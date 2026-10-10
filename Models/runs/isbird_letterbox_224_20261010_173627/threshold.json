@@ -1,0 +1,19 @@
+{
+  "bird_probability_threshold": 0.8180000000000001,
+  "selection_split": "validation",
+  "maximum_validation_false_positive_rate": 0.05,
+  "validation_metrics": {
+    "threshold": 0.8180000000000001,
+    "images": 4229,
+    "tp": 1805,
+    "tn": 1979,
+    "fp": 27,
+    "fn": 418,
+    "accuracy": 0.8947741782927406,
+    "precision": 0.9852620087336245,
+    "recall": 0.811965811965812,
+    "specificity": 0.9865403788634097,
+    "false_positive_rate": 0.013459621136590228,
+    "f1": 0.8902589395807645
+  }
+}

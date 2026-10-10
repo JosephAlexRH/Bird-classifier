@@ -1,0 +1,118 @@
+Processing esp32cam (platform: espressif32; board: esp32cam; framework: arduino)
+--------------------------------------------------------------------------------
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32cam.html
+PLATFORM: Espressif 32 (7.0.1) > AI Thinker ESP32-CAM
+HARDWARE: ESP32 240MHz, 320KB RAM, 4MB Flash
+DEBUG: Current (cmsis-dap) External (cmsis-dap, esp-bridge, esp-prog, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - framework-arduinoespressif32 @ 3.20017.241212+sha.dcc1105b 
+ - tool-esptoolpy @ 2.41100.0 (4.11.0) 
+ - toolchain-xtensa-esp32 @ 8.4.0+2021r2-patch5
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 34 compatible libraries
+Scanning dependencies...
+Dependency Graph
+|-- ArduinoJson @ 7.4.3
+|-- FS @ 2.0.0
+|-- SD_MMC @ 2.0.0
+|-- SPIFFS @ 2.0.0
+|-- WiFi @ 2.0.0
+|-- HTTPClient @ 2.0.0
+Building in release mode
+Compiling .pio\build\esp32cam\src\app_config.cpp.o
+Compiling .pio\build\esp32cam\src\camera_runtime.cpp.o
+Compiling .pio\build\esp32cam\src\camera_service.cpp.o
+Compiling .pio\build\esp32cam\src\image_storage.cpp.o
+Compiling .pio\build\esp32cam\src\main.cpp.o
+Compiling .pio\build\esp32cam\src\motion_detector.cpp.o
+Compiling .pio\build\esp32cam\src\web_server.cpp.o
+Building .pio\build\esp32cam\bootloader.bin
+esptool.py v4.11.0
+Creating esp32 image...
+Merged 1 ELF section
+Successfully created esp32 image.
+Generating partitions .pio\build\esp32cam\partitions.bin
+Compiling .pio\build\esp32cam\lib794\FS\FS.cpp.o
+Compiling .pio\build\esp32cam\lib794\FS\vfs_api.cpp.o
+Compiling .pio\build\esp32cam\lib663\SD_MMC\SD_MMC.cpp.o
+Archiving .pio\build\esp32cam\lib794\libFS.a
+Compiling .pio\build\esp32cam\libca4\SPIFFS\SPIFFS.cpp.o
+Archiving .pio\build\esp32cam\lib663\libSD_MMC.a
+Compiling .pio\build\esp32cam\lib6ac\WiFi\WiFi.cpp.o
+Archiving .pio\build\esp32cam\libca4\libSPIFFS.a
+Compiling .pio\build\esp32cam\lib6ac\WiFi\WiFiAP.cpp.o
+Compiling .pio\build\esp32cam\lib6ac\WiFi\WiFiClient.cpp.o
+Compiling .pio\build\esp32cam\lib6ac\WiFi\WiFiGeneric.cpp.o
+Compiling .pio\build\esp32cam\lib6ac\WiFi\WiFiMulti.cpp.o
+Compiling .pio\build\esp32cam\lib6ac\WiFi\WiFiSTA.cpp.o
+Compiling .pio\build\esp32cam\lib6ac\WiFi\WiFiScan.cpp.o
+Compiling .pio\build\esp32cam\lib6ac\WiFi\WiFiServer.cpp.o
+Compiling .pio\build\esp32cam\lib6ac\WiFi\WiFiUdp.cpp.o
+Compiling .pio\build\esp32cam\lib6c5\WiFiClientSecure\WiFiClientSecure.cpp.o
+Archiving .pio\build\esp32cam\lib6ac\libWiFi.a
+Compiling .pio\build\esp32cam\lib6c5\WiFiClientSecure\esp_crt_bundle.c.o
+Compiling .pio\build\esp32cam\lib6c5\WiFiClientSecure\ssl_client.cpp.o
+Compiling .pio\build\esp32cam\libe0d\HTTPClient\HTTPClient.cpp.o
+Archiving .pio\build\esp32cam\lib6c5\libWiFiClientSecure.a
+Compiling .pio\build\esp32cam\FrameworkArduino\Esp.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\FirmwareMSC.cpp.o
+Archiving .pio\build\esp32cam\libe0d\libHTTPClient.a
+Compiling .pio\build\esp32cam\FrameworkArduino\FunctionalInterrupt.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\HWCDC.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\HardwareSerial.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\IPAddress.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\IPv6Address.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\MD5Builder.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\Print.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\Stream.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\StreamString.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\Tone.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\USB.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\USBCDC.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\USBMSC.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\WMath.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\WString.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\base64.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\cbuf.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-adc.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-bt.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-cpu.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-dac.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-gpio.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-i2c-slave.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-i2c.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-ledc.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-matrix.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-misc.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-psram.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-rgb-led.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-rmt.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-sigmadelta.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-spi.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-time.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-timer.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-tinyusb.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-touch.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\esp32-hal-uart.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\firmware_msc_fat.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\libb64\cdecode.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\libb64\cencode.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\main.cpp.o
+Compiling .pio\build\esp32cam\FrameworkArduino\stdlib_noniso.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\wiring_pulse.c.o
+Compiling .pio\build\esp32cam\FrameworkArduino\wiring_shift.c.o
+Archiving .pio\build\esp32cam\libFrameworkArduino.a
+Linking .pio\build\esp32cam\firmware.elf
+Retrieving maximum program size .pio\build\esp32cam\firmware.elf
+Checking size .pio\build\esp32cam\firmware.elf
+Advanced Memory Usage is available via "PlatformIO Home > Project Inspect"
+RAM:   [==        ]  17.4% (used 57036 bytes from 327680 bytes)
+Flash: [====      ]  36.5% (used 1149301 bytes from 3145728 bytes)
+Building .pio\build\esp32cam\firmware.bin
+esptool.py v4.11.0
+Creating esp32 image...
+Merged 27 ELF sections
+Successfully created esp32 image.
+========================= [SUCCESS] Took 42.26 seconds =========================

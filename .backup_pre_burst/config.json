@@ -1,0 +1,12 @@
+{
+  "motion_threshold": 20,
+  "motion_sensitivity": 0.05,
+  "motion_check_ms": 500,
+  "motion_enabled": true,
+  "jpeg_quality": 10,
+  "framesize": 8,
+  "server_ip": "192.168.7.170",
+  "server_port": 5000,
+  "save_birds_to_sd": true,
+  "bird_confidence_threshold": 0.8
+}

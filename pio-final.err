@@ -1,0 +1,274 @@
+src/app_config.cpp: In function 'void loadConfig()':
+src/app_config.cpp:75:3: warning: 'template<unsigned int N> class ArduinoJson::V743PB22::StaticJsonDocument' is deprecated: use JsonDocument instead [-Wdeprecated-declarations]
+   StaticJsonDocument<512> document;
+   ^~~~~~~~~~~~~~~~~~
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:65,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/compatibility.hpp:63:58: note: declared here
+ class ARDUINOJSON_DEPRECATED("use JsonDocument instead") StaticJsonDocument
+                                                          ^~~~~~~~~~~~~~~~~~
+src/app_config.cpp:84:46: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_threshold")) {
+                                              ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp:87:48: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_sensitivity")) {
+                                                ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp:90:45: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_check_ms")) {
+                                             ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp:93:44: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_enabled")) {
+                                            ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp:96:42: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("jpeg_quality")) {
+                                          ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp:99:39: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("framesize")) {
+                                       ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp:102:39: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("server_ip")) {
+                                       ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp:105:41: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("server_port")) {
+                                         ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp:108:46: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("save_birds_to_sd")) {
+                                              ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp:111:55: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("bird_confidence_threshold")) {
+                                                       ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/app_config.cpp: In function 'void saveConfig()':
+src/app_config.cpp:133:3: warning: 'template<unsigned int N> class ArduinoJson::V743PB22::StaticJsonDocument' is deprecated: use JsonDocument instead [-Wdeprecated-declarations]
+   StaticJsonDocument<512> document;
+   ^~~~~~~~~~~~~~~~~~
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:65,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/app_config.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/compatibility.hpp:63:58: note: declared here
+ class ARDUINOJSON_DEPRECATED("use JsonDocument instead") StaticJsonDocument
+                                                          ^~~~~~~~~~~~~~~~~~
+src/web_server.cpp: In function 'bool {anonymous}::validConfig(const ArduinoJson::V743PB22::JsonDocument&, String&)':
+src/web_server.cpp:203:46: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_threshold")) {
+                                              ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:210:48: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_sensitivity")) {
+                                                ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:217:45: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_check_ms")) {
+                                             ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:224:42: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("jpeg_quality")) {
+                                          ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:231:39: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("framesize")) {
+                                       ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:238:41: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("server_port")) {
+                                         ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:245:39: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("server_ip")) {
+                                       ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:252:55: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("bird_confidence_threshold")) {
+                                                       ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp: In function 'void {anonymous}::applyConfig(const ArduinoJson::V743PB22::JsonDocument&)':
+src/web_server.cpp:263:46: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_threshold")) cfg.motionThreshold = document["motion_threshold"];
+                                              ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:264:48: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_sensitivity")) cfg.motionSensitivity = document["motion_sensitivity"];
+                                                ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:265:45: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_check_ms")) cfg.motionCheckMs = document["motion_check_ms"];
+                                             ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:266:44: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("motion_enabled")) cfg.motionEnabled = document["motion_enabled"];
+                                            ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:267:42: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("jpeg_quality")) cfg.jpegQuality = document["jpeg_quality"];
+                                          ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:268:39: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("framesize")) cfg.framesize = document["framesize"];
+                                       ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:269:39: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("server_ip")) {
+                                       ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:272:41: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("server_port")) cfg.serverPort = document["server_port"];
+                                         ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:273:46: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("save_birds_to_sd")) cfg.saveBirdsToSd = document["save_birds_to_sd"];
+                                              ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~
+src/web_server.cpp:274:55: warning: 'bool ArduinoJson::V743PB22::JsonDocument::containsKey(TChar*) const [with TChar = const char]' is deprecated: use doc["key"].is<T>() instead [-Wdeprecated-declarations]
+   if (document.containsKey("bird_confidence_threshold")) {
+                                                       ^
+In file included from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.hpp:42,
+                 from .pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson.h:9,
+                 from src/web_server.cpp:4:
+.pio/libdeps/esp32cam/ArduinoJson/src/ArduinoJson/Document/JsonDocument.hpp:167:8: note: declared here
+   bool containsKey(TChar* key) const {
+        ^~~~~~~~~~~

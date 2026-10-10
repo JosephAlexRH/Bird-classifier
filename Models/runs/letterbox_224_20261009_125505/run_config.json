@@ -1,0 +1,193 @@
+{
+  "run_name": "letterbox_224_20261009_125505",
+  "created": "2026-10-09T13:01:56",
+  "preprocessing": "letterbox",
+  "img_size": 224,
+  "input": "RGB, 0-255, pixel scaling is inside the model",
+  "backbone": "MobileNetV2 alpha=1.0 weights=imagenet",
+  "dropout": 0.2,
+  "batch_size": 32,
+  "head_epochs": 10,
+  "head_lr": 0.001,
+  "fine_tune_epochs": 10,
+  "fine_tune_layers": 40,
+  "fine_tune_lr": 1e-05,
+  "epochs_run": 15,
+  "augment_flip": true,
+  "seed": 1234,
+  "limit_per_split": 200,
+  "tflite_eval_limit": null,
+  "uses_bounding_boxes": false,
+  "photo_roots": {
+    "cub_200_2011": "/mnt/e/Datasets/CUB_200/CUB_200_2011/images",
+    "inaturalist": "/mnt/e/Datasets/iNaturalist/train_mini/train_mini"
+  },
+  "num_classes": 179,
+  "images": {
+    "train": 200,
+    "validation": 200,
+    "test": 200
+  },
+  "training_manifest_sha256": "ea53797c71e4103e4de5eab2ee248dc235013d366adedce513b45f7fb27fb716",
+  "class_map_sha256": "1506e2d760232852914b0954c695287e0ceafcbc862aa8cdca4d926735cb04c6",
+  "tensorflow": "2.21.0",
+  "train_minutes": 1.1,
+  "tflite": {
+    "tflite_float32": {
+      "size_mb": 9.80374,
+      "ms_per_image": 3.197701515382505,
+      "test_agreement_with_keras": 1.0
+    },
+    "tflite_int8": {
+      "size_mb": 2.965952,
+      "ms_per_image": 3.0567504601640394,
+      "test_agreement_with_keras": 0.8
+    }
+  },
+  "results": [
+    {
+      "model": "keras",
+      "split": "validation",
+      "source": "all",
+      "images": 200,
+      "top1": 0.07,
+      "top5": 0.195
+    },
+    {
+      "model": "keras",
+      "split": "validation",
+      "source": "cub_200_2011",
+      "images": 105,
+      "top1": 0.10476190476190476,
+      "top5": 0.2571428571428571
+    },
+    {
+      "model": "keras",
+      "split": "validation",
+      "source": "inaturalist",
+      "images": 95,
+      "top1": 0.031578947368421054,
+      "top5": 0.12631578947368421
+    },
+    {
+      "model": "keras",
+      "split": "test",
+      "source": "all",
+      "images": 200,
+      "top1": 0.075,
+      "top5": 0.23
+    },
+    {
+      "model": "keras",
+      "split": "test",
+      "source": "cub_200_2011",
+      "images": 171,
+      "top1": 0.08187134502923976,
+      "top5": 0.23976608187134502
+    },
+    {
+      "model": "keras",
+      "split": "test",
+      "source": "inaturalist",
+      "images": 29,
+      "top1": 0.034482758620689655,
+      "top5": 0.1724137931034483
+    },
+    {
+      "model": "tflite_float32",
+      "split": "validation",
+      "source": "all",
+      "images": 200,
+      "top1": 0.07,
+      "top5": 0.19
+    },
+    {
+      "model": "tflite_float32",
+      "split": "validation",
+      "source": "cub_200_2011",
+      "images": 105,
+      "top1": 0.10476190476190476,
+      "top5": 0.24761904761904763
+    },
+    {
+      "model": "tflite_float32",
+      "split": "validation",
+      "source": "inaturalist",
+      "images": 95,
+      "top1": 0.031578947368421054,
+      "top5": 0.12631578947368421
+    },
+    {
+      "model": "tflite_float32",
+      "split": "test",
+      "source": "all",
+      "images": 200,
+      "top1": 0.075,
+      "top5": 0.23
+    },
+    {
+      "model": "tflite_float32",
+      "split": "test",
+      "source": "cub_200_2011",
+      "images": 171,
+      "top1": 0.08187134502923976,
+      "top5": 0.23976608187134502
+    },
+    {
+      "model": "tflite_float32",
+      "split": "test",
+      "source": "inaturalist",
+      "images": 29,
+      "top1": 0.034482758620689655,
+      "top5": 0.1724137931034483
+    },
+    {
+      "model": "tflite_int8",
+      "split": "validation",
+      "source": "all",
+      "images": 200,
+      "top1": 0.06,
+      "top5": 0.185
+    },
+    {
+      "model": "tflite_int8",
+      "split": "validation",
+      "source": "cub_200_2011",
+      "images": 105,
+      "top1": 0.0761904761904762,
+      "top5": 0.2571428571428571
+    },
+    {
+      "model": "tflite_int8",
+      "split": "validation",
+      "source": "inaturalist",
+      "images": 95,
+      "top1": 0.042105263157894736,
+      "top5": 0.10526315789473684
+    },
+    {
+      "model": "tflite_int8",
+      "split": "test",
+      "source": "all",
+      "images": 200,
+      "top1": 0.07,
+      "top5": 0.205
+    },
+    {
+      "model": "tflite_int8",
+      "split": "test",
+      "source": "cub_200_2011",
+      "images": 171,
+      "top1": 0.07602339181286549,
+      "top5": 0.21052631578947367
+    },
+    {
+      "model": "tflite_int8",
+      "split": "test",
+      "source": "inaturalist",
+      "images": 29,
+      "top1": 0.034482758620689655,
+      "top5": 0.1724137931034483
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-10-07T16:27:14.432605+00:00",
+  "configuration": {
+    "class_policy": "shared",
+    "seed": "esp32-bird-training-v1",
+    "cub_validation_fraction": 0.2,
+    "inaturalist_validation_fraction": 0.1,
+    "inaturalist_test_fraction": 0.1,
+    "verify_files": false,
+    "cub_photo_root_override": "",
+    "inaturalist_photo_root_override": ""
+  },
+  "inputs": {
+    "bridge_manifest": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\Bridge Outputs\\bird_bridge_manifest.csv",
+    "bridge_manifest_sha256": "44a4665411e28d91f5aecdf407b2990560441b5023d95fa70f41206d233c9885",
+    "bridge_rows": 86088,
+    "crosswalk": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\Bridge Outputs\\cub_inaturalist_taxon_crosswalk.csv",
+    "crosswalk_sha256": "aa17336bd8032c1d2628d38a04111602a88ec1a767deb5867e026f63e5410d38"
+  },
+  "dataset": {
+    "images": 19607,
+    "classes": 179,
+    "split_counts": {
+      "train": 11450,
+      "validation": 1969,
+      "test": 6188
+    },
+    "source_counts": {
+      "cub_200_2011": 10657,
+      "inaturalist": 8950
+    },
+    "source_split_counts": {
+      "cub_200_2011": {
+        "train": 4290,
+        "validation": 1074,
+        "test": 5293
+      },
+      "inaturalist": {
+        "train": 7160,
+        "validation": 895,
+        "test": 895
+      }
+    }
+  },
+  "outputs": {
+    "training_manifest": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Models\\Training Manifest\\bird_training_manifest.csv",
+    "class_map": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Models\\Training Manifest\\bird_training_classes.csv",
+    "summary": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Models\\Training Manifest\\bird_training_summary.json",
+    "training_manifest_sha256": "ea53797c71e4103e4de5eab2ee248dc235013d366adedce513b45f7fb27fb716",
+    "class_map_sha256": "1506e2d760232852914b0954c695287e0ceafcbc862aa8cdca4d926735cb04c6"
+  },
+  "validations": {
+    "class_indices_are_contiguous_zero_based": true,
+    "all_selected_taxa_have_images": true,
+    "all_rows_have_model_splits": true,
+    "cub_official_test_preserved": true,
+    "cub_official_train_not_in_test": true,
+    "resolved_files_exist_now": null
+  }
+}

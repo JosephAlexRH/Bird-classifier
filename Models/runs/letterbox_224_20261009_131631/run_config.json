@@ -1,0 +1,193 @@
+{
+  "run_name": "letterbox_224_20261009_131631",
+  "created": "2026-10-09T13:38:19",
+  "preprocessing": "letterbox",
+  "img_size": 224,
+  "input": "RGB, 0-255, pixel scaling is inside the model",
+  "backbone": "MobileNetV2 alpha=1.0 weights=imagenet",
+  "dropout": 0.2,
+  "batch_size": 32,
+  "head_epochs": 10,
+  "head_lr": 0.001,
+  "fine_tune_epochs": 10,
+  "fine_tune_layers": 40,
+  "fine_tune_lr": 1e-05,
+  "epochs_run": 20,
+  "augment_flip": true,
+  "seed": 1234,
+  "limit_per_split": null,
+  "tflite_eval_limit": null,
+  "uses_bounding_boxes": false,
+  "photo_roots": {
+    "cub_200_2011": "/mnt/e/Datasets/CUB_200/CUB_200_2011/images",
+    "inaturalist": "/mnt/e/Datasets/iNaturalist/train_mini/train_mini"
+  },
+  "num_classes": 179,
+  "images": {
+    "train": 11450,
+    "validation": 1969,
+    "test": 6188
+  },
+  "training_manifest_sha256": "ea53797c71e4103e4de5eab2ee248dc235013d366adedce513b45f7fb27fb716",
+  "class_map_sha256": "1506e2d760232852914b0954c695287e0ceafcbc862aa8cdca4d926735cb04c6",
+  "tensorflow": "2.21.0",
+  "train_minutes": 9.1,
+  "tflite": {
+    "tflite_float32": {
+      "size_mb": 9.80374,
+      "ms_per_image": 3.6255291036573642,
+      "test_agreement_with_keras": 0.9974143503555268
+    },
+    "tflite_int8": {
+      "size_mb": 2.965952,
+      "ms_per_image": 2.907637131623567,
+      "test_agreement_with_keras": 0.8112475759534583
+    }
+  },
+  "results": [
+    {
+      "model": "keras",
+      "split": "validation",
+      "source": "all",
+      "images": 1969,
+      "top1": 0.4581005586592179,
+      "top5": 0.7176231589639411
+    },
+    {
+      "model": "keras",
+      "split": "validation",
+      "source": "cub_200_2011",
+      "images": 1074,
+      "top1": 0.5968342644320298,
+      "top5": 0.8594040968342644
+    },
+    {
+      "model": "keras",
+      "split": "validation",
+      "source": "inaturalist",
+      "images": 895,
+      "top1": 0.2916201117318436,
+      "top5": 0.547486033519553
+    },
+    {
+      "model": "keras",
+      "split": "test",
+      "source": "all",
+      "images": 6188,
+      "top1": 0.5505817711700065,
+      "top5": 0.8175500969618616
+    },
+    {
+      "model": "keras",
+      "split": "test",
+      "source": "cub_200_2011",
+      "images": 5293,
+      "top1": 0.5934252786699414,
+      "top5": 0.8594369922539202
+    },
+    {
+      "model": "keras",
+      "split": "test",
+      "source": "inaturalist",
+      "images": 895,
+      "top1": 0.29720670391061454,
+      "top5": 0.5698324022346368
+    },
+    {
+      "model": "tflite_float32",
+      "split": "validation",
+      "source": "all",
+      "images": 1969,
+      "top1": 0.4581005586592179,
+      "top5": 0.7171152869476892
+    },
+    {
+      "model": "tflite_float32",
+      "split": "validation",
+      "source": "cub_200_2011",
+      "images": 1074,
+      "top1": 0.5968342644320298,
+      "top5": 0.8594040968342644
+    },
+    {
+      "model": "tflite_float32",
+      "split": "validation",
+      "source": "inaturalist",
+      "images": 895,
+      "top1": 0.2916201117318436,
+      "top5": 0.5463687150837989
+    },
+    {
+      "model": "tflite_float32",
+      "split": "test",
+      "source": "all",
+      "images": 6188,
+      "top1": 0.5504201680672269,
+      "top5": 0.8175500969618616
+    },
+    {
+      "model": "tflite_float32",
+      "split": "test",
+      "source": "cub_200_2011",
+      "images": 5293,
+      "top1": 0.5932363498960892,
+      "top5": 0.8594369922539202
+    },
+    {
+      "model": "tflite_float32",
+      "split": "test",
+      "source": "inaturalist",
+      "images": 895,
+      "top1": 0.29720670391061454,
+      "top5": 0.5698324022346368
+    },
+    {
+      "model": "tflite_int8",
+      "split": "validation",
+      "source": "all",
+      "images": 1969,
+      "top1": 0.44692737430167595,
+      "top5": 0.7100050787201625
+    },
+    {
+      "model": "tflite_int8",
+      "split": "validation",
+      "source": "cub_200_2011",
+      "images": 1074,
+      "top1": 0.5865921787709497,
+      "top5": 0.8566108007448789
+    },
+    {
+      "model": "tflite_int8",
+      "split": "validation",
+      "source": "inaturalist",
+      "images": 895,
+      "top1": 0.27932960893854747,
+      "top5": 0.5340782122905028
+    },
+    {
+      "model": "tflite_int8",
+      "split": "test",
+      "source": "all",
+      "images": 6188,
+      "top1": 0.5368455074337427,
+      "top5": 0.8063994828700711
+    },
+    {
+      "model": "tflite_int8",
+      "split": "test",
+      "source": "cub_200_2011",
+      "images": 5293,
+      "top1": 0.5783109767617608,
+      "top5": 0.8492348384658983
+    },
+    {
+      "model": "tflite_int8",
+      "split": "test",
+      "source": "inaturalist",
+      "images": 895,
+      "top1": 0.2916201117318436,
+      "top5": 0.553072625698324
+    }
+  ]
+}
