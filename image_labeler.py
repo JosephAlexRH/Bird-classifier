@@ -32,6 +32,7 @@ from PIL import Image, ImageOps, ImageTk
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
 MANUAL_LABEL_KEY = "manual_label"
 UNKNOWN_SPECIES = "Unknown"
+THUMBNAIL_SIZE = (140, 96)
 
 
 @dataclass(frozen=True)
@@ -227,8 +228,8 @@ class BirdLabelerApp:
     def __init__(self, root: tk.Tk, initial_directory: Path | None = None) -> None:
         self.root = root
         self.root.title("Bird Frame Labeler")
-        self.root.geometry("1180x780")
-        self.root.minsize(800, 560)
+        self.root.geometry("1360x780")
+        self.root.minsize(1050, 560)
 
         self.directory: Path | None = None
         self.records: list[ImageRecord] = []
@@ -241,6 +242,10 @@ class BirdLabelerApp:
         self.render_job: str | None = None
         self.loading_controls = False
         self.dirty = False
+        self.selected_indices: set[int] = set()
+        self.selection_anchor: int | None = None
+        self.thumbnail_images: dict[int, ImageTk.PhotoImage] = {}
+        self.thumbnail_items: dict[int, tuple[tk.Frame, tk.Label, tk.Label]] = {}
 
         self.presence_var = tk.StringVar(value="unlabeled")
         self.species_var = tk.StringVar()
@@ -248,6 +253,7 @@ class BirdLabelerApp:
         self.filename_var = tk.StringVar(value="Open a folder to begin")
         self.pairing_var = tk.StringVar()
         self.progress_var = tk.StringVar(value="0 / 0")
+        self.selection_var = tk.StringVar(value="0 selected")
         self.status_var = tk.StringVar(value="Ready")
 
         self._build_ui()
@@ -274,10 +280,61 @@ class BirdLabelerApp:
         content = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
+        gallery = ttk.Frame(content, width=180)
         image_frame = ttk.Frame(content)
         controls = ttk.Frame(content, width=320, padding=(14, 6))
+        content.add(gallery, weight=0)
         content.add(image_frame, weight=4)
         content.add(controls, weight=1)
+
+        gallery_header = ttk.Frame(gallery)
+        gallery_header.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(gallery_header, text="Images", font=("TkDefaultFont", 11, "bold")).pack(
+            side=tk.LEFT
+        )
+        ttk.Label(gallery_header, textvariable=self.selection_var).pack(side=tk.RIGHT)
+        gallery_actions = ttk.Frame(gallery)
+        gallery_actions.pack(fill=tk.X, pady=(0, 5))
+        self.select_all_button = ttk.Button(
+            gallery_actions, text="Select All", command=self.select_all
+        )
+        self.select_all_button.pack(side=tk.LEFT, expand=True, fill=tk.X)
+        self.only_current_button = ttk.Button(
+            gallery_actions, text="Only Current", command=self.select_only_current
+        )
+        self.only_current_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(4, 0))
+
+        gallery_body = ttk.Frame(gallery)
+        gallery_body.pack(fill=tk.BOTH, expand=True)
+        gallery_scrollbar = ttk.Scrollbar(gallery_body, orient=tk.VERTICAL)
+        gallery_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.thumbnail_canvas = tk.Canvas(
+            gallery_body,
+            width=170,
+            background="#e6e6e6",
+            highlightthickness=0,
+            yscrollcommand=gallery_scrollbar.set,
+        )
+        self.thumbnail_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        gallery_scrollbar.configure(command=self.thumbnail_canvas.yview)
+        self.thumbnail_frame = tk.Frame(self.thumbnail_canvas, background="#e6e6e6")
+        self.thumbnail_window = self.thumbnail_canvas.create_window(
+            (0, 0), window=self.thumbnail_frame, anchor=tk.NW
+        )
+        self.thumbnail_frame.bind(
+            "<Configure>",
+            lambda _event: self.thumbnail_canvas.configure(
+                scrollregion=self.thumbnail_canvas.bbox("all")
+            ),
+        )
+        self.thumbnail_canvas.bind("<Configure>", self._resize_thumbnail_frame)
+        self.thumbnail_canvas.bind("<MouseWheel>", self._scroll_thumbnails)
+        ttk.Label(
+            gallery,
+            text="Click to view. Ctrl-click adds/removes; Shift-click selects a range.",
+            wraplength=170,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(5, 0))
 
         self.canvas = tk.Canvas(
             image_frame,
@@ -356,6 +413,18 @@ class BirdLabelerApp:
         ttk.Button(controls, text="Save  (Ctrl+S)", command=self.save).pack(
             fill=tk.X, pady=(6, 0)
         )
+        self.save_selected_button = ttk.Button(
+            controls,
+            text="Save Label to Selected  (Ctrl+Shift+S)",
+            command=self.save_selected,
+        )
+        self.save_selected_button.pack(fill=tk.X, pady=(6, 0))
+        self.delete_selected_button = ttk.Button(
+            controls,
+            text="Delete Selected Photo(s)  (Delete)",
+            command=self.delete_selected,
+        )
+        self.delete_selected_button.pack(fill=tk.X, pady=(6, 0))
 
         navigation = ttk.Frame(controls)
         navigation.pack(fill=tk.X, pady=(18, 0))
@@ -373,7 +442,8 @@ class BirdLabelerApp:
         ttk.Label(
             controls,
             text="Shortcuts: Y or B = bird, N = no bird + next, Enter = save + next, "
-            "←/→ = navigate. Shortcuts do not intercept species typing.",
+            "Ctrl+Shift+S = save to selected, Delete = delete selected, ←/→ = navigate. "
+            "Shortcuts do not intercept species typing.",
             wraplength=290,
             justify=tk.LEFT,
         ).pack(anchor=tk.W)
@@ -391,6 +461,8 @@ class BirdLabelerApp:
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-s>", lambda _event: self.save())
+        self.root.bind("<Control-Shift-S>", lambda _event: self.save_selected())
+        self.root.bind("<Delete>", self._delete_pressed)
         self.root.bind("<Return>", self._enter_pressed)
         self.root.bind("<Left>", self._left_pressed)
         self.root.bind("<Right>", self._right_pressed)
@@ -435,12 +507,28 @@ class BirdLabelerApp:
         self.mark_no_bird_and_next()
         return "break"
 
+    def _delete_pressed(self, _event: tk.Event[Any]) -> str | None:
+        if self._typing_species():
+            return None
+        self.delete_selected()
+        return "break"
+
     def _set_controls_available(self, available: bool) -> None:
         state = tk.NORMAL if available else tk.DISABLED
         self.save_next_button.configure(state=state)
         self.no_bird_button.configure(state=state)
         self.repeat_species_check.configure(state=state)
+        self.select_all_button.configure(state=state)
+        self.only_current_button.configure(state=state)
+        self._update_selection_controls()
         self._update_species_state()
+
+    def _update_selection_controls(self) -> None:
+        count = len(self.selected_indices)
+        self.selection_var.set(f"{count} selected")
+        state = tk.NORMAL if self.records and count else tk.DISABLED
+        self.save_selected_button.configure(state=state)
+        self.delete_selected_button.configure(state=state)
 
     def _update_species_state(self) -> None:
         enabled = bool(self.records) and self.presence_var.get() == "yes"
@@ -458,6 +546,146 @@ class BirdLabelerApp:
             self.dirty = True
             self.status_var.set("Unsaved changes")
         self._update_species_state()
+
+    def _resize_thumbnail_frame(self, event: tk.Event[Any]) -> None:
+        self.thumbnail_canvas.itemconfigure(self.thumbnail_window, width=event.width)
+
+    def _scroll_thumbnails(self, event: tk.Event[Any]) -> str:
+        self.thumbnail_canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
+
+    @staticmethod
+    def _selection_modifiers(event: tk.Event[Any]) -> tuple[bool, bool]:
+        # Tk uses these state bits for Shift and Control on Windows/Linux.
+        return bool(event.state & 0x0001), bool(event.state & 0x0004)
+
+    def _thumbnail_clicked(self, event: tk.Event[Any], index: int) -> str:
+        if index == self.index or self._save_dirty_before_navigation():
+            shift, control = self._selection_modifiers(event)
+            if shift and self.selection_anchor is not None:
+                start, end = sorted((self.selection_anchor, index))
+                ranged = set(range(start, end + 1))
+                self.selected_indices = self.selected_indices | ranged if control else ranged
+            elif control:
+                if index in self.selected_indices:
+                    self.selected_indices.remove(index)
+                else:
+                    self.selected_indices.add(index)
+                self.selection_anchor = index
+            else:
+                self.selected_indices = {index}
+                self.selection_anchor = index
+
+            changed_image = index != self.index
+            self.index = index
+            self._refresh_thumbnail_styles()
+            self._update_selection_controls()
+            if changed_image:
+                self.load_current(update_selection=False)
+        return "break"
+
+    def select_all(self) -> None:
+        if not self.records:
+            return
+        self.selected_indices = set(range(len(self.records)))
+        self.selection_anchor = self.index
+        self._refresh_thumbnail_styles()
+        self._update_selection_controls()
+
+    def select_only_current(self) -> None:
+        if not self.records:
+            return
+        self.selected_indices = {self.index}
+        self.selection_anchor = self.index
+        self._refresh_thumbnail_styles()
+        self._update_selection_controls()
+
+    def _build_thumbnails(self) -> None:
+        for child in self.thumbnail_frame.winfo_children():
+            child.destroy()
+        self.thumbnail_images.clear()
+        self.thumbnail_items.clear()
+
+        for index, record in enumerate(self.records):
+            item = tk.Frame(
+                self.thumbnail_frame,
+                background="#e6e6e6",
+                borderwidth=2,
+                relief=tk.FLAT,
+                cursor="hand2",
+            )
+            item.pack(fill=tk.X, padx=4, pady=3)
+            try:
+                with Image.open(record.image_path) as opened:
+                    thumbnail = ImageOps.contain(
+                        ImageOps.exif_transpose(opened).convert("RGB"),
+                        THUMBNAIL_SIZE,
+                        method=Image.Resampling.LANCZOS,
+                    )
+                photo = ImageTk.PhotoImage(thumbnail)
+                self.thumbnail_images[index] = photo
+                image_label = tk.Label(item, image=photo, background="#e6e6e6")
+            except (OSError, ValueError):
+                image_label = tk.Label(
+                    item,
+                    text="Image unavailable",
+                    width=20,
+                    height=6,
+                    background="#404040",
+                    foreground="white",
+                )
+            image_label.pack(padx=3, pady=(3, 1))
+            name_label = tk.Label(
+                item,
+                text=record.image_path.name,
+                anchor=tk.W,
+                background="#e6e6e6",
+                font=("TkDefaultFont", 8),
+            )
+            name_label.pack(fill=tk.X, padx=3, pady=(0, 3))
+            self.thumbnail_items[index] = (item, image_label, name_label)
+            for widget in (item, image_label, name_label):
+                widget.bind(
+                    "<Button-1>",
+                    lambda event, selected=index: self._thumbnail_clicked(event, selected),
+                )
+                widget.bind("<MouseWheel>", self._scroll_thumbnails)
+
+        self.thumbnail_canvas.yview_moveto(0)
+        self._refresh_thumbnail_styles()
+
+    def _refresh_thumbnail_styles(self) -> None:
+        for index, (item, image_label, name_label) in self.thumbnail_items.items():
+            selected = index in self.selected_indices
+            current = index == self.index
+            background = "#cfe8ff" if selected else "#e6e6e6"
+            border = "#0067c0" if current else "#58a6d8" if selected else "#e6e6e6"
+            item.configure(background=border, relief=tk.SOLID if selected or current else tk.FLAT)
+            image_label.configure(background=background, foreground="#202020")
+            name_label.configure(
+                background=background,
+                foreground="#176b2c"
+                if self.records[index].image_path in self.labeled_images
+                else "#202020",
+                font=("TkDefaultFont", 8, "bold" if current else "normal"),
+            )
+
+    def _show_current_thumbnail(self) -> None:
+        item = self.thumbnail_items.get(self.index)
+        if item is None:
+            return
+        self.root.update_idletasks()
+        top = item[0].winfo_y()
+        bottom = top + item[0].winfo_height()
+        visible_top = self.thumbnail_canvas.canvasy(0)
+        visible_bottom = visible_top + self.thumbnail_canvas.winfo_height()
+        content_height = max(self.thumbnail_frame.winfo_height(), 1)
+        if top < visible_top:
+            self.thumbnail_canvas.yview_moveto(top / content_height)
+        elif bottom > visible_bottom:
+            self.thumbnail_canvas.yview_moveto(
+                max((bottom - self.thumbnail_canvas.winfo_height()) / content_height, 0)
+            )
 
     def choose_directory(self) -> None:
         if not self._confirm_leave_unsaved():
@@ -487,6 +715,8 @@ class BirdLabelerApp:
         self.directory = directory
         self.records = records
         self.index = 0 if records else -1
+        self.selected_indices = {0} if records else set()
+        self.selection_anchor = self.index if records else None
         self.labeled_images, species = collect_label_state(records)
         self.species_box.configure(values=species)
         self.dirty = False
@@ -495,6 +725,7 @@ class BirdLabelerApp:
         if not records:
             self._clear_current(f"No supported images found in {directory}")
             return
+        self._build_thumbnails()
         self._set_controls_available(True)
         self.load_current()
 
@@ -507,6 +738,8 @@ class BirdLabelerApp:
         current_path = self.current_record.image_path if self.records else None
         records = discover_records(self.directory)
         self.records = records
+        self.selected_indices.clear()
+        self.selection_anchor = None
         self.labeled_images, species = collect_label_state(records)
         self.species_box.configure(values=species)
         if not records:
@@ -515,6 +748,9 @@ class BirdLabelerApp:
             return
         paths = [record.image_path for record in records]
         self.index = paths.index(current_path) if current_path in paths else 0
+        self.selected_indices = {self.index}
+        self.selection_anchor = self.index
+        self._build_thumbnails()
         self._set_controls_available(True)
         self.load_current()
 
@@ -525,6 +761,12 @@ class BirdLabelerApp:
     def _clear_current(self, status: str) -> None:
         self.records = []
         self.labeled_images.clear()
+        self.selected_indices.clear()
+        self.selection_anchor = None
+        for child in self.thumbnail_frame.winfo_children():
+            child.destroy()
+        self.thumbnail_images.clear()
+        self.thumbnail_items.clear()
         self.index = -1
         self.sidecar_data = {}
         self.source_image = None
@@ -540,11 +782,20 @@ class BirdLabelerApp:
         self.filename_var.set("No image selected")
         self.pairing_var.set("")
         self.progress_var.set("0 / 0")
+        self._update_selection_controls()
         self.status_var.set(status)
         self._set_controls_available(False)
 
-    def load_current(self, *, repeated_species: str | None = None) -> None:
+    def load_current(
+        self, *, repeated_species: str | None = None, update_selection: bool = True
+    ) -> None:
         record = self.current_record
+        if update_selection:
+            self.selected_indices = {self.index}
+            self.selection_anchor = self.index
+        self._refresh_thumbnail_styles()
+        self._update_selection_controls()
+        self._show_current_thumbnail()
         self.sidecar_load_error = None
         try:
             self.sidecar_data = read_sidecar(record)
@@ -667,8 +918,230 @@ class BirdLabelerApp:
             species_values.add(self.species_var.get().strip())
         self.species_box.configure(values=sorted(species_values, key=str.casefold))
         self._update_progress()
+        self._refresh_thumbnail_styles()
         if not quiet:
             self.status_var.set(f"Saved {self.current_record.sidecar_path.name}")
+        return True
+
+    def save_selected(self) -> bool:
+        """Apply the controls' label to every selected thumbnail."""
+        indices = sorted(self.selected_indices)
+        if not self.records or not indices:
+            return False
+
+        presence = self.presence_var.get()
+        if presence not in {"yes", "no"}:
+            messagebox.showwarning(
+                "Label required", "Choose Yes or No for bird presence.", parent=self.root
+            )
+            return False
+
+        bird_present = presence == "yes"
+        species = self.species_var.get()
+        try:
+            # Validate the label before asking for confirmation or touching files.
+            apply_manual_label({}, bird_present=bird_present, species=species)
+        except ValueError as error:
+            messagebox.showwarning("Label required", str(error), parent=self.root)
+            return False
+
+        if len(indices) > 1:
+            existing_count = sum(
+                1
+                for index in indices
+                if self.records[index].image_path in self.labeled_images
+            )
+            overwrite_note = (
+                f"\n\nThis will replace {existing_count} existing manual label(s)."
+                if existing_count
+                else ""
+            )
+            if not messagebox.askyesno(
+                "Apply label to selected images?",
+                f"Save the same label to {len(indices)} selected images?{overwrite_note}",
+                parent=self.root,
+            ):
+                return False
+
+        updates: list[tuple[ImageRecord, dict[str, Any]]] = []
+        for index in indices:
+            record = self.records[index]
+            try:
+                data = read_sidecar(record)
+                updated = apply_manual_label(
+                    data, bird_present=bird_present, species=species
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                messagebox.showerror(
+                    "Cannot save selected labels",
+                    f"No files were changed because {record.sidecar_path.name} could not "
+                    f"be read or validated:\n\n{error}",
+                    parent=self.root,
+                )
+                return False
+            updates.append((record, updated))
+
+        saved_count = 0
+        try:
+            for record, updated in updates:
+                write_json_atomic(record.sidecar_path, updated)
+                saved_count += 1
+        except OSError as error:
+            messagebox.showerror(
+                "Could not save selected labels",
+                f"Saved {saved_count} of {len(updates)} labels before an error occurred:\n\n{error}",
+                parent=self.root,
+            )
+            self.labeled_images.update(
+                record.image_path for record, _updated in updates[:saved_count]
+            )
+            self._update_progress()
+            self._refresh_thumbnail_styles()
+            return False
+
+        self.labeled_images.update(record.image_path for record, _updated in updates)
+        if self.index in self.selected_indices:
+            self.sidecar_data = updates[indices.index(self.index)][1]
+            self.sidecar_load_error = None
+            self.dirty = False
+        species_values = set(self.species_box.cget("values"))
+        if bird_present:
+            species_values.add(species.strip())
+        self.species_box.configure(values=sorted(species_values, key=str.casefold))
+        self._update_progress()
+        self._refresh_thumbnail_styles()
+        label_description = species.strip() if bird_present else "No bird"
+        self.status_var.set(
+            f"Saved “{label_description}” to {len(updates)} selected image(s)"
+        )
+        return True
+
+    def delete_selected(self) -> bool:
+        """Permanently delete selected photos and their existing sidecars."""
+        indices = sorted(
+            index for index in self.selected_indices if 0 <= index < len(self.records)
+        )
+        if not indices:
+            return False
+
+        targets = [self.records[index] for index in indices]
+        existing_sidecars = sum(record.sidecar_path.exists() for record in targets)
+        names = "\n".join(f"  • {record.image_path.name}" for record in targets[:6])
+        if len(targets) > 6:
+            names += f"\n  • …and {len(targets) - 6} more"
+        sidecar_note = (
+            f"\n\n{existing_sidecars} corresponding JSON sidecar(s) will also be deleted."
+            if existing_sidecars
+            else "\n\nNo corresponding JSON sidecars currently exist."
+        )
+        unsaved_note = (
+            "\n\nUnsaved label changes for the current photo will be discarded."
+            if self.dirty and self.index in indices
+            else ""
+        )
+        if not messagebox.askyesno(
+            "Permanently delete selected photos?",
+            f"Permanently delete {len(targets)} selected photo(s)?\n\n"
+            f"{names}{sidecar_note}{unsaved_note}\n\nThis cannot be undone.",
+            icon="warning",
+            parent=self.root,
+        ):
+            return False
+
+        old_records = self.records
+        old_index = self.index
+        current_path = self.current_record.image_path
+        selected_paths = {
+            old_records[index].image_path
+            for index in self.selected_indices
+            if 0 <= index < len(old_records)
+        }
+        deleted_paths: set[Path] = set()
+        deleted_sidecars = 0
+        errors: list[str] = []
+
+        for record in targets:
+            try:
+                record.image_path.unlink()
+            except FileNotFoundError:
+                # Treat a concurrently removed photo as deleted and clean up its
+                # paired sidecar so the UI can discard the stale record.
+                pass
+            except OSError as error:
+                errors.append(f"{record.image_path.name}: {error}")
+                continue
+
+            deleted_paths.add(record.image_path)
+            self.labeled_images.discard(record.image_path)
+            try:
+                if record.sidecar_path.exists():
+                    record.sidecar_path.unlink()
+                    deleted_sidecars += 1
+            except OSError as error:
+                errors.append(f"{record.sidecar_path.name}: {error}")
+
+        if not deleted_paths:
+            self.status_var.set("No photos were deleted")
+            messagebox.showerror(
+                "Could not delete selected photos",
+                "No photos were deleted:\n\n" + "\n".join(errors),
+                parent=self.root,
+            )
+            return False
+
+        self.records = [
+            record for record in old_records if record.image_path not in deleted_paths
+        ]
+        selected_paths.difference_update(deleted_paths)
+
+        if not self.records:
+            deleted_count = len(deleted_paths)
+            self.dirty = False
+            self._clear_current(
+                f"Deleted {deleted_count} photo(s) and {deleted_sidecars} sidecar(s)"
+            )
+        else:
+            remaining_paths = [record.image_path for record in self.records]
+            current_deleted = current_path in deleted_paths
+            if current_deleted:
+                self.index = min(old_index, len(self.records) - 1)
+            else:
+                self.index = remaining_paths.index(current_path)
+
+            self.selected_indices = {
+                index
+                for index, record in enumerate(self.records)
+                if record.image_path in selected_paths
+            }
+            if not self.selected_indices:
+                self.selected_indices = {self.index}
+            self.selection_anchor = self.index
+            self._build_thumbnails()
+            self._set_controls_available(True)
+            if current_deleted:
+                self.load_current(update_selection=False)
+            else:
+                self._refresh_thumbnail_styles()
+                self._update_selection_controls()
+                self._show_current_thumbnail()
+                self._update_progress()
+
+            status = (
+                f"Deleted {len(deleted_paths)} photo(s) and "
+                f"{deleted_sidecars} sidecar(s)"
+            )
+            if self.dirty:
+                status += "; current photo still has unsaved changes"
+            self.status_var.set(status)
+
+        if errors:
+            messagebox.showerror(
+                "Deletion incomplete",
+                f"Deleted {len(deleted_paths)} of {len(targets)} selected photo(s), "
+                "but some files could not be removed:\n\n" + "\n".join(errors),
+                parent=self.root,
+            )
+            return False
         return True
 
     def save_and_next(self) -> None:

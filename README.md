@@ -11,6 +11,7 @@ Firmware and local-network receiver tools for a bird-feeder monitoring system. T
 - Saves the JPEG under `/birds` on microSD only when the Pi explicitly confirms a bird
 - Exposes HTTP endpoints for on-demand capture, live config, and status
 - Loads and persists configuration on a microSD card, so settings survive reflashing
+- Includes a standalone laptop job for one-shot or interval environment-dataset captures
 
 ## Hardware
 
@@ -43,6 +44,10 @@ Firmware and local-network receiver tools for a bird-feeder monitoring system. T
    ```
 
 If upload fails, hold the ESP32-CAM's `IO0` pin low (or hold the programmer's reset/boot buttons per its silkscreen) while it starts, then release once the upload begins.
+
+For scheduled background/environment collection, including a one-frame-every-30-minutes
+example and Windows Task Scheduler setup, see
+[`server/README.md`](server/README.md#scheduled-environment-negative-candidates).
 
 ## Configuration
 
@@ -105,8 +110,11 @@ The camera has two persistent operating modes plus one temporary exclusive state
 
 - **Idle** leaves continuous capture disabled while retaining manual capture and
   configuration access.
-- **Motion** runs the ESP32 software detector using 160×120 JPEG frames decoded
-  to an 80×60 luminance reference. It reports `motion_arming` until the observed
+- **Motion** runs the ESP32 software detector using JPEG frames decoded to an
+  80×60 luminance reference. QQVGA, QVGA, and VGA capture configurations monitor
+  at their configured resolution so a trigger does not restart AEC/AGC just
+  before the first burst frame; other capture sizes use QQVGA for monitoring. It
+  reports `motion_arming` until the observed
   AEC-lines × nominal-gain product remains stable for the configured number of
   frames and a reference exists, then `motion_armed`. A trigger captures and
   uploads a JPEG before automatically re-arming the detector.

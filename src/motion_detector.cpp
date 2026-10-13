@@ -217,6 +217,26 @@ float median(float *values, int count) {
   return 0.5f * (values[count / 2 - 1] + values[count / 2]);
 }
 
+bool isSupportedMotionFrame(const camera_fb_t *frameBuffer) {
+  if (frameBuffer == nullptr) return false;
+  return (frameBuffer->width == 160 && frameBuffer->height == 120) ||
+         (frameBuffer->width == 320 && frameBuffer->height == 240) ||
+         (frameBuffer->width == 640 && frameBuffer->height == 480);
+}
+
+bool decodeMotionFrame(const camera_fb_t *frameBuffer) {
+  if (frameBuffer->width == 160 && frameBuffer->height == 120) {
+    return jpg2rgb565(frameBuffer->buf, frameBuffer->len, decodedMotionFrame, JPG_SCALE_2X);
+  }
+  if (frameBuffer->width == 320 && frameBuffer->height == 240) {
+    return jpg2rgb565(frameBuffer->buf, frameBuffer->len, decodedMotionFrame, JPG_SCALE_4X);
+  }
+  if (frameBuffer->width == 640 && frameBuffer->height == 480) {
+    return jpg2rgb565(frameBuffer->buf, frameBuffer->len, decodedMotionFrame, JPG_SCALE_8X);
+  }
+  return false;
+}
+
 void effectiveMotionRoi(int &x, int &y, int &width, int &height) {
   x = constrain(static_cast<int>(floorf(cfg.motionRoiX * kMotionWidth)), 0, kMotionWidth - 1);
   y = constrain(static_cast<int>(floorf(cfg.motionRoiY * kMotionHeight)), 0, kMotionHeight - 1);
@@ -322,7 +342,7 @@ void checkMotion() {
       setCameraRuntimeError("Could not drain stale motion frame");
       return;
     }
-    // A QQVGA/VGA transition restarts AEC/AGC convergence. Keep an existing
+    // A frame-size transition restarts AEC/AGC convergence. Keep an existing
     // background when requested, but never compare against a transition frame.
     restartExposureSettling();
   }
@@ -335,7 +355,7 @@ void checkMotion() {
   }
 
   camera_fb_t *frameBuffer = acquireCameraFrame();
-  if (!isCompleteJpeg(frameBuffer) || frameBuffer->width != 160 || frameBuffer->height != 120) {
+  if (!isCompleteJpeg(frameBuffer) || !isSupportedMotionFrame(frameBuffer)) {
     if (frameBuffer != nullptr) {
       esp_camera_fb_return(frameBuffer);
     }
@@ -343,7 +363,7 @@ void checkMotion() {
     return;
   }
 
-  if (!jpg2rgb565(frameBuffer->buf, frameBuffer->len, decodedMotionFrame, JPG_SCALE_2X)) {
+  if (!decodeMotionFrame(frameBuffer)) {
     esp_camera_fb_return(frameBuffer);
     setCameraRuntimeError("Motion JPEG decode failed");
     return;

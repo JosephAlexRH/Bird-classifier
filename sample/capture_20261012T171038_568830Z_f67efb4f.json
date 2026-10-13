@@ -1,0 +1,195 @@
+{
+  "bytes": 44406,
+  "calibration_type": "normal",
+  "camera": {
+    "driver": {
+      "arduino_esp32_version": "2.0.17",
+      "arduino_esp32_version_value": 131089,
+      "esp32_camera": {
+        "bundled_revision": "f0bb429",
+        "bundled_revision_source": "Arduino-ESP32 2.0.17 tools/sdk/versions.txt",
+        "distribution": "bundled_with_arduino_esp32",
+        "independent_version": null
+      },
+      "framebuffer": {
+        "age_qualifier": "queued_frame_and_ov2640_aec_agc_pipeline_can_make_frame_older_than_post_frame_registers",
+        "fb_count": 1,
+        "grab_mode": "CAMERA_GRAB_WHEN_EMPTY",
+        "grab_mode_value": 0,
+        "queue_age_possible": true
+      }
+    },
+    "observed": {
+      "capture": {
+        "frame_size": {
+          "name": "VGA",
+          "value": 8
+        },
+        "framebuffer_bytes": 44406,
+        "frames_since_boot": 17298,
+        "height": 480,
+        "jpeg_quality": 10,
+        "pixel_format": {
+          "name": "JPEG",
+          "value": 4
+        },
+        "width": 640
+      },
+      "controls": {
+        "auto_exposure": 1,
+        "auto_exposure_dsp": 0,
+        "auto_gain": 1,
+        "auto_white_balance": 1,
+        "auto_white_balance_gain": 1,
+        "brightness": 0,
+        "contrast": 0,
+        "exposure_level": 0,
+        "gain_ceiling": 0,
+        "horizontal_mirror": 0,
+        "saturation": 0,
+        "semantic": "sensor_driver_cached_state_not_live_register_observation",
+        "special_effect": 0,
+        "vertical_flip": 0,
+        "white_balance_mode": 0
+      },
+      "ov2640_registers": {
+        "aec": {
+          "ae_saturated": false,
+          "ae_saturated_qualifier": "derived_from_aec_enabled_consistent_lines_at_driver_limit_not_sensor_status_bit",
+          "ae_saturated_valid": true,
+          "aec_driver_limit_lines": 1200,
+          "aec_lines": 25,
+          "aec_max_lines": 1200,
+          "aec_max_lines_source": "esp32_camera_f0bb429_set_aec_value_driver_limit",
+          "consistent": true,
+          "max_consistency_attempts": 3,
+          "read_attempts": 2,
+          "sensor_bank_0x04_mask_0x03": 1,
+          "sensor_bank_0x10_mask_0xff": 6,
+          "sensor_bank_0x45_mask_0x3f": 0,
+          "valid": true
+        },
+        "dsp_raw_controls": {
+          "dsp_bank_0xcc": 128,
+          "dsp_bank_0xcd": 128,
+          "dsp_bank_0xce": 128,
+          "label": "raw_controls_not_verified_live_awb_gains",
+          "valid": true,
+          "verified_live_awb_gains": false
+        },
+        "exposure_gain_product": 25,
+        "gain": {
+          "nominal_multiplier": 1,
+          "nominal_multiplier_formula": "2^popcount(high_nibble)*(1+low_nibble/16)",
+          "sensor_bank_0x00_mask_0xff": 0,
+          "valid": true
+        },
+        "observation_qualifier": "post_frame_non_atomic_with_buffer_and_sensor_pipeline_delay",
+        "registers_are_exact_frame_state": false
+      }
+    },
+    "register_dump": {
+      "address_range": "0x00-0xfe_per_bank",
+      "binary_layout": "ascii_OVD1_then_dsp_255_values_then_dsp_32_byte_validity_bitmap_then_sensor_equivalent",
+      "canonical_bytes": 578,
+      "format": "ov2640_banked_register_dump_v1",
+      "payload_included": false,
+      "qualifier": "best_effort_non_atomic_register_sweep",
+      "revision": 1,
+      "sha256": "4067c37288ac78231e259809b18b5d7b76c06ef06f3eb7b49db449d60b0b43ad",
+      "valid": true
+    },
+    "requested": {
+      "capture": {
+        "frame_size": {
+          "name": "VGA",
+          "value": 8
+        },
+        "jpeg_quality": 10,
+        "pixel_format": {
+          "name": "JPEG",
+          "value": 4
+        }
+      },
+      "motion": {
+        "check_ms": 200,
+        "enabled": true,
+        "sensitivity": 0.05,
+        "threshold": 20
+      },
+      "pipeline": {
+        "bird_confidence_threshold": 0.8,
+        "save_birds_to_sd": true
+      }
+    },
+    "sensor": {
+      "manufacturer": "OmniVision",
+      "manufacturer_high": 127,
+      "manufacturer_high_hex": "0x7F",
+      "manufacturer_id": 32674,
+      "manufacturer_id_hex": "0x7FA2",
+      "manufacturer_low": 162,
+      "manufacturer_low_hex": "0xA2",
+      "model": "OV2640",
+      "pid": 38,
+      "pid_hex": "0x0026",
+      "sccb_address": 48,
+      "sccb_address_hex": "0x30",
+      "version": 66,
+      "version_hex": "0x42",
+      "xclk_hz": 20000000
+    },
+    "timing": {
+      "frame_boot_us": 1941569494,
+      "frame_timestamp_semantic": "camera_driver_framebuffer_timestamp_not_exposure_start",
+      "frame_utc_estimate": "2026-10-12T17:10:37.111804Z",
+      "ms_since_settings_change": 1073,
+      "register_read_boot_us": 1941609769,
+      "register_read_minus_frame_us": 40275,
+      "register_timestamp_semantic": "immediately_before_first_sccb_register_read",
+      "settings_revision": 37
+    }
+  },
+  "capture_id": "capture_20261012T171038_568830Z_f67efb4f",
+  "device": {
+    "boot_id": "e09f8245-4a73-43d6-afc6-d9855cff4903",
+    "clock": {
+      "device_time_boot_us": 1941623100,
+      "device_time_utc": "2026-10-12T17:10:37.165410Z",
+      "semantic": "wall_clock_sampled_at_device_time_boot_us_ntp_may_step",
+      "sync_status": "synchronized"
+    },
+    "config": {
+      "file_hash_valid": true,
+      "file_sha256": "83ebefd7213968deabaa8e44ade38d51055e8789aebde7afab43dac34f786c2a",
+      "hash_scope": "exact_active_config_file_bytes",
+      "storage": "SD card"
+    },
+    "resources": {
+      "chip_temperature_c": 53.33333,
+      "chip_temperature_qualifier": "uncalibrated_internal_die_temperature_not_ambient",
+      "heap": {
+        "free_bytes": 163656,
+        "largest_free_block_bytes": 110580,
+        "minimum_free_bytes_since_boot": 133968
+      },
+      "psram": {
+        "free_bytes": 4103643,
+        "largest_free_block_bytes": 4063220,
+        "minimum_free_bytes_since_boot": 4086267,
+        "present": true,
+        "total_bytes": 4192059
+      }
+    }
+  },
+  "filename": "capture_20261012T171038_568830Z_f67efb4f.jpg",
+  "firmware_metadata_schema_version": 4,
+  "label": "",
+  "metadata_error": null,
+  "note": "",
+  "received_at": "2026-10-12T17:10:38.568+00:00",
+  "schema_version": 3,
+  "sha256": "a74b7532495d81746fcc6778b38ecc3a199ee3909023184f2bc74897659fe414",
+  "sidecar": "capture_20261012T171038_568830Z_f67efb4f.json",
+  "source": "motion"
+}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Copy labeled (confirmed) images and their sidecars from a manifest to another drive using robocopy.
+Copy labeled images and their sidecars from a manifest to another drive using robocopy.
 
 Usage (Windows):
     python copy_confirmed.py manifest.tsv E:\\ESP32Cam_confirmed --dry-run
@@ -23,12 +23,12 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path, PureWindowsPath
 
-# Robocopy takes file names on the command line; Windows caps a command at ~32k chars.
+
 MAX_ARG_CHARS = 20000
 
 
 def read_manifest(path):
-    """Read a CSV/TSV manifest, detecting the delimiter from the header line."""
+    """Read a CSV/TSV manifest"""
     with open(path, newline="", encoding="utf-8-sig") as f:
         header = f.readline()
         delimiter = "\t" if header.count("\t") >= header.count(",") else ","

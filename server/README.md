@@ -52,6 +52,56 @@ optional `include/secrets.h` made from `include/secrets.example.h` supplies a
 compile-time fallback. Do not commit either a populated `config.json` or
 `secrets.h`.
 
+## Scheduled environment-negative candidates
+
+`camera_capture_job.py` is a small standalone collector for building an
+environment dataset without adding scheduling responsibilities to the laptop
+dashboard. It calls the ESP32's existing `/capture` endpoint directly, so the
+Flask test server does not need to be running.
+
+Take one picture:
+
+```powershell
+python .\server\camera_capture_job.py `
+  --camera-url http://192.168.1.84 `
+  --save-dir E:\Datasets\ESP32_environment
+```
+
+Or keep the command open and take the first picture immediately, then one every
+30 minutes:
+
+```powershell
+python .\server\camera_capture_job.py `
+  --camera-url http://192.168.1.84 `
+  --save-dir E:\Datasets\ESP32_environment `
+  --interval-minutes 30
+```
+
+Each successful request uses the normal `CaptureStore` layout: a JPEG, JSON
+sidecar, and `manifest.jsonl` row. Records have `source: "environment"` and a
+`collection` object whose purpose is `environment_negative_candidate` and whose
+review status is `unreviewed`. The collector deliberately does **not** add a
+`manual_label`: a scheduled frame can still contain a bird.
+
+Keep these candidates in their own directory and review them before training:
+
+```powershell
+python .\image_labeler.py E:\Datasets\ESP32_environment
+```
+
+For unattended collection on Windows, the recommended setup is a Task Scheduler
+task that invokes the one-picture command every 30 minutes. Set the action's
+**Program/script** to the path of `python.exe`, put the script and its arguments
+in **Add arguments**, set **Start in** to this project directory, and configure
+the task not to start a second instance when one is already running. This is
+more restart-safe than leaving the interval process open.
+
+The laptop must be awake and on the same network as the ESP32. An active MJPEG
+stream occupies the firmware's single HTTP client and prevents captures; stop
+streaming before collection. A brief motion upload can also delay a request.
+One-shot mode exits nonzero on failure so Task Scheduler can report it; interval
+mode logs an individual failure and tries again at the next fixed-rate slot.
+
 ## Laptop test server
 
 Install the dependency from the PlatformIO project directory:

@@ -382,8 +382,16 @@ bool configureMotionCapture(bool &changed) {
 
   // The camera HAL was initialized for JPEG and cannot safely be changed to
   // raw grayscale by updating only the OV2640 sensor. Keep the HAL and sensor
-  // in JPEG mode, then decode the QQVGA frame for motion analysis.
-  return setJpegMode(sensor, FRAMESIZE_QQVGA, cfg.jpegQuality, changed);
+  // in JPEG mode. QQVGA, QVGA, and VGA can all be decoded directly to the same
+  // 80x60 analysis image. Keeping those configured capture sizes here avoids an
+  // AEC/AGC restart immediately before the first JPEG in a motion burst.
+  framesize_t motionFramesize = FRAMESIZE_QQVGA;
+  const framesize_t configuredFramesize = static_cast<framesize_t>(cfg.framesize);
+  if (configuredFramesize == FRAMESIZE_QQVGA || configuredFramesize == FRAMESIZE_QVGA ||
+      configuredFramesize == FRAMESIZE_VGA) {
+    motionFramesize = configuredFramesize;
+  }
+  return setJpegMode(sensor, motionFramesize, cfg.jpegQuality, changed);
 }
 
 camera_fb_t *acquireCameraFrame() {
