@@ -13,6 +13,10 @@ data/config.json
 # Jupyter autosaves
 .ipynb_checkpoints/
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 # Generated outputs (iNaturalist, Bridge, CUB)
 Notebooks/Outputs/
 
