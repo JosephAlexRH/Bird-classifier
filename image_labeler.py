@@ -33,6 +33,8 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".
 MANUAL_LABEL_KEY = "manual_label"
 UNKNOWN_SPECIES = "Unknown"
 THUMBNAIL_SIZE = (140, 96)
+THUMBNAIL_ROW_HEIGHT = 126
+THUMBNAIL_OVERSCAN_ROWS = 2
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,36 @@ class ImageRecord:
     image_path: Path
     sidecar_path: Path
     pairing: str
+
+
+@dataclass(frozen=True)
+class ThumbnailCanvasItem:
+    """Canvas objects for one currently materialized thumbnail row."""
+
+    background_id: int
+    preview_id: int
+    name_id: int
+
+
+def visible_thumbnail_range(
+    record_count: int,
+    visible_top: float,
+    viewport_height: int,
+    *,
+    row_height: int = THUMBNAIL_ROW_HEIGHT,
+    overscan_rows: int = THUMBNAIL_OVERSCAN_ROWS,
+) -> range:
+    """Return the bounded rows needed for a virtualized thumbnail viewport."""
+    if record_count <= 0 or row_height <= 0:
+        return range(0)
+    overscan_rows = max(overscan_rows, 0)
+    first = min(
+        max(int(max(visible_top, 0) // row_height) - overscan_rows, 0),
+        record_count,
+    )
+    last_visible = int((max(visible_top, 0) + max(viewport_height, 1)) // row_height)
+    end = min(last_visible + overscan_rows + 1, record_count)
+    return range(first, end)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -245,7 +277,8 @@ class BirdLabelerApp:
         self.selected_indices: set[int] = set()
         self.selection_anchor: int | None = None
         self.thumbnail_images: dict[int, ImageTk.PhotoImage] = {}
-        self.thumbnail_items: dict[int, tuple[tk.Frame, tk.Label, tk.Label]] = {}
+        self.thumbnail_items: dict[int, ThumbnailCanvasItem] = {}
+        self.thumbnail_refresh_job: str | None = None
 
         self.presence_var = tk.StringVar(value="unlabeled")
         self.species_var = tk.StringVar()
@@ -313,22 +346,16 @@ class BirdLabelerApp:
             width=170,
             background="#e6e6e6",
             highlightthickness=0,
-            yscrollcommand=gallery_scrollbar.set,
+            yscrollcommand=self._thumbnail_scroll_changed,
         )
         self.thumbnail_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        gallery_scrollbar.configure(command=self.thumbnail_canvas.yview)
-        self.thumbnail_frame = tk.Frame(self.thumbnail_canvas, background="#e6e6e6")
-        self.thumbnail_window = self.thumbnail_canvas.create_window(
-            (0, 0), window=self.thumbnail_frame, anchor=tk.NW
-        )
-        self.thumbnail_frame.bind(
-            "<Configure>",
-            lambda _event: self.thumbnail_canvas.configure(
-                scrollregion=self.thumbnail_canvas.bbox("all")
-            ),
-        )
-        self.thumbnail_canvas.bind("<Configure>", self._resize_thumbnail_frame)
+        self.thumbnail_scrollbar = gallery_scrollbar
+        gallery_scrollbar.configure(command=self._scroll_thumbnail_view)
+        self.thumbnail_canvas.bind("<Configure>", self._thumbnail_canvas_resized)
+        self.thumbnail_canvas.tag_bind("thumbnail", "<Button-1>", self._thumbnail_canvas_clicked)
         self.thumbnail_canvas.bind("<MouseWheel>", self._scroll_thumbnails)
+        self.thumbnail_canvas.bind("<Button-4>", self._scroll_thumbnails)
+        self.thumbnail_canvas.bind("<Button-5>", self._scroll_thumbnails)
         ttk.Label(
             gallery,
             text="Click to view. Ctrl-click adds/removes; Shift-click selects a range.",
@@ -547,12 +574,53 @@ class BirdLabelerApp:
             self.status_var.set("Unsaved changes")
         self._update_species_state()
 
-    def _resize_thumbnail_frame(self, event: tk.Event[Any]) -> None:
-        self.thumbnail_canvas.itemconfigure(self.thumbnail_window, width=event.width)
+    def _thumbnail_scroll_changed(self, first: str, last: str) -> None:
+        self.thumbnail_scrollbar.set(first, last)
+        self._schedule_thumbnail_refresh()
+
+    def _scroll_thumbnail_view(self, *args: str) -> None:
+        self.thumbnail_canvas.yview(*args)
+        self._schedule_thumbnail_refresh()
+
+    def _thumbnail_canvas_resized(self, _event: tk.Event[Any]) -> None:
+        width = max(self.thumbnail_canvas.winfo_width(), THUMBNAIL_SIZE[0] + 12)
+        for index, item in self.thumbnail_items.items():
+            row_top = index * THUMBNAIL_ROW_HEIGHT
+            self.thumbnail_canvas.coords(
+                item.background_id,
+                3,
+                row_top + 3,
+                width - 4,
+                row_top + THUMBNAIL_ROW_HEIGHT - 3,
+            )
+            self.thumbnail_canvas.coords(item.preview_id, width // 2, row_top + 52)
+        self._schedule_thumbnail_refresh()
+
+    def _schedule_thumbnail_refresh(self) -> None:
+        if self.thumbnail_refresh_job is None:
+            self.thumbnail_refresh_job = self.root.after_idle(self._refresh_visible_thumbnails)
 
     def _scroll_thumbnails(self, event: tk.Event[Any]) -> str:
-        self.thumbnail_canvas.yview_scroll(int(-event.delta / 120), "units")
+        button = getattr(event, "num", None)
+        if button in {4, 5}:
+            direction = -1 if button == 4 else 1
+        else:
+            delta = getattr(event, "delta", 0)
+            direction = -1 if delta > 0 else 1
+        visible_top = max(self.thumbnail_canvas.canvasy(0) + direction * 32, 0)
+        content_height = max(len(self.records) * THUMBNAIL_ROW_HEIGHT, 1)
+        self.thumbnail_canvas.yview_moveto(visible_top / content_height)
+        self._schedule_thumbnail_refresh()
         return "break"
+
+    def _thumbnail_canvas_clicked(self, event: tk.Event[Any]) -> str | None:
+        current = self.thumbnail_canvas.find_withtag("current")
+        if not current:
+            return None
+        for tag in self.thumbnail_canvas.gettags(current[0]):
+            if tag.startswith("thumbnail-index-"):
+                return self._thumbnail_clicked(event, int(tag.removeprefix("thumbnail-index-")))
+        return None
 
     @staticmethod
     def _selection_modifiers(event: tk.Event[Any]) -> tuple[bool, bool]:
@@ -601,91 +669,139 @@ class BirdLabelerApp:
         self._update_selection_controls()
 
     def _build_thumbnails(self) -> None:
-        for child in self.thumbnail_frame.winfo_children():
-            child.destroy()
+        if self.thumbnail_refresh_job is not None:
+            self.root.after_cancel(self.thumbnail_refresh_job)
+            self.thumbnail_refresh_job = None
+        self.thumbnail_canvas.delete("all")
         self.thumbnail_images.clear()
         self.thumbnail_items.clear()
-
-        for index, record in enumerate(self.records):
-            item = tk.Frame(
-                self.thumbnail_frame,
-                background="#e6e6e6",
-                borderwidth=2,
-                relief=tk.FLAT,
-                cursor="hand2",
-            )
-            item.pack(fill=tk.X, padx=4, pady=3)
-            try:
-                with Image.open(record.image_path) as opened:
-                    thumbnail = ImageOps.contain(
-                        ImageOps.exif_transpose(opened).convert("RGB"),
-                        THUMBNAIL_SIZE,
-                        method=Image.Resampling.LANCZOS,
-                    )
-                photo = ImageTk.PhotoImage(thumbnail)
-                self.thumbnail_images[index] = photo
-                image_label = tk.Label(item, image=photo, background="#e6e6e6")
-            except (OSError, ValueError):
-                image_label = tk.Label(
-                    item,
-                    text="Image unavailable",
-                    width=20,
-                    height=6,
-                    background="#404040",
-                    foreground="white",
-                )
-            image_label.pack(padx=3, pady=(3, 1))
-            name_label = tk.Label(
-                item,
-                text=record.image_path.name,
-                anchor=tk.W,
-                background="#e6e6e6",
-                font=("TkDefaultFont", 8),
-            )
-            name_label.pack(fill=tk.X, padx=3, pady=(0, 3))
-            self.thumbnail_items[index] = (item, image_label, name_label)
-            for widget in (item, image_label, name_label):
-                widget.bind(
-                    "<Button-1>",
-                    lambda event, selected=index: self._thumbnail_clicked(event, selected),
-                )
-                widget.bind("<MouseWheel>", self._scroll_thumbnails)
-
+        content_height = max(len(self.records) * THUMBNAIL_ROW_HEIGHT, 1)
+        self.thumbnail_canvas.configure(
+            scrollregion=(0, 0, max(self.thumbnail_canvas.winfo_width(), 1), content_height),
+        )
         self.thumbnail_canvas.yview_moveto(0)
+        self._refresh_visible_thumbnails()
+
+    def _load_thumbnail(self, index: int) -> ImageTk.PhotoImage:
+        """Decode one small preview, asking supported formats to downsample early."""
+        with Image.open(self.records[index].image_path) as opened:
+            opened.draft("RGB", THUMBNAIL_SIZE)
+            thumbnail = ImageOps.exif_transpose(opened).convert("RGB")
+            thumbnail.thumbnail(
+                THUMBNAIL_SIZE,
+                resample=Image.Resampling.LANCZOS,
+                reducing_gap=3.0,
+            )
+        return ImageTk.PhotoImage(thumbnail)
+
+    def _create_thumbnail_item(self, index: int) -> None:
+        width = max(self.thumbnail_canvas.winfo_width(), THUMBNAIL_SIZE[0] + 12)
+        row_top = index * THUMBNAIL_ROW_HEIGHT
+        tags = ("thumbnail", f"thumbnail-index-{index}")
+        background_id = self.thumbnail_canvas.create_rectangle(
+            3,
+            row_top + 3,
+            width - 4,
+            row_top + THUMBNAIL_ROW_HEIGHT - 3,
+            fill="#e6e6e6",
+            outline="#e6e6e6",
+            width=2,
+            tags=tags,
+        )
+        try:
+            photo = self._load_thumbnail(index)
+            self.thumbnail_images[index] = photo
+            preview_id = self.thumbnail_canvas.create_image(
+                width // 2,
+                row_top + 52,
+                image=photo,
+                anchor=tk.CENTER,
+                tags=tags,
+            )
+        except (OSError, ValueError, MemoryError, Image.DecompressionBombError, tk.TclError):
+            preview_id = self.thumbnail_canvas.create_text(
+                width // 2,
+                row_top + 52,
+                text="Image unavailable",
+                fill="#8b1a1a",
+                font=("TkDefaultFont", 9, "bold"),
+                tags=tags,
+            )
+        name_id = self.thumbnail_canvas.create_text(
+            8,
+            row_top + 112,
+            text=self.records[index].image_path.name,
+            anchor=tk.W,
+            fill="#202020",
+            font=("TkDefaultFont", 8),
+            tags=tags,
+        )
+        self.thumbnail_items[index] = ThumbnailCanvasItem(background_id, preview_id, name_id)
+
+    def _delete_thumbnail_item(self, index: int) -> None:
+        item = self.thumbnail_items.pop(index)
+        for canvas_id in (item.background_id, item.preview_id, item.name_id):
+            self.thumbnail_canvas.delete(canvas_id)
+        self.thumbnail_images.pop(index, None)
+
+    def _refresh_visible_thumbnails(self) -> None:
+        if self.thumbnail_refresh_job is not None:
+            try:
+                self.root.after_cancel(self.thumbnail_refresh_job)
+            except tk.TclError:
+                pass
+        self.thumbnail_refresh_job = None
+        if not self.records:
+            return
+        visible = visible_thumbnail_range(
+            len(self.records),
+            self.thumbnail_canvas.canvasy(0),
+            self.thumbnail_canvas.winfo_height(),
+        )
+        wanted = set(visible)
+        for index in set(self.thumbnail_items) - wanted:
+            self._delete_thumbnail_item(index)
+        for index in visible:
+            if index not in self.thumbnail_items:
+                self._create_thumbnail_item(index)
         self._refresh_thumbnail_styles()
 
     def _refresh_thumbnail_styles(self) -> None:
-        for index, (item, image_label, name_label) in self.thumbnail_items.items():
+        for index, item in self.thumbnail_items.items():
             selected = index in self.selected_indices
             current = index == self.index
             background = "#cfe8ff" if selected else "#e6e6e6"
             border = "#0067c0" if current else "#58a6d8" if selected else "#e6e6e6"
-            item.configure(background=border, relief=tk.SOLID if selected or current else tk.FLAT)
-            image_label.configure(background=background, foreground="#202020")
-            name_label.configure(
-                background=background,
-                foreground="#176b2c"
+            self.thumbnail_canvas.itemconfigure(
+                item.background_id,
+                fill=background,
+                outline=border,
+                width=2 if selected or current else 1,
+            )
+            self.thumbnail_canvas.itemconfigure(
+                item.name_id,
+                fill="#176b2c"
                 if self.records[index].image_path in self.labeled_images
                 else "#202020",
                 font=("TkDefaultFont", 8, "bold" if current else "normal"),
             )
 
     def _show_current_thumbnail(self) -> None:
-        item = self.thumbnail_items.get(self.index)
-        if item is None:
+        if self.index < 0 or not self.records:
             return
-        self.root.update_idletasks()
-        top = item[0].winfo_y()
-        bottom = top + item[0].winfo_height()
+        top = self.index * THUMBNAIL_ROW_HEIGHT
+        bottom = top + THUMBNAIL_ROW_HEIGHT
         visible_top = self.thumbnail_canvas.canvasy(0)
-        visible_bottom = visible_top + self.thumbnail_canvas.winfo_height()
-        content_height = max(self.thumbnail_frame.winfo_height(), 1)
+        viewport_height = max(self.thumbnail_canvas.winfo_height(), THUMBNAIL_ROW_HEIGHT)
+        visible_bottom = visible_top + viewport_height
+        content_height = max(len(self.records) * THUMBNAIL_ROW_HEIGHT, 1)
         if top < visible_top:
             self.thumbnail_canvas.yview_moveto(top / content_height)
         elif bottom > visible_bottom:
             self.thumbnail_canvas.yview_moveto(
-                max((bottom - self.thumbnail_canvas.winfo_height()) / content_height, 0)
+                max((bottom - viewport_height) / content_height, 0)
             )
+        self._refresh_visible_thumbnails()
 
     def choose_directory(self) -> None:
         if not self._confirm_leave_unsaved():
@@ -763,8 +879,11 @@ class BirdLabelerApp:
         self.labeled_images.clear()
         self.selected_indices.clear()
         self.selection_anchor = None
-        for child in self.thumbnail_frame.winfo_children():
-            child.destroy()
+        if self.thumbnail_refresh_job is not None:
+            self.root.after_cancel(self.thumbnail_refresh_job)
+            self.thumbnail_refresh_job = None
+        self.thumbnail_canvas.delete("all")
+        self.thumbnail_canvas.configure(scrollregion=(0, 0, 1, 1))
         self.thumbnail_images.clear()
         self.thumbnail_items.clear()
         self.index = -1
@@ -805,8 +924,19 @@ class BirdLabelerApp:
 
         try:
             with Image.open(record.image_path) as opened:
-                self.source_image = ImageOps.exif_transpose(opened).convert("RGB")
-        except (OSError, ValueError) as error:
+                target_size = (
+                    max(self.root.winfo_screenwidth(), self.canvas.winfo_width(), 1),
+                    max(self.root.winfo_screenheight(), self.canvas.winfo_height(), 1),
+                )
+                opened.draft("RGB", target_size)
+                source_image = ImageOps.exif_transpose(opened).convert("RGB")
+                source_image.thumbnail(
+                    target_size,
+                    resample=Image.Resampling.LANCZOS,
+                    reducing_gap=3.0,
+                )
+                self.source_image = source_image
+        except (OSError, ValueError, MemoryError, Image.DecompressionBombError) as error:
             self.source_image = None
             self.status_var.set(f"Could not open image: {error}")
 
@@ -864,10 +994,21 @@ class BirdLabelerApp:
                 font=("TkDefaultFont", 16),
             )
             return
-        display = ImageOps.contain(
-            self.source_image, (width, height), method=Image.Resampling.LANCZOS
-        )
-        self.tk_image = ImageTk.PhotoImage(display)
+        try:
+            display = ImageOps.contain(
+                self.source_image, (width, height), method=Image.Resampling.LANCZOS
+            )
+            self.tk_image = ImageTk.PhotoImage(display)
+        except (MemoryError, tk.TclError) as error:
+            self.tk_image = None
+            self.canvas.create_text(
+                width // 2,
+                height // 2,
+                text=f"Could not render image: {error}",
+                fill="white",
+                font=("TkDefaultFont", 12),
+            )
+            return
         self.canvas.create_image(
             self.canvas.winfo_width() // 2,
             self.canvas.winfo_height() // 2,

@@ -49,6 +49,35 @@ For scheduled background/environment collection, including a one-frame-every-30-
 example and Windows Task Scheduler setup, see
 [`server/README.md`](server/README.md#scheduled-environment-negative-candidates).
 
+## Bounding-box review tool
+
+`bbox_viewer.py` is a desktop Tkinter/Pillow viewer and single-box editor for the
+generated iNaturalist/CUB manifest CSVs and an unmodified `CUB_200_2011`
+directory. It never edits the source manifest. Human decisions (`boxed`,
+`no_bird`, or `skipped`) are atomically saved to a separate resumable CSV.
+
+Install Pillow (it is also listed in `server/requirements.txt`), then run:
+
+```powershell
+python .\bbox_viewer.py `
+  ".\Notebooks\Outputs\iNaturalist Outputs\Bounding Box Outputs\inaturalist_bird_bbox_manifest.csv" `
+  --image-root "E:\Datasets\iNaturalist\train_mini\train_mini"
+```
+
+If paths stored in the manifest are valid on the current machine,
+`--image-root` can be omitted. By default, reviews are written beside the
+manifest as `<manifest-name>_ground_truth.csv`; use `--ground-truth` to choose a
+different file. Orange dashed boxes are immutable source annotations or pseudo-
+labels, while cyan boxes are the editable human-review draft. Drag to draw,
+drag inside a box to move it, and drag a corner to resize it. Run
+`python .\bbox_viewer.py --help` for all options and shortcuts.
+
+Quote paths containing spaces. In PowerShell, a backtick (`` ` ``), not a
+backslash (`\`), continues a command on the next line. For the untouched
+iNaturalist mini training set, `--image-root` must be the directory directly
+containing the numbered class folders; the viewer joins it to each manifest
+row's `photo_relative_path`.
+
 ## Configuration
 
 Settings live in `config.json` on the SD card and are re-read every 10 seconds,
