@@ -1,4 +1,4 @@
-"""View and manually review single-bird bounding boxes.
+"""View and manually review one or more bird bounding boxes per image.
 
 The source manifest is never modified.  Human decisions are atomically saved to
 a separate CSV through :mod:`bbox_data`, so a review session can be resumed.
@@ -8,9 +8,10 @@ PowerShell examples::
     python .\\bbox_viewer.py ".\\Notebooks\\Outputs\\iNaturalist Outputs\\Bounding Box Outputs\\inaturalist_bird_bbox_manifest.csv" --image-root "E:\\Datasets\\iNaturalist\\train_mini\\train_mini"
     python .\\bbox_viewer.py "E:\\Datasets\\CUB_200\\CUB_200_2011"
 
-Drag on the image to create a box.  Drag inside it to move it and drag a corner
-handle to resize it.  The orange dashed rectangle is the immutable source box;
-the cyan rectangle is the human-review draft or saved box.
+Drag empty space to add a box. Drag inside a box to move it and drag a corner
+handle to resize it. Shift-drag adds an overlapping box. Machine/source boxes
+are deliberately hidden so they cannot bias the review; cyan rectangles are
+human-review boxes.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ from bbox_data import (
 )
 
 
-REVIEW_FILTERS = ("all", "unreviewed", "boxed", "no_bird", "skipped")
+REVIEW_FILTERS = ("all", "unreviewed", "boxed", "no_bird", "unusable", "skipped")
 SOURCE_BOX_FILTERS = ("all", "with box", "without box")
 SORT_KEYS = (
     "source_id",
@@ -182,6 +183,26 @@ def hit_test_bbox(box: BBox, x: float, y: float, tolerance: float) -> str | None
     normalized = box.normalized()
     if normalized.x <= x <= normalized.right and normalized.y <= y <= normalized.bottom:
         return "move"
+    return None
+
+
+def hit_test_bboxes(
+    boxes: list[BBox],
+    x: float,
+    y: float,
+    tolerance: float,
+    active_index: int | None = None,
+) -> tuple[int, str] | None:
+    """Hit-test boxes, preferring active handles and then the topmost box."""
+
+    if active_index is not None and 0 <= active_index < len(boxes):
+        mode = hit_test_bbox(boxes[active_index], x, y, tolerance)
+        if mode in bbox_handles(boxes[active_index]):
+            return active_index, mode
+    for index in range(len(boxes) - 1, -1, -1):
+        mode = hit_test_bbox(boxes[index], x, y, tolerance)
+        if mode is not None:
+            return index, mode
     return None
 
 
@@ -330,7 +351,10 @@ class ReviewSession:
     def counts(self) -> dict[str, int]:
         if self._counts_cache is not None:
             return self._counts_cache.copy()
-        counts = {state: 0 for state in ("unreviewed", "boxed", "no_bird", "skipped")}
+        counts = {
+            state: 0
+            for state in ("unreviewed", "boxed", "no_bird", "unusable", "skipped")
+        }
         source_ids = {record.source_id for record in self.dataset}
         for source_id in source_ids:
             review = self.reviews.get(source_id)
@@ -348,10 +372,12 @@ class DragState:
     start_x: float
     start_y: float
     original: BBox | None
+    index: int
+    previous_boxes: list[BBox]
 
 
 class BBoxViewerApp:
-    """Tk viewer/editor for one bounding box and decision per source image."""
+    """Tk viewer/editor for multiple bounding boxes per source image."""
 
     def __init__(
         self,
@@ -380,7 +406,8 @@ class BBoxViewerApp:
         self.rendered_size: tuple[int, int] | None = None
         self.image_size: tuple[int, int] | None = None
         self.transform: ImageCanvasTransform | None = None
-        self.draft_bbox: BBox | None = None
+        self.draft_bboxes: list[BBox] = []
+        self.active_box_index: int | None = None
         self.draft_dirty = False
         self.drag: DragState | None = None
         self.render_job: str | None = None
@@ -477,11 +504,19 @@ class BBoxViewerApp:
             fill=tk.X
         )
         ttk.Label(right, textvariable=self.box_var, justify=tk.LEFT, wraplength=290).pack(
-            fill=tk.X, pady=(8, 12)
+            fill=tk.X, pady=(8, 4)
+        )
+        ttk.Label(
+            right,
+            text="Drag empty space to add a bird. Shift-drag to add an overlapping box.",
+            justify=tk.LEFT,
+            wraplength=290,
+        ).pack(
+            fill=tk.X, pady=(0, 12)
         )
 
         self.accept_button = ttk.Button(
-            right, text="Accept Box + Next  [1]", command=self.accept_box_and_next
+            right, text="Accept Boxes + Next  [1]", command=self.accept_box_and_next
         )
         self.accept_button.pack(fill=tk.X, pady=2)
         self.no_bird_button = ttk.Button(
@@ -492,10 +527,16 @@ class BBoxViewerApp:
             right, text="Skip + Next  [3]", command=lambda: self.commit_and_next("skipped")
         )
         self.skip_button.pack(fill=tk.X, pady=2)
+        self.unusable_button = ttk.Button(
+            right,
+            text="Unusable / Noise + Next  [4]",
+            command=lambda: self.commit_and_next("unusable"),
+        )
+        self.unusable_button.pack(fill=tk.X, pady=2)
         ttk.Separator(right).pack(fill=tk.X, pady=8)
-        self.source_button = ttk.Button(right, text="Reset Draft to Source  [R]", command=self.use_source)
-        self.source_button.pack(fill=tk.X, pady=2)
-        self.delete_button = ttk.Button(right, text="Delete Draft  [Del]", command=self.delete_draft)
+        self.delete_button = ttk.Button(
+            right, text="Delete Selected Box  [Del]", command=self.delete_draft
+        )
         self.delete_button.pack(fill=tk.X, pady=2)
         self.clear_button = ttk.Button(right, text="Clear Saved Review", command=self.clear_review)
         self.clear_button.pack(fill=tk.X, pady=2)
@@ -538,8 +579,10 @@ class BBoxViewerApp:
         self.root.bind(
             "<Key-3>", lambda event: self._shortcut(event, lambda: self.commit_and_next("skipped"))
         )
+        self.root.bind(
+            "<Key-4>", lambda event: self._shortcut(event, lambda: self.commit_and_next("unusable"))
+        )
         self.root.bind("<Key-n>", lambda event: self._shortcut(event, self.next_unreviewed))
-        self.root.bind("<Key-r>", lambda event: self._shortcut(event, self.use_source))
         self.root.bind("<Delete>", lambda event: self._shortcut(event, self.delete_draft))
 
     def _shortcut(self, event: tk.Event[Any], action: Any) -> str | None:
@@ -666,7 +709,8 @@ class BBoxViewerApp:
         self.counts_var.set(
             f"Showing {len(self.session.filtered):,} of {len(self.session.dataset):,}  •  "
             f"unreviewed {counts['unreviewed']:,}  boxed {counts['boxed']:,}  "
-            f"no bird {counts['no_bird']:,}  skipped {counts['skipped']:,}"
+            f"no bird {counts['no_bird']:,}  unusable {counts['unusable']:,}  "
+            f"skipped {counts['skipped']:,}"
         )
         position = self.session.position + 1 if self.session.current else 0
         self.progress_var.set(f"{position:,} / {len(self.session.filtered):,}")
@@ -712,7 +756,9 @@ class BBoxViewerApp:
                 1, top + 1, width - 2, top + ROW_HEIGHT - 1,
                 fill=fill, outline="#b7b7b7" if selected else "", tags=tags,
             )
-            marker = {"boxed": "□", "no_bird": "×", "skipped": "–"}.get(state, "·")
+            marker = {
+                "boxed": "□", "no_bird": "×", "unusable": "!", "skipped": "–"
+            }.get(state, "·")
             label = f"{marker}  {record.source_id}"
             self.record_canvas.create_text(
                 7, top + ROW_HEIGHT / 2, text=label, anchor=tk.W,
@@ -748,7 +794,8 @@ class BBoxViewerApp:
         self.image_size = None
         self.transform = None
         self.drag = None
-        self.draft_bbox = None
+        self.draft_bboxes = []
+        self.active_box_index = None
         self.draft_dirty = False
         if not self.session or not self.session.current:
             self.title_var.set("No records match the filters")
@@ -778,10 +825,9 @@ class BBoxViewerApp:
             self.status_var.set(f"Could not open {path}: {error}")
 
         review = self.session.current_review
-        if review and review.bbox:
-            self.draft_bbox = review.bbox
-        elif record.bbox and self.image_size:
-            self.draft_bbox = record.bbox.clipped(*self.image_size)
+        if review and review.bboxes:
+            self.draft_bboxes = list(review.bboxes)
+        self.active_box_index = len(self.draft_bboxes) - 1 if self.draft_bboxes else None
 
         confidence = "—" if record.confidence is None else f"{record.confidence:.4f}"
         review_state = review.review_state if review else "unreviewed"
@@ -799,7 +845,7 @@ class BBoxViewerApp:
         )
         self.status_var.set(
             f"Loaded saved {review_state} review" if review else
-            "Source box loaded as a draft; explicitly accept it to save a human review"
+            "Ready for blind review; source predictions are hidden"
         )
         self._update_box_text()
         self._update_counts()
@@ -834,27 +880,22 @@ class BBoxViewerApp:
             self.rendered_size = display_size
         canvas.create_image(width / 2, height / 2, image=self.photo_image)
 
-        record = self.session.current if self.session else None
-        if record and record.bbox:
-            source_box = self.transform.image_bbox_to_canvas(record.bbox)
-            if source_box:
-                canvas.create_rectangle(
-                    source_box.x, source_box.y, source_box.right, source_box.bottom,
-                    outline="#ff9f1c", width=2, dash=(7, 4), tags="source-box",
-                )
-        if self.draft_bbox:
-            review_box = self.transform.image_bbox_to_canvas(self.draft_bbox)
+        for index, draft_box in enumerate(self.draft_bboxes):
+            review_box = self.transform.image_bbox_to_canvas(draft_box)
             if review_box:
                 canvas.create_rectangle(
                     review_box.x, review_box.y, review_box.right, review_box.bottom,
-                    outline="#00e5ff", width=3, tags="review-box",
+                    outline="#00e5ff",
+                    width=3 if index == self.active_box_index else 2,
+                    tags="review-box",
                 )
-                for handle_x, handle_y in bbox_handles(review_box).values():
-                    canvas.create_rectangle(
-                        handle_x - HANDLE_RADIUS, handle_y - HANDLE_RADIUS,
-                        handle_x + HANDLE_RADIUS, handle_y + HANDLE_RADIUS,
-                        fill="#00e5ff", outline="#001f24", tags="review-box",
-                    )
+                if index == self.active_box_index:
+                    for handle_x, handle_y in bbox_handles(review_box).values():
+                        canvas.create_rectangle(
+                            handle_x - HANDLE_RADIUS, handle_y - HANDLE_RADIUS,
+                            handle_x + HANDLE_RADIUS, handle_y + HANDLE_RADIUS,
+                            fill="#00e5ff", outline="#001f24", tags="review-box",
+                        )
 
     def _canvas_image_point(
         self, event: tk.Event[Any], *, require_inside: bool = False
@@ -873,12 +914,31 @@ class BBoxViewerApp:
         if point is None or self.read_only:
             return "break"
         x, y = point
-        mode = None
-        if self.draft_bbox and self.transform:
-            mode = hit_test_bbox(self.draft_bbox, x, y, HANDLE_RADIUS / self.transform.scale)
-        self.drag = DragState(mode or "draw", x, y, self.draft_bbox)
-        if mode is None:
-            self.draft_bbox = BBox(x, y, 0.0, 0.0)
+        hit = None
+        force_new = bool(getattr(event, "state", 0) & 0x0001)
+        if self.transform and not force_new:
+            hit = hit_test_bboxes(
+                self.draft_bboxes,
+                x,
+                y,
+                HANDLE_RADIUS / self.transform.scale,
+                self.active_box_index,
+            )
+        previous_boxes = list(self.draft_bboxes)
+        if hit is None:
+            self.draft_bboxes.append(BBox(x, y, 0.0, 0.0))
+            self.active_box_index = len(self.draft_bboxes) - 1
+            mode = "draw"
+            original = None
+        else:
+            self.active_box_index, mode = hit
+            original = self.draft_bboxes[self.active_box_index]
+        self.drag = DragState(
+            mode, x, y, original, self.active_box_index, previous_boxes
+        )
+        self._update_box_text()
+        self._update_button_states()
+        self._render()
         return "break"
 
     def _drag_moved(self, event: tk.Event[Any]) -> str:
@@ -887,16 +947,21 @@ class BBoxViewerApp:
             return "break"
         x, y = point
         width, height = self.image_size
+        if not 0 <= self.drag.index < len(self.draft_bboxes):
+            return "break"
         if self.drag.mode == "draw":
-            self.draft_bbox = BBox(
+            updated = BBox(
                 self.drag.start_x, self.drag.start_y, x - self.drag.start_x, y - self.drag.start_y
             ).normalized()
         elif self.drag.mode == "move" and self.drag.original:
-            self.draft_bbox = move_bbox(
+            updated = move_bbox(
                 self.drag.original, x - self.drag.start_x, y - self.drag.start_y, width, height
             )
         elif self.drag.original:
-            self.draft_bbox = resize_bbox(self.drag.original, self.drag.mode, x, y, width, height)
+            updated = resize_bbox(self.drag.original, self.drag.mode, x, y, width, height)
+        else:
+            return "break"
+        self.draft_bboxes[self.drag.index] = updated
         self.draft_dirty = True
         self._update_box_text()
         self._update_button_states()
@@ -906,25 +971,38 @@ class BBoxViewerApp:
     def _drag_finished(self, event: tk.Event[Any]) -> str:
         if self.drag:
             self._drag_moved(event)
-            if self.draft_bbox and (
-                self.draft_bbox.width < MIN_BOX_PIXELS or self.draft_bbox.height < MIN_BOX_PIXELS
-            ):
-                self.draft_bbox = self.drag.original
+            active = (
+                self.draft_bboxes[self.drag.index]
+                if 0 <= self.drag.index < len(self.draft_bboxes)
+                else None
+            )
+            if active and (active.width < MIN_BOX_PIXELS or active.height < MIN_BOX_PIXELS):
+                self.draft_bboxes = self.drag.previous_boxes
+                self.active_box_index = (
+                    min(self.drag.index, len(self.draft_bboxes) - 1)
+                    if self.draft_bboxes else None
+                )
                 self.status_var.set("Ignored a box smaller than one source pixel")
             else:
-                self.status_var.set("Draft changed — choose Accept Box to save it")
+                self.status_var.set("Draft changed — choose Accept Boxes to save it")
             self.drag = None
             self._update_box_text()
+            self._update_button_states()
             self._render()
         return "break"
 
     def _update_cursor(self, event: tk.Event[Any]) -> None:
         point = self._canvas_image_point(event)
         cursor = "crosshair"
-        if point and self.draft_bbox and self.transform:
-            hit = hit_test_bbox(
-                self.draft_bbox, point[0], point[1], HANDLE_RADIUS / self.transform.scale
+        if point and self.draft_bboxes and self.transform:
+            result = hit_test_bboxes(
+                self.draft_bboxes,
+                point[0],
+                point[1],
+                HANDLE_RADIUS / self.transform.scale,
+                self.active_box_index,
             )
+            hit = result[1] if result else None
             cursor = {
                 "move": "fleur", "nw": "top_left_corner", "se": "bottom_right_corner",
                 "ne": "top_right_corner", "sw": "bottom_left_corner",
@@ -935,12 +1013,14 @@ class BBoxViewerApp:
             self.image_canvas.configure(cursor="crosshair")
 
     def _update_box_text(self) -> None:
-        if not self.draft_bbox:
-            self.box_var.set("Draft: no box")
+        if not self.draft_bboxes:
+            self.box_var.set("Draft: no boxes")
             return
-        box = self.draft_bbox
+        if self.active_box_index is None or not 0 <= self.active_box_index < len(self.draft_bboxes):
+            self.active_box_index = len(self.draft_bboxes) - 1
+        box = self.draft_bboxes[self.active_box_index]
         self.box_var.set(
-            f"Draft box (source pixels)\n"
+            f"Draft boxes: {len(self.draft_bboxes)}  •  selected {self.active_box_index + 1}\n"
             f"x {box.x:.2f}   y {box.y:.2f}\n"
             f"width {box.width:.2f}   height {box.height:.2f}"
         )
@@ -953,38 +1033,33 @@ class BBoxViewerApp:
         decision_state = tk.NORMAL if dimensions_known and not self.read_only else tk.DISABLED
         image_edit_state = tk.NORMAL if self.image_size and not self.read_only else tk.DISABLED
         self.accept_button.configure(
-            state=tk.NORMAL if image_edit_state == tk.NORMAL and self.draft_bbox else tk.DISABLED
+            state=tk.NORMAL if image_edit_state == tk.NORMAL and self.draft_bboxes else tk.DISABLED
         )
-        for button in (self.no_bird_button, self.skip_button):
+        for button in (self.no_bird_button, self.skip_button, self.unusable_button):
             button.configure(state=decision_state)
-        self.delete_button.configure(state=image_edit_state)
+        self.delete_button.configure(
+            state=image_edit_state if self.active_box_index is not None else tk.DISABLED
+        )
         self.clear_button.configure(
             state=tk.NORMAL
             if current and not self.read_only and current.source_id in self.session.reviews
             else tk.DISABLED
         )
-        self.source_button.configure(
-            state=tk.NORMAL
-            if image_edit_state == tk.NORMAL and current and current.has_bbox else tk.DISABLED
-        )
-
-    def use_source(self) -> None:
-        if not self.session or not self.session.current or not self.image_size or self.read_only:
-            return
-        source = self.session.current.bbox
-        self.draft_bbox = source.clipped(*self.image_size) if source else None
-        self.draft_dirty = True
-        self.status_var.set("Source box copied to draft; choose Accept Box to save it")
-        self._update_box_text()
-        self._update_button_states()
-        self._render()
 
     def delete_draft(self) -> None:
-        if self.read_only:
+        if (
+            self.read_only
+            or self.active_box_index is None
+            or not 0 <= self.active_box_index < len(self.draft_bboxes)
+        ):
             return
-        self.draft_bbox = None
+        del self.draft_bboxes[self.active_box_index]
+        self.active_box_index = (
+            min(self.active_box_index, len(self.draft_bboxes) - 1)
+            if self.draft_bboxes else None
+        )
         self.draft_dirty = True
-        self.status_var.set("Draft box removed; saved review is unchanged")
+        self.status_var.set("Selected draft box removed; saved review is unchanged")
         self._update_box_text()
         self._update_button_states()
         self._render()
@@ -1009,15 +1084,15 @@ class BBoxViewerApp:
                 parent=self.root,
             )
             return False
-        bbox = self.draft_bbox if state == "boxed" else None
-        if state == "boxed" and (bbox is None or not bbox.is_valid):
-            messagebox.showerror("No valid box", "Draw or restore a valid box first.", parent=self.root)
+        bboxes = list(self.draft_bboxes) if state == "boxed" else []
+        if state == "boxed" and (not bboxes or any(not box.is_valid for box in bboxes)):
+            messagebox.showerror("No valid boxes", "Draw or restore a valid box first.", parent=self.root)
             return False
         source_id = self.session.current.source_id
         previous = self.session.reviews.get(source_id)
         try:
             review = GroundTruthRecord.from_image_record(
-                self.session.current, state, bbox,
+                self.session.current, state, bboxes=bboxes,
                 source_width=dimensions[0], source_height=dimensions[1],
             )
             self.session.reviews[review.source_id] = review

@@ -15,7 +15,9 @@ from PIL import Image
 from server.bird_inference import (
     BirdInferenceEngine,
     TFLiteModel,
+    letterbox_array,
     letterbox_rgb,
+    tf_resize_with_pad_geometry,
     read_inference_record,
     write_inference_record,
 )
@@ -128,6 +130,128 @@ class BirdInferenceTests(unittest.TestCase):
         self.assertEqual(result["guess"], "beta")
         self.assertEqual([item["label"] for item in result["species_top_k"]], ["beta", "alpha"])
         self.assertEqual(restored["classification"]["label"], "beta")
+
+
+UINT8_CONTRACT = {
+    "model_file": "binary.tflite",
+    "labels": {"0": "not_bird", "1": "bird"},
+    "bird_probability_threshold": 0.9453125,
+    "uint8_output_threshold": 242,
+    "input_shape": [1, 224, 224, 3],
+    "input_dtype": "uint8",
+    "input_quantization": [1.0, 0],
+    "color_order": "RGB",
+    "jpeg_decode_channels": 3,
+    "geometry": "letterbox",
+    "geometry_location": "outside the model",
+    "resize_method": "TensorFlow bilinear",
+    "resize_antialias": True,
+    "letterbox_padding_value": 0,
+    "numeric_scaling": "[0,255] to [-1,1] inside the model",
+    "output_dtype": "uint8",
+    "output_quantization": [0.00390625, 0],
+}
+
+
+def quantized_fake(raw_output: int):
+    class QuantizedFake(FakeInterpreter):
+        outputs = {
+            "binary.tflite": np.array([[raw_output]], dtype=np.uint8),
+            "species.tflite": np.array([[0.2, 0.7, 0.1]], dtype=np.float32),
+        }
+        input_dtype = np.uint8
+        output_dtype = np.uint8
+        input_quantization = (1.0, 0)
+        output_quantization = (0.00390625, 0)
+
+        def get_output_details(self):
+            details = super().get_output_details()
+            if Path(self.model_path).name == "species.tflite":
+                details[0]["dtype"] = np.float32
+                details[0]["quantization"] = (0.0, 0)
+            return details
+
+        def get_tensor(self, _index: int) -> np.ndarray:
+            return self.outputs[Path(self.model_path).name]
+
+    return QuantizedFake
+
+
+class ContractTests(unittest.TestCase):
+    def build(self, root: Path, raw_output: int, contract=UINT8_CONTRACT, **kwargs):
+        binary = root / "binary.tflite"
+        species = root / "species.tflite"
+        binary.write_bytes(b"binary")
+        species.write_bytes(b"species")
+        (root / "labels.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+        (root / "inference_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+        return BirdInferenceEngine(
+            binary, species, interpreter_factory=quantized_fake(raw_output), **kwargs
+        )
+
+    def infer(self, engine: BirdInferenceEngine, root: Path) -> dict:
+        image = root / "capture.jpg"
+        image.write_bytes(jpeg_bytes(size=(64, 48)))
+        return engine.infer(image)
+
+    def test_contract_uses_exact_uint8_rule(self) -> None:
+        for raw, expected in ((242, True), (241, False), (255, True)):
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                engine = self.build(root, raw)
+                result = self.infer(engine, root)
+                self.assertEqual(engine.decision_rule, "raw_output >= 242")
+                self.assertIs(result["is_bird"], expected)
+                self.assertEqual(result["bird_decision"]["raw_output"], raw)
+                self.assertAlmostEqual(result["bird_probability"], raw / 256)
+                self.assertEqual(result["classification"]["confidence"], result["bird_probability"])
+
+    def test_override_uses_probability_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            engine = self.build(root, 200, bird_threshold=0.5)
+            result = self.infer(engine, root)
+        self.assertEqual(engine.decision_rule, "bird_probability >= 0.5")
+        self.assertTrue(result["is_bird"])
+
+    def test_contract_rejects_mismatched_model_tensors(self) -> None:
+        contract = dict(UINT8_CONTRACT, input_dtype="float32", input_quantization=[0.0, 0])
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(ValueError, "input dtype"):
+            self.build(Path(temporary), 242, contract=contract)
+
+    def test_contract_rejects_unsupported_geometry(self) -> None:
+        contract = dict(UINT8_CONTRACT, geometry="center_crop")
+        with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(ValueError, "geometry"):
+            self.build(Path(temporary), 242, contract=contract)
+
+    def test_contract_and_threshold_file_must_agree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "threshold.json").write_text(
+                json.dumps({"bird_probability_threshold": 0.5}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "disagrees"):
+                self.build(root, 242)
+
+
+class GeometryTests(unittest.TestCase):
+    def test_resize_with_pad_geometry_matches_tensorflow(self) -> None:
+        # Values from tf.image.resize_with_pad, including its float32 floor quirks.
+        self.assertEqual(tf_resize_with_pad_geometry(480, 640, 224), (168, 224, 28, 0))
+        self.assertEqual(tf_resize_with_pad_geometry(100, 50, 224), (224, 112, 0, 56))
+        self.assertEqual(tf_resize_with_pad_geometry(333, 111, 224), (223, 74, 0, 74))
+        self.assertEqual(tf_resize_with_pad_geometry(1536, 2048, 224), (168, 223, 28, 0))
+
+    def test_same_size_resize_is_identity(self) -> None:
+        rgb = np.random.default_rng(0).integers(0, 256, (224, 224, 3), dtype=np.uint8)
+        np.testing.assert_array_equal(letterbox_array(rgb), rgb.astype(np.float32))
+
+    def test_letterbox_preserves_constant_color_and_float_output(self) -> None:
+        rgb = np.full((480, 640, 3), (10, 120, 250), dtype=np.uint8)
+        pixels = letterbox_array(rgb)
+        self.assertEqual(pixels.dtype, np.float32)
+        self.assertTrue(np.all(pixels[:28] == 0) and np.all(pixels[196:] == 0))
+        np.testing.assert_allclose(pixels[28:196], np.broadcast_to([10, 120, 250], (168, 224, 3)), atol=1e-3)
 
 
 class PiPollerTests(unittest.TestCase):

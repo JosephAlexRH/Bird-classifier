@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable, Iterator, Mapping, Sequence
 
 
-REVIEW_STATES = frozenset({"boxed", "no_bird", "skipped"})
+REVIEW_STATES = frozenset({"boxed", "no_bird", "unusable", "skipped"})
 GROUND_TRUTH_FIELDS = (
     "source_id",
     "source_dataset",
@@ -594,9 +594,13 @@ class ImageCanvasTransform:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class GroundTruthRecord:
-    """One resumable human review decision, independent of machine labels."""
+    """One image-level review decision containing zero or more bird boxes.
+
+    ``bboxes`` is the canonical representation.  The legacy ``bbox`` argument
+    and property remain available for callers that work with one box.
+    """
 
     source_id: str
     source_dataset: str
@@ -605,7 +609,39 @@ class GroundTruthRecord:
     source_width: int
     source_height: int
     review_state: str
-    bbox: BBox | None = None
+    bboxes: list[BBox]
+
+    def __init__(
+        self,
+        source_id: str,
+        source_dataset: str,
+        image_id: str,
+        relative_path: str,
+        source_width: int,
+        source_height: int,
+        review_state: str,
+        bbox: BBox | None = None,
+        *,
+        bboxes: Iterable[BBox] | None = None,
+    ) -> None:
+        if bbox is not None and bboxes is not None:
+            raise ValueError("specify bbox or bboxes, not both")
+        boxes = list(bboxes) if bboxes is not None else ([] if bbox is None else [bbox])
+        object.__setattr__(self, "source_id", source_id)
+        object.__setattr__(self, "source_dataset", source_dataset)
+        object.__setattr__(self, "image_id", image_id)
+        object.__setattr__(self, "relative_path", relative_path)
+        object.__setattr__(self, "source_width", source_width)
+        object.__setattr__(self, "source_height", source_height)
+        object.__setattr__(self, "review_state", review_state)
+        object.__setattr__(self, "bboxes", boxes)
+        self.__post_init__()
+
+    @property
+    def bbox(self) -> BBox | None:
+        """Return the first box for compatibility with single-box callers."""
+
+        return self.bboxes[0] if self.bboxes else None
 
     def __post_init__(self) -> None:
         if not self.source_id:
@@ -615,19 +651,22 @@ class GroundTruthRecord:
         if self.review_state not in REVIEW_STATES:
             raise ValueError(f"invalid review state: {self.review_state!r}")
         if self.review_state == "boxed":
-            if self.bbox is None or not self.bbox.is_valid:
-                raise ValueError("boxed review state requires a valid bounding box")
-            box = self.bbox.normalized()
+            if not self.bboxes:
+                raise ValueError("boxed review state requires a valid bounding box (at least one)")
             tolerance = 1e-12 * max(self.source_width, self.source_height, 1)
-            if (
-                box.x < -tolerance
-                or box.y < -tolerance
-                or box.right > self.source_width + tolerance
-                or box.bottom > self.source_height + tolerance
-            ):
-                raise ValueError("ground-truth bounding box must be within source dimensions")
-        elif self.bbox is not None:
-            raise ValueError(f"{self.review_state} review state must not contain a bounding box")
+            for box in self.bboxes:
+                if not isinstance(box, BBox) or not box.is_valid:
+                    raise ValueError("boxed review state requires valid bounding boxes")
+                normalized = box.normalized()
+                if (
+                    normalized.x < -tolerance
+                    or normalized.y < -tolerance
+                    or normalized.right > self.source_width + tolerance
+                    or normalized.bottom > self.source_height + tolerance
+                ):
+                    raise ValueError("ground-truth bounding boxes must be within source dimensions")
+        elif self.bboxes:
+            raise ValueError(f"{self.review_state} review state must not contain bounding boxes")
 
     @classmethod
     def from_image_record(
@@ -636,6 +675,7 @@ class GroundTruthRecord:
         review_state: str,
         bbox: BBox | None = None,
         *,
+        bboxes: Iterable[BBox] | None = None,
         source_width: int | None = None,
         source_height: int | None = None,
     ) -> GroundTruthRecord:
@@ -645,7 +685,7 @@ class GroundTruthRecord:
             raise ValueError("source dimensions are required when absent from the manifest")
         return cls(
             record.source_id, record.source_dataset, record.image_id, record.relative_path,
-            width, height, review_state, bbox,
+            width, height, review_state, bbox, bboxes=bboxes,
         )
 
 
@@ -654,7 +694,7 @@ ReviewRecord = GroundTruthRecord
 
 
 def load_ground_truth(path: str | os.PathLike[str]) -> dict[str, GroundTruthRecord]:
-    """Load decisions keyed by stable ``source_id``; a missing file returns ``{}``."""
+    """Load image decisions, combining one boxed CSV row per bird box."""
 
     source = Path(path)
     if not source.exists():
@@ -692,9 +732,32 @@ def load_ground_truth(path: str | os.PathLike[str]) -> dict[str, GroundTruthReco
                 )
             except ValueError as error:
                 raise ValueError(f"{source}:{line_number}: {error}") from error
-            if source_id in result:
+            previous = result.get(source_id)
+            if previous is None:
+                result[source_id] = record
+                continue
+            identity = (
+                "source_dataset", "image_id", "relative_path",
+                "source_width", "source_height", "review_state",
+            )
+            mismatches = [name for name in identity if getattr(previous, name) != getattr(record, name)]
+            if mismatches:
+                raise ValueError(
+                    f"{source}:{line_number}: inconsistent rows for source_id {source_id!r}: "
+                    + ", ".join(mismatches)
+                )
+            if record.review_state != "boxed":
                 raise ValueError(f"{source}:{line_number}: duplicate source_id {source_id!r}")
-            result[source_id] = record
+            result[source_id] = GroundTruthRecord(
+                previous.source_id,
+                previous.source_dataset,
+                previous.image_id,
+                previous.relative_path,
+                previous.source_width,
+                previous.source_height,
+                previous.review_state,
+                bboxes=[*previous.bboxes, *record.bboxes],
+            )
     return result
 
 
@@ -709,17 +772,30 @@ def save_ground_truth(
     path: str | os.PathLike[str],
     records: Iterable[GroundTruthRecord] | Mapping[str, GroundTruthRecord],
 ) -> None:
-    """Atomically replace a ground-truth CSV with deterministic source-id order."""
+    """Atomically save decisions, writing one row for each bird box."""
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     values = records.values() if isinstance(records, Mapping) else records
     ordered = sorted(values, key=lambda record: _natural_key(record.source_id))
     seen: set[str] = set()
+    validated: list[GroundTruthRecord] = []
     for record in ordered:
         if record.source_id in seen:
             raise ValueError(f"duplicate source_id {record.source_id!r}")
         seen.add(record.source_id)
+        # Reconstruct so a caller cannot persist an invalid, subsequently
+        # mutated bboxes list from this otherwise frozen record.
+        validated.append(GroundTruthRecord(
+            record.source_id,
+            record.source_dataset,
+            record.image_id,
+            record.relative_path,
+            record.source_width,
+            record.source_height,
+            record.review_state,
+            bboxes=record.bboxes,
+        ))
     temporary_name: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -734,21 +810,21 @@ def save_ground_truth(
             temporary_name = handle.name
             writer = csv.DictWriter(handle, fieldnames=GROUND_TRUTH_FIELDS, lineterminator="\n")
             writer.writeheader()
-            for record in ordered:
-                bbox = record.bbox
-                writer.writerow({
-                    "source_id": record.source_id,
-                    "source_dataset": record.source_dataset,
-                    "image_id": record.image_id,
-                    "relative_path": record.relative_path,
-                    "source_width": record.source_width,
-                    "source_height": record.source_height,
-                    "review_state": record.review_state,
-                    "bbox_x": _csv_number(bbox.x) if bbox else "",
-                    "bbox_y": _csv_number(bbox.y) if bbox else "",
-                    "bbox_width": _csv_number(bbox.width) if bbox else "",
-                    "bbox_height": _csv_number(bbox.height) if bbox else "",
-                })
+            for record in validated:
+                for bbox in record.bboxes or [None]:
+                    writer.writerow({
+                        "source_id": record.source_id,
+                        "source_dataset": record.source_dataset,
+                        "image_id": record.image_id,
+                        "relative_path": record.relative_path,
+                        "source_width": record.source_width,
+                        "source_height": record.source_height,
+                        "review_state": record.review_state,
+                        "bbox_x": _csv_number(bbox.x) if bbox else "",
+                        "bbox_y": _csv_number(bbox.y) if bbox else "",
+                        "bbox_width": _csv_number(bbox.width) if bbox else "",
+                        "bbox_height": _csv_number(bbox.height) if bbox else "",
+                    })
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_name, target)

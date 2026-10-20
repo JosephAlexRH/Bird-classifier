@@ -51,10 +51,15 @@ example and Windows Task Scheduler setup, see
 
 ## Bounding-box review tool
 
-`bbox_viewer.py` is a desktop Tkinter/Pillow viewer and single-box editor for the
+`bbox_viewer.py` is a desktop Tkinter/Pillow multi-box editor for the
 generated iNaturalist/CUB manifest CSVs and an unmodified `CUB_200_2011`
 directory. It never edits the source manifest. Human decisions (`boxed`,
-`no_bird`, or `skipped`) are atomically saved to a separate resumable CSV.
+`no_bird`, `unusable`, or `skipped`) are atomically saved to a separate
+resumable CSV. Use `unusable` for ambiguous/noisy images that should be excluded
+even when they may contain a bird. A
+boxed image is held as a list of boxes in memory and written as one CSV row per
+box (repeating the image's `source_id` and metadata). The custom `BBoxDataset`
+and its source detection records remain unchanged.
 
 Install Pillow (it is also listed in `server/requirements.txt`), then run:
 
@@ -67,9 +72,12 @@ python .\bbox_viewer.py `
 If paths stored in the manifest are valid on the current machine,
 `--image-root` can be omitted. By default, reviews are written beside the
 manifest as `<manifest-name>_ground_truth.csv`; use `--ground-truth` to choose a
-different file. Orange dashed boxes are immutable source annotations or pseudo-
-labels, while cyan boxes are the editable human-review draft. Drag to draw,
-drag inside a box to move it, and drag a corner to resize it. Run
+different file. Machine/source boxes are deliberately neither displayed nor
+copied into the draft, preventing them from biasing a blind review. Cyan boxes
+are saved or newly drawn human-review boxes. Drag empty image space to add a
+box, drag inside a box to select/move it, and drag a selected corner to resize
+it. Shift-drag to add a box overlapping an existing box. The Delete key removes
+only the selected box. Run
 `python .\bbox_viewer.py --help` for all options and shortcuts.
 
 Quote paths containing spaces. In PowerShell, a backtick (`` ` ``), not a

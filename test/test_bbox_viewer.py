@@ -58,6 +58,14 @@ class EditingGeometryTests(unittest.TestCase):
         clipped = bbox_viewer.resize_bbox(BBox(10, 10, 20, 20), "se", 500, -5, 100, 80)
         self.assertEqual(clipped, BBox(10, 0, 90, 10))
 
+    def test_multi_box_hit_test_prefers_active_handles_then_topmost_box(self) -> None:
+        boxes = [BBox(10, 10, 40, 40), BBox(20, 20, 40, 40)]
+        self.assertEqual(bbox_viewer.hit_test_bboxes(boxes, 25, 25, 3), (1, "move"))
+        self.assertEqual(
+            bbox_viewer.hit_test_bboxes(boxes, 10, 10, 3, active_index=0),
+            (0, "nw"),
+        )
+
 
 class ReviewSessionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -88,7 +96,7 @@ class ReviewSessionTests(unittest.TestCase):
     def test_review_counts_ignore_orphans_and_navigation_wraps(self) -> None:
         session = bbox_viewer.ReviewSession(self.dataset, self.reviews)
         self.assertEqual(session.counts(), {
-            "unreviewed": 3, "boxed": 0, "no_bird": 1, "skipped": 0
+            "unreviewed": 3, "boxed": 0, "no_bird": 1, "unusable": 0, "skipped": 0
         })
         session.position = len(session.filtered) - 1
         self.assertTrue(session.next_unreviewed())
@@ -180,7 +188,9 @@ class TkWorkflowTests(unittest.TestCase):
         app.ground_truth_path = output
         app.session = bbox_viewer.ReviewSession(dataset, {})
         app.load_current()
-        app.draft_bbox = BBox(10, 15, 30, 25)
+        boxes = [BBox(10, 15, 30, 25), BBox(60, 20, 20, 30)]
+        app.draft_bboxes = boxes
+        app.active_box_index = 1
 
         with mock.patch("bbox_viewer.save_ground_truth", side_effect=OSError("disk full")), \
              mock.patch("bbox_viewer.messagebox.showerror"):
@@ -189,7 +199,9 @@ class TkWorkflowTests(unittest.TestCase):
 
         self.assertTrue(app._save_review("boxed"))
         loaded = load_ground_truth(output)
-        self.assertEqual(loaded["inat:1"].bbox, BBox(10, 15, 30, 25))
+        self.assertEqual(loaded["inat:1"].bboxes, boxes)
+        with output.open("r", encoding="utf-8") as handle:
+            self.assertEqual(len(handle.read().splitlines()), 3)
 
     def test_shortcuts_do_not_fire_while_typing_in_search(self) -> None:
         from unittest import mock
@@ -204,7 +216,8 @@ class TkWorkflowTests(unittest.TestCase):
         dataset = BBoxDataset((record(1), record(2)), Path("manifest.csv"), "test")
         app = bbox_viewer.BBoxViewerApp(self.root)
         app.session = bbox_viewer.ReviewSession(dataset, {})
-        app.draft_bbox = BBox(1, 2, 3, 4)
+        app.draft_bboxes = [BBox(1, 2, 3, 4), BBox(10, 20, 30, 40)]
+        app.active_box_index = 1
         app.draft_dirty = True
         app.search_var.set("new search")
         if app.filter_job is not None:
@@ -212,7 +225,7 @@ class TkWorkflowTests(unittest.TestCase):
             app.filter_job = None
         with mock.patch("bbox_viewer.messagebox.askyesno", return_value=False):
             app._apply_filters()
-        self.assertEqual(app.draft_bbox, BBox(1, 2, 3, 4))
+        self.assertEqual(app.draft_bboxes, [BBox(1, 2, 3, 4), BBox(10, 20, 30, 40)])
         self.assertEqual(app.search_var.get(), "")
 
     def test_missing_image_can_still_be_marked_no_bird_from_manifest_dimensions(self) -> None:
@@ -230,6 +243,36 @@ class TkWorkflowTests(unittest.TestCase):
         self.assertIsNone(app.image_size)
         self.assertTrue(app._save_review("no_bird"))
 
+    def test_machine_source_box_is_not_loaded_or_drawn(self) -> None:
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        (directory / "birds").mkdir()
+        Image.new("RGB", (100, 80)).save(directory / "birds" / "image_1.jpg")
+        dataset = BBoxDataset((record(1),), directory / "manifest.csv", "test", directory)
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(dataset, {})
+
+        app.load_current()
+        app._render()
+
+        self.assertEqual(app.draft_bboxes, [])
+        self.assertEqual(app.image_canvas.find_withtag("source-box"), ())
+
+    def test_unusable_review_round_trips_without_boxes(self) -> None:
+        from bbox_data import load_ground_truth
+
+        directory = Path(self.temporary.name)
+        dataset = BBoxDataset((record(1),), directory / "manifest.csv", "test")
+        output = directory / "reviews.csv"
+        app = bbox_viewer.BBoxViewerApp(self.root, ground_truth_path=output)
+        app.ground_truth_path = output
+        app.session = bbox_viewer.ReviewSession(dataset, {})
+
+        self.assertTrue(app._save_review("unusable"))
+        self.assertEqual(load_ground_truth(output)["inat:1"].review_state, "unusable")
+        self.assertEqual(load_ground_truth(output)["inat:1"].bboxes, [])
+
     def test_external_review_change_blocks_overwrite(self) -> None:
         from unittest import mock
         from bbox_data import save_ground_truth
@@ -243,11 +286,32 @@ class TkWorkflowTests(unittest.TestCase):
         app.ground_truth_path = output
         app.session = bbox_viewer.ReviewSession(dataset, {})
         app.load_current()
-        app.draft_bbox = BBox(1, 2, 3, 4)
+        app.draft_bboxes = [BBox(1, 2, 3, 4)]
+        app.active_box_index = 0
         save_ground_truth(output, [GroundTruthRecord.from_image_record(record(1), "skipped")])
         with mock.patch("bbox_viewer.messagebox.showerror"):
             self.assertFalse(app._save_review("boxed"))
         self.assertEqual(app.session.reviews, {})
+
+    def test_saved_multi_box_review_loads_and_delete_removes_only_selected_box(self) -> None:
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        Image.new("RGB", (100, 80)).save(directory / "bird.jpg")
+        source = ImageRecord("inat:1", "inat", "1", "bird.jpg", width=100, height=80)
+        dataset = BBoxDataset((source,), directory / "manifest.csv", "test", directory)
+        boxes = [BBox(1, 2, 20, 30), BBox(50, 10, 25, 35)]
+        review = GroundTruthRecord.from_image_record(source, "boxed", bboxes=boxes)
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(dataset, {source.source_id: review})
+
+        app.load_current()
+        self.assertEqual(app.draft_bboxes, boxes)
+        self.assertEqual(app.active_box_index, 1)
+
+        app.delete_draft()
+        self.assertEqual(app.draft_bboxes, boxes[:1])
+        self.assertEqual(app.active_box_index, 0)
 
     def test_review_file_lock_rejects_a_concurrent_writer(self) -> None:
         if bbox_viewer.os.name != "nt":

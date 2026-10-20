@@ -287,43 +287,61 @@ python3 -m pip install ai-edge-litert
 
 If `ai-edge-litert` has no wheel for the Pi image, install `tflite-runtime`
 instead. Full TensorFlow is also supported but is normally unnecessary on the
-Pi. NumPy and Pillow are included in `server/requirements.txt`; only the
-platform-specific inference runtime is installed separately.
+Pi. NumPy, Pillow, and `simplejpeg` are included in `server/requirements.txt`;
+only the platform-specific inference runtime is installed separately.
 
-Deploy the **float32** `model_float32.tflite` from the binary is-bird run and a
-**float32** species `model_float32.tflite`. Keep `labels.txt` beside the species
-model and `threshold.json` beside the is-bird model. Use `--species-labels` or
-`--threshold-file` if either companion file is stored elsewhere. Then start the
-receiver, using paths on the Pi:
+### Models
+
+The default is-bird model is the full-integer
+`Models/runs/isbird_manifests_letterbox_224_20261020_004327/model_uint8.tflite`
+(trained by `Models/train_isbird_tflite_manifests.ipynb`). Copy the whole run
+directory, or at least `model_uint8.tflite`, `inference_contract.json`, and
+`threshold.json` together. The species model is still the float32
+`letterbox_224_20261009_131631/model_float32.tflite`, with `labels.txt` beside it.
 
 ```bash
 python3 server/raspberry_pi_server.py \
   --camera-url http://192.168.1.84 \
-  --is-bird-model /opt/bird-models/is-bird/model_float32.tflite \
+  --is-bird-model /opt/bird-models/is-bird/model_uint8.tflite \
   --species-model /opt/bird-models/species/model_float32.tflite
 ```
 
-The two model files are not interchangeable. Both expect a 224×224 RGB image
-with letterboxing; scaling is embedded in the model. Do not substitute the
-`model_int8.tflite` exports for this deployment unless you have deliberately
-validated the quantized pipeline.
+`inference_contract.json` beside the is-bird model is the authority for
+deployment. At startup the receiver checks it against what it implements
+(RGB, letterbox, antialiased bilinear, scaling inside the model) and against the
+loaded model's tensors (shape, uint8 dtypes, quantization scale/zero point); a
+mismatched model/contract pair stops the server instead of mis-scoring images.
+Use `--contract-file` if the contract lives elsewhere.
+
+Preprocessing reproduces the notebook's `tf.io.decode_jpeg` +
+`tf.image.resize_with_pad(..., antialias=True)` exactly, without TensorFlow:
+JPEGs are decoded with `simplejpeg` using TensorFlow's default fast integer
+IDCT, EXIF orientation is ignored (as TensorFlow does), and the resize repeats
+TensorFlow's float32 geometry and accumulation order. Receiver pixels and
+quantized model outputs are bit-identical to the notebook's. If `simplejpeg`
+is missing the receiver falls back to Pillow and prints a warning: Pillow's
+accurate IDCT shifts pixels by about one level, which moved the uint8 output by
+up to 22 steps on borderline test images. Both models share these pixels (the
+species notebook used the same letterbox).
+
+The bird decision is the contract's exact integer rule,
+`raw_output >= uint8_output_threshold` (`242`), which is the rule the threshold
+was selected with on the uint8 model. Each inference record keeps the raw
+output, the dequantized `bird_probability` (`raw / 256`), and the rule under
+`bird_decision`; `classification.confidence` sent to the ESP32 is the
+probability. `--bird-threshold` overrides this with a probability rule.
+Older runs without a contract still work from their `threshold.json`.
 
 For this baseline, both models run for every accepted JPEG. The species result
-is therefore an advisory guess even when `is_bird` is false; this deliberately
-keeps the complete architecture observable while the binary model is being
-retrained and recalibrated.
+is therefore an advisory guess even when `is_bird` is false.
 
-> **Threshold warning:** the bird decision threshold is part of the trained
-> is-bird artifact, not a generic `0.5`. Deploy its matching `threshold.json`.
-> `--bird-threshold` deliberately overrides that artifact value; changing it
-> changes which uploads the ESP32 may retain as birds, so validate an override
-> against the intended field data before deployment.
->
-> This is an architecture baseline, not a production accuracy claim. At `0.818`,
-> the selected model's recorded held-out ESP32 subset detected 0 of 1,245 labelled
-> bird images (while rejecting all 620 labelled non-birds). Keep the raw
-> `bird_probability` in each inference record visible, collect new field results,
-> and retrain or recalibrate before relying on the boolean decision.
+> **Accuracy warning:** this is not yet a reliable detector. The threshold was
+> chosen to keep validation false positives at or below 5%, and at that
+> operating point the run recorded 5.8% bird recall on ESP32 validation
+> (26/445, balanced accuracy 0.51) and 5.4% on the held-out ESP32 test day
+> (132/2,463, 1 false positive). Most bird captures will come back
+> `is_bird: false`. Keep the raw outputs, collect field results, and
+> retrain or recalibrate before relying on the boolean decision.
 
 Set `server_ip` in the ESP32's `config.json` to the Raspberry Pi's LAN address
 when moving from laptop testing to hardware deployment. Images are saved under
@@ -356,7 +374,7 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/opt/esp32-classifier
-ExecStart=/opt/esp32-classifier/.venv/bin/python server/raspberry_pi_server.py --host 0.0.0.0 --port 5000 --camera-url http://192.168.1.84 --save-dir /home/pi/bird_images --is-bird-model /opt/bird-models/is-bird/model_float32.tflite --species-model /opt/bird-models/species/model_float32.tflite
+ExecStart=/opt/esp32-classifier/.venv/bin/python server/raspberry_pi_server.py --host 0.0.0.0 --port 5000 --camera-url http://192.168.1.84 --save-dir /home/pi/bird_images --is-bird-model /opt/bird-models/is-bird/model_uint8.tflite --species-model /opt/bird-models/species/model_float32.tflite
 Restart=on-failure
 RestartSec=5
 
@@ -430,4 +448,4 @@ Latest received motion image:
 
 ```text
 http://SERVER_IP:5000/latest.jpg
-```
+```

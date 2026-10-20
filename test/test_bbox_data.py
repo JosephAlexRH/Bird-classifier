@@ -243,11 +243,13 @@ class GroundTruthPersistenceTests(unittest.TestCase):
 
     def test_validation_enforces_review_state_and_box_invariants(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires a valid"):
-            dataclasses.replace(self.record("boxed"), bbox=None)
+            dataclasses.replace(self.record("boxed"), bboxes=[])
         with self.assertRaisesRegex(ValueError, "must not contain"):
             dataclasses.replace(self.record("boxed"), review_state="no_bird")
         with self.assertRaisesRegex(ValueError, "within source dimensions"):
-            dataclasses.replace(self.record("boxed"), bbox=bbox_data.BBox(400, 400, 100, 100))
+            dataclasses.replace(
+                self.record("boxed"), bboxes=[bbox_data.BBox(400, 400, 100, 100)]
+            )
         with self.assertRaisesRegex(ValueError, "invalid review state"):
             dataclasses.replace(self.record("skipped"), review_state="pending")
 
@@ -258,6 +260,7 @@ class GroundTruthPersistenceTests(unittest.TestCase):
                 "inat:3": self.record("skipped", "inat:3"),
                 "inat:1": self.record("boxed", "inat:1"),
                 "inat:2": self.record("no_bird", "inat:2"),
+                "inat:4": self.record("unusable", "inat:4"),
             }
 
             bbox_data.save_ground_truth(path, records)
@@ -276,9 +279,50 @@ class GroundTruthPersistenceTests(unittest.TestCase):
             path = Path(temporary) / "ground_truth.csv"
             x = 1.2345678901234567
             box = bbox_data.BBox(x, 0.12345678901234567, 429.0 - x, 416.87654321098764)
-            record = dataclasses.replace(self.record("boxed"), bbox=box)
+            record = dataclasses.replace(self.record("boxed"), bboxes=[box])
             bbox_data.save_ground_truth(path, [record])
             self.assertEqual(bbox_data.load_ground_truth(path)[record.source_id], record)
+
+    def test_multiple_boxes_are_kept_as_a_list_and_saved_one_row_per_box(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ground_truth.csv"
+            boxes = [
+                bbox_data.BBox(1, 2, 30, 40),
+                bbox_data.BBox(100, 120, 50, 60),
+                bbox_data.BBox(250, 200, 20, 25),
+            ]
+            record = dataclasses.replace(self.record("boxed"), bboxes=boxes)
+
+            bbox_data.save_ground_truth(path, [record])
+            loaded = bbox_data.load_ground_truth(path)[record.source_id]
+
+            self.assertIsInstance(loaded.bboxes, list)
+            self.assertEqual(loaded.bboxes, boxes)
+            self.assertEqual(loaded.bbox, boxes[0])
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                self.assertEqual(len(list(csv.DictReader(handle))), 3)
+
+    def test_repeated_box_rows_must_describe_the_same_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ground_truth.csv"
+            record = dataclasses.replace(
+                self.record("boxed"),
+                bboxes=[bbox_data.BBox(1, 2, 3, 4), bbox_data.BBox(5, 6, 7, 8)],
+            )
+            bbox_data.save_ground_truth(path, [record])
+            text = path.read_text(encoding="utf-8")
+            path.write_text(text.replace("class/image.jpg", "other.jpg", 1), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "inconsistent rows"):
+                bbox_data.load_ground_truth(path)
+
+    def test_save_revalidates_a_mutated_box_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ground_truth.csv"
+            record = self.record("boxed")
+            record.bboxes.append(bbox_data.BBox(420, 410, 20, 20))
+            with self.assertRaisesRegex(ValueError, "within source dimensions"):
+                bbox_data.save_ground_truth(path, [record])
+            self.assertFalse(path.exists())
 
     def test_missing_file_is_empty_and_malformed_rows_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

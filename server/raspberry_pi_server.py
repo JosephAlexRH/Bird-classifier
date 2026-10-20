@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import queue
 import threading
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ try:
     from .bird_inference import (
         BirdInferenceEngine,
         inference_path,
+        jpeg_decoder_name,
         read_inference_record,
         write_inference_record,
     )
@@ -29,6 +31,7 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
     from bird_inference import (
         BirdInferenceEngine,
         inference_path,
+        jpeg_decoder_name,
         read_inference_record,
         write_inference_record,
     )
@@ -39,8 +42,13 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
 
 DEFAULT_SAVE_DIR = Path.home() / "bird_images"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Full-integer model: decision uses the exact uint8 rule from its inference_contract.json.
 DEFAULT_IS_BIRD_MODEL = (
-    PROJECT_ROOT / "Models" / "runs" / "isbird_letterbox_224_20261010_173627" / "model_float32.tflite"
+    PROJECT_ROOT
+    / "Models"
+    / "runs"
+    / "isbird_manifests_letterbox_224_20261020_004327"
+    / "model_uint8.tflite"
 )
 DEFAULT_SPECIES_MODEL = (
     PROJECT_ROOT / "Models" / "runs" / "letterbox_224_20261009_131631" / "model_float32.tflite"
@@ -534,9 +542,28 @@ def parse_args() -> argparse.Namespace:
         help="Species TFLite model",
     )
     parser.add_argument("--species-labels", type=Path, help="Species labels (default: beside model)")
-    parser.add_argument("--threshold-file", type=Path, help="Bird threshold JSON (default: beside model)")
-    parser.add_argument("--bird-threshold", type=float, help="Override the model threshold")
+    parser.add_argument(
+        "--contract-file",
+        type=Path,
+        help="is-bird inference_contract.json (default: beside the is-bird model)",
+    )
+    parser.add_argument(
+        "--threshold-file",
+        type=Path,
+        help="Legacy bird threshold JSON, used when no contract is present (default: beside model)",
+    )
+    parser.add_argument(
+        "--bird-threshold",
+        type=float,
+        help="Override the contract threshold (uses the probability rule, not the uint8 rule)",
+    )
     parser.add_argument("--top-k", type=int, default=5, help="Number of species guesses to retain")
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=max(1, min(4, os.cpu_count() or 1)),
+        help="TFLite interpreter threads per model (default: up to 4)",
+    )
     return parser.parse_args()
 
 
@@ -548,11 +575,22 @@ if __name__ == "__main__":
             args.species_model,
             species_labels=args.species_labels,
             threshold_file=args.threshold_file,
+            contract_file=args.contract_file,
             bird_threshold=args.bird_threshold,
             top_k=args.top_k,
+            num_threads=args.num_threads,
         )
     except Exception as error:
         raise SystemExit(f"Model startup error: {error}") from error
     print(f"Models ready: {json.dumps(engine.describe(), sort_keys=True)}", flush=True)
+    print(f"Bird decision: {engine.decision_rule} (from {engine.threshold_source})", flush=True)
+    if engine.contract is None:
+        print("WARNING: no inference_contract.json beside the is-bird model; using legacy threshold.", flush=True)
+    if not jpeg_decoder_name().startswith("simplejpeg"):
+        print(
+            "WARNING: simplejpeg is not installed; JPEGs are decoded with Pillow, whose pixels "
+            "differ slightly from training. Run: pip install simplejpeg",
+            flush=True,
+        )
     application = create_app(args.save_dir, args.camera_url, engine)
     application.run(host=args.host, port=args.port, debug=False, threaded=True)
