@@ -2,6 +2,12 @@
 
 Firmware and local-network receiver tools for a bird-feeder monitoring system. The ESP32-CAM watches for motion using low-resolution luminance samples decoded from JPEG frames, captures a full-resolution JPEG when something moves, and pushes it to the included laptop or Raspberry Pi receiver.
 
+Motion ownership defaults to the Raspberry Pi. In this mode the Pi polls fresh
+JPEGs from the ESP32 and owns motion decisions; the ESP32 remains a manual,
+exclusive camera endpoint and does not run its local detector or flush legacy
+buffered motion uploads. Set `motion_owner` to `firmware` only as an explicit
+fallback to the on-device detector.
+
 ## Responsibilities
 
 - Connects the ESP32-CAM to Wi-Fi
@@ -100,7 +106,8 @@ available, the firmware can use the SPIFFS copy uploaded from `data/config.json`
 | `motion_threshold` | int | Minimum global-light-normalized block luminance residual (0-255) required before a block counts as changed |
 | `motion_sensitivity` | float | Lower fraction of valid changed blocks required to trigger a motion event |
 | `motion_check_ms` | int | Milliseconds between motion checks |
-| `motion_enabled` | bool | Disable to stop motion polling entirely |
+| `motion_enabled` | bool | Arms the local detector only when `motion_owner` is `firmware`; must be `false` under Pi ownership |
+| `motion_owner` | string | `pi` (default) gives polling/detection ownership to the Pi; `firmware` explicitly enables the legacy on-device fallback |
 | `motion_roi` | object | Normalized `{x,y,width,height}` rectangle used for motion analysis; defaults to the full frame and must rasterize to at least 16×12 pixels in the 80×60 analysis image |
 | `motion_exposure_settle_frames` | int | Consecutive stable exposure/gain product samples required before the detector arms (2-20) |
 | `motion_exposure_settle_tolerance` | float | Maximum `(window max / window min) - 1` allowed while exposure is settling (0-1) |
@@ -133,6 +140,7 @@ The device runs a small unauthenticated HTTP server on port 80. All endpoints as
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/capture` | Returns a full-resolution JPEG on demand |
+| `GET` | `/monitor-frame` | Returns a fresh full-resolution JPEG for Pi motion polling, with metadata source `pi_motion_poll` |
 | `GET` | `/stream` | Runs an exclusive multipart MJPEG stream until the client disconnects |
 | `GET` | `/metadata` | Returns sensor identity, current processing state, capture settings, and motion settings as JSON |
 | `GET` | `/motion` | Returns `{"motion": true/false}` and clears the flag on read |
@@ -143,7 +151,8 @@ The device runs a small unauthenticated HTTP server on port 80. All endpoints as
 
 ### Camera operating modes
 
-The camera has two persistent operating modes plus one temporary exclusive state:
+The camera has two persistent operating modes plus one temporary exclusive state.
+Local motion mode is available only when `motion_owner` is `firmware`:
 
 - **Idle** leaves continuous capture disabled while retaining manual capture and
   configuration access.
@@ -182,14 +191,30 @@ last capture/upload results, upload cooldown, and the last camera error. The run
 
 `GET /capture` includes the same capture-specific JSON in the
 `X-ESP32-Camera-Metadata` response header. Motion-triggered `POST /upload`
-requests include that header too. Camera metadata schema version 4 separates
+requests include that header too. Camera metadata schema version 5 separates
 requested capture settings from observed frame, driver, and OV2640 state. It
 keeps frame size, pixel format, and JPEG quality in only the intentional
 `requested.capture` and `observed.capture` locations. Actual dimensions,
 `framebuffer_bytes`, and the frame sequence occur only under observed capture.
 The receiver's top-level `bytes` remains separate because it verifies the JPEG
 length actually received and stored. Bird-classification and retention settings
-are grouped under `camera.requested.pipeline`.
+are grouped under `camera.requested.pipeline`. The active normalized motion ROI
+is recorded as `{x,y,width,height}` under `camera.requested.motion.roi` for every
+profile, preview, and motion-capture metadata snapshot.
+
+Crop-aware is-bird models declare `roi_crop_then_letterbox` in their inference
+contract. The receiver then expands the ROI by 20% total (10% per side), clips
+and outward-rounds it to pixels, crops the original decoded frame, and only then
+letterboxes it. Missing or mismatched ROI provenance is an inference error, not
+a full-frame fallback. The species model remains whole-frame letterbox. Captures
+made before metadata schema 5 have no recorded ROI and are excluded by the
+crop-aware training notebook rather than assigned the current camera setting.
+
+`GET /monitor-frame` has the same fresh-frame and metadata behavior as
+`GET /capture`, but labels metadata `source` as `pi_motion_poll`. Metadata's
+`device.camera_id` and `/status`'s top-level `camera_id` are the same stable
+`esp32cam-<12 hex digits>` identifier derived from the chip's factory eFuse MAC.
+It does not change across boots; `boot_id` remains random per startup.
 
 Each record includes a random per-startup `boot_id`, exact active config-file
 SHA-256 when a file exists, internal heap/PSRAM statistics, and the ESP32's

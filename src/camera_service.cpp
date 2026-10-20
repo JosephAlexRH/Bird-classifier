@@ -428,9 +428,14 @@ CameraMetadataSnapshot sampleCameraMetadata(const camera_fb_t *frameBuffer) {
   snapshot.requestedFramesize = cfg.framesize;
   snapshot.requestedJpegQuality = cfg.jpegQuality;
   snapshot.requestedMotionEnabled = cfg.motionEnabled;
+  snapshot.requestedMotionOwner = cfg.motionOwner;
   snapshot.requestedMotionThreshold = cfg.motionThreshold;
   snapshot.requestedMotionSensitivity = cfg.motionSensitivity;
   snapshot.requestedMotionCheckMs = cfg.motionCheckMs;
+  snapshot.requestedMotionRoiX = cfg.motionRoiX;
+  snapshot.requestedMotionRoiY = cfg.motionRoiY;
+  snapshot.requestedMotionRoiWidth = cfg.motionRoiWidth;
+  snapshot.requestedMotionRoiHeight = cfg.motionRoiHeight;
   snapshot.requestedSaveBirdsToSd = cfg.saveBirdsToSd;
   snapshot.requestedBirdConfidenceThreshold = cfg.birdConfidenceThreshold;
   snapshot.settingsRevision = settingsRevision;
@@ -509,10 +514,11 @@ void acknowledgeRegisterDumpDelivery(const CameraMetadataSnapshot &snapshot) {
 
 String buildCameraMetadata(const CameraMetadataSnapshot &snapshot, const char *source) {
   JsonDocument document;
-  document["schema_version"] = 4;
+  document["schema_version"] = 5;
   document["source"] = source;
 
   JsonObject device = document["device"].to<JsonObject>();
+  device["camera_id"] = snapshot.device.cameraId;
   device["boot_id"] = snapshot.device.bootId;
   JsonObject clock = device["clock"].to<JsonObject>();
   clock["sync_status"] = snapshot.device.timeSynchronized ? "synchronized" : "unsynchronized";
@@ -594,10 +600,16 @@ String buildCameraMetadata(const CameraMetadataSnapshot &snapshot, const char *s
   requestedPixelFormat["value"] = PIXFORMAT_JPEG;
   requestedCapture["jpeg_quality"] = snapshot.requestedJpegQuality;
   JsonObject requestedMotion = requested["motion"].to<JsonObject>();
+  requestedMotion["owner"] = motionOwnerName(snapshot.requestedMotionOwner);
   requestedMotion["enabled"] = snapshot.requestedMotionEnabled;
   requestedMotion["threshold"] = snapshot.requestedMotionThreshold;
   requestedMotion["sensitivity"] = snapshot.requestedMotionSensitivity;
   requestedMotion["check_ms"] = snapshot.requestedMotionCheckMs;
+  JsonObject requestedMotionRoi = requestedMotion["roi"].to<JsonObject>();
+  requestedMotionRoi["x"] = snapshot.requestedMotionRoiX;
+  requestedMotionRoi["y"] = snapshot.requestedMotionRoiY;
+  requestedMotionRoi["width"] = snapshot.requestedMotionRoiWidth;
+  requestedMotionRoi["height"] = snapshot.requestedMotionRoiHeight;
   JsonObject requestedPipeline = requested["pipeline"].to<JsonObject>();
   requestedPipeline["save_birds_to_sd"] = snapshot.requestedSaveBirdsToSd;
   requestedPipeline["bird_confidence_threshold"] = snapshot.requestedBirdConfidenceThreshold;

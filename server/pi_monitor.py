@@ -121,6 +121,12 @@ class PiPoller:
                 self.mirror_dir / f"{capture_id}.inference.json",
                 (json.dumps(inference, indent=2, sort_keys=True) + "\n").encode("utf-8"),
             )
+        motion = capture.get("motion")
+        if isinstance(motion, dict):
+            _atomic_write(
+                self.mirror_dir / f"{capture_id}.motion.json",
+                (json.dumps(motion, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+            )
 
     def poll_once(self) -> None:
         with self.lock:

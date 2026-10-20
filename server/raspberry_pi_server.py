@@ -26,6 +26,7 @@ try:
     )
     from .capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from .laptop_test_server import camera_url_argument, normalize_camera_url
+    from .pi_motion import MotionService
     from .roi_control import ROI_CONTROL_JS
 except ImportError:  # Direct execution: python server/raspberry_pi_server.py
     from bird_inference import (
@@ -37,6 +38,7 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
     )
     from capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from laptop_test_server import camera_url_argument, normalize_camera_url
+    from pi_motion import MotionService
     from roi_control import ROI_CONTROL_JS
 
 
@@ -57,6 +59,9 @@ MAX_JPEG_BYTES = 10 * 1024 * 1024
 # Sent by the ESP32 when wait_for_classification is false in its config.
 CLASSIFICATION_HEADER = "X-ESP32-Classification"
 PROXY_TIMEOUT_SECONDS = 8
+CAPTURE_ROI_SOURCE = "capture_sidecar.camera.requested.motion.roi"
+DEFAULT_MOTION_POLL_SECONDS = 0.25
+DEFAULT_MOTION_TIMEOUT_SECONDS = 2.0
 
 
 PI_DASHBOARD_HTML = r"""
@@ -200,10 +205,41 @@ def validate_classification(value: Any) -> tuple[dict[str, Any] | None, str | No
     return result, None
 
 
+def capture_roi(image_path: Path) -> tuple[Any, str]:
+    """Read the acquisition-time ROI from the immutable matching sidecar.
+
+    Values are deliberately returned without coercion or clamping. A crop-aware
+    inference contract must reject missing or malformed provenance rather than
+    silently using the current camera setting or the full frame.
+    """
+    image_path = Path(image_path)
+    sidecar_path = image_path.with_suffix(".json")
+    source = CAPTURE_ROI_SOURCE
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, source
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, source
+    if not isinstance(sidecar, dict):
+        return None, source
+    if sidecar.get("capture_id") != image_path.stem or sidecar.get("filename") != image_path.name:
+        return None, source
+    camera = sidecar.get("camera")
+    requested = camera.get("requested") if isinstance(camera, dict) else None
+    motion = requested.get("motion") if isinstance(requested, dict) else None
+    return (motion.get("roi") if isinstance(motion, dict) else None), source
+
+
 def create_app(
     save_dir: Path = DEFAULT_SAVE_DIR,
     camera_url: str | None = None,
     inference_engine: BirdInferenceEngine | None = None,
+    *,
+    start_motion_service: bool = False,
+    motion_poll_seconds: float = DEFAULT_MOTION_POLL_SECONDS,
+    motion_timeout_seconds: float = DEFAULT_MOTION_TIMEOUT_SECONDS,
+    motion_service_factory: Callable[..., Any] = MotionService,
 ) -> Flask:
     """Create the receiver/classifier app, with optional ESP32 camera controls."""
     app = Flask(__name__)
@@ -211,6 +247,7 @@ def create_app(
     store = CaptureStore(save_dir)
     camera_url = normalize_camera_url(camera_url)
     camera_lock = threading.Lock()
+    inference_lock = threading.Lock()
     state_lock = threading.Lock()
     existing = sorted(store.root.glob("*.jpg"), key=lambda path: path.stat().st_mtime)
     latest: dict[str, Any] = {
@@ -221,6 +258,7 @@ def create_app(
     }
     pending: queue.Queue[Path] = queue.Queue()
     app.config["CLASSIFICATION_QUEUE"] = pending
+    app.config["MOTION_SERVICE"] = None
 
     def failed_record(destination: Path, error: str) -> dict[str, Any]:
         return {
@@ -240,7 +278,13 @@ def create_app(
     ) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
         try:
             if inference_engine is not None:
-                inference = inference_engine.infer(destination)
+                roi, roi_source = capture_roi(destination)
+                with inference_lock:
+                    inference = inference_engine.infer(
+                        destination,
+                        roi=roi,
+                        roi_source=roi_source,
+                    )
                 inference["capture_id"] = destination.stem
                 classification, error = validate_classification(inference.get("classification"))
             else:
@@ -287,6 +331,37 @@ def create_app(
                 pending.task_done()
 
     threading.Thread(target=classification_worker, name="classifier", daemon=True).start()
+
+    motion_service = None
+    if start_motion_service:
+        if not camera_url or inference_engine is None:
+            raise ValueError("Pi motion polling requires both camera_url and inference_engine.")
+        def motion_persisted(
+            destination: Path,
+            capture: dict[str, Any],
+            inference: dict[str, Any],
+        ) -> None:
+            classification, _ = validate_classification(inference.get("classification"))
+            with state_lock:
+                latest.update(
+                    path=destination,
+                    received_at=capture.get("received_at"),
+                    classification=classification,
+                    inference=inference,
+                )
+
+        motion_service = motion_service_factory(
+            camera_url,
+            store,
+            inference_engine,
+            poll_seconds=motion_poll_seconds,
+            timeout_seconds=motion_timeout_seconds,
+            camera_lock=camera_lock,
+            inference_lock=inference_lock,
+            on_persist=motion_persisted,
+        )
+        motion_service.start()
+        app.config["MOTION_SERVICE"] = motion_service
 
     # A process restart must not strand accepted captures whose in-memory queue was lost.
     if inference_engine is not None:
@@ -436,6 +511,13 @@ def create_app(
         except (OSError, json.JSONDecodeError):
             pass
         inference = read_inference_record(path)
+        motion_path = path.with_suffix(".motion.json")
+        motion = None
+        try:
+            value = json.loads(motion_path.read_text(encoding="utf-8"))
+            motion = value if isinstance(value, dict) else None
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
         return {
             "capture_id": sidecar.get("capture_id", path.stem),
             "filename": path.name,
@@ -445,8 +527,10 @@ def create_app(
             "sha256": sidecar.get("sha256"),
             "inference_status": (inference or {}).get("status", "pending"),
             "inference": inference,
+            "motion": motion,
             "image_url": f"/api/captures/{path.stem}/image",
             "inference_url": f"/api/captures/{path.stem}/inference",
+            "motion_url": f"/api/captures/{path.stem}/motion",
         }
 
     def capture_path(capture_id: str) -> Path | None:
@@ -496,6 +580,18 @@ def create_app(
             return jsonify(status="pending", capture_id=capture_id), 202
         return jsonify(inference)
 
+    @app.get("/api/captures/<capture_id>/motion")
+    def capture_motion(capture_id: str):
+        path = capture_path(capture_id)
+        if path is None:
+            return jsonify(error="Capture not found."), 404
+        motion_path = path.with_suffix(".motion.json")
+        try:
+            value = json.loads(motion_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return jsonify(error="Motion record not found."), 404
+        return jsonify(value) if isinstance(value, dict) else (jsonify(error="Invalid motion record."), 500)
+
     @app.get("/health")
     def health() -> Response:
         with state_lock:
@@ -513,6 +609,7 @@ def create_app(
             classification=classification,
             latest_inference=latest_inference,
             classification_queue_depth=pending.unfinished_tasks,
+            motion_service=(motion_service.describe() if motion_service is not None else {"running": False}),
             models=(inference_engine.describe() if inference_engine is not None else {"ready": False}),
         )
 
@@ -559,6 +656,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top-k", type=int, default=5, help="Number of species guesses to retain")
     parser.add_argument(
+        "--motion-poll-seconds",
+        type=float,
+        default=DEFAULT_MOTION_POLL_SECONDS,
+        help="Pi-owned full-resolution motion polling interval (default: 0.25 seconds)",
+    )
+    parser.add_argument(
+        "--motion-timeout-seconds",
+        type=float,
+        default=DEFAULT_MOTION_TIMEOUT_SECONDS,
+        help="Per-frame ESP32 monitor request timeout (default: 2 seconds)",
+    )
+    parser.add_argument(
         "--num-threads",
         type=int,
         default=max(1, min(4, os.cpu_count() or 1)),
@@ -592,5 +701,14 @@ if __name__ == "__main__":
             "differ slightly from training. Run: pip install simplejpeg",
             flush=True,
         )
-    application = create_app(args.save_dir, args.camera_url, engine)
+    if args.motion_poll_seconds <= 0 or args.motion_timeout_seconds <= 0:
+        raise SystemExit("Motion poll interval and timeout must be greater than zero.")
+    application = create_app(
+        args.save_dir,
+        args.camera_url,
+        engine,
+        start_motion_service=bool(args.camera_url),
+        motion_poll_seconds=args.motion_poll_seconds,
+        motion_timeout_seconds=args.motion_timeout_seconds,
+    )
     application.run(host=args.host, port=args.port, debug=False, threaded=True)

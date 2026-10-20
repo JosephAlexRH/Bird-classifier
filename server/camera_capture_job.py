@@ -88,18 +88,21 @@ def _content_type(headers: Any) -> str:
 def fetch_camera_capture(
     camera_url: str,
     *,
+    endpoint: str = "capture",
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_jpeg_bytes: int = MAX_JPEG_BYTES,
     opener: Callable[..., Any] = urlopen,
 ) -> tuple[bytes, str | None]:
     """Fetch one bounded JPEG and its optional firmware metadata header."""
     camera_url = normalize_camera_url(camera_url)
+    if not endpoint or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in endpoint):
+        raise ValueError("Camera endpoint must be one lowercase path segment.")
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be greater than zero.")
     if max_jpeg_bytes < 4:
         raise ValueError("max_jpeg_bytes must be at least four.")
 
-    target = f"{camera_url}/capture"
+    target = f"{camera_url}/{endpoint}"
     outgoing = Request(target, headers={"Accept": "image/jpeg"}, method="GET")
     try:
         with opener(outgoing, timeout=timeout_seconds) as response:

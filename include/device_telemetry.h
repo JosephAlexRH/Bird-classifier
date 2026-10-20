@@ -3,6 +3,7 @@
 #include <Arduino.h>
 
 struct DeviceTelemetrySnapshot {
+  String cameraId;
   String bootId;
   bool timeSynchronized;
   String deviceTimeUtc;
@@ -19,4 +20,5 @@ struct DeviceTelemetrySnapshot {
 
 void initializeDeviceTelemetry();
 DeviceTelemetrySnapshot sampleDeviceTelemetry();
+const String &getCameraId();
 const String &getBootId();

@@ -27,7 +27,12 @@ from server.laptop_test_server import (
     normalize_camera_url,
     preflight_port,
 )
-from server.raspberry_pi_server import create_app as create_pi_app, validate_classification
+from server.raspberry_pi_server import (
+    CAPTURE_ROI_SOURCE,
+    capture_roi,
+    create_app as create_pi_app,
+    validate_classification,
+)
 
 
 JPEG = b"\xff\xd8test-jpeg-payload\xff\xd9"
@@ -161,6 +166,79 @@ class CaptureStorageTests(unittest.TestCase):
             self.assertNotIn("frame_utc_estimate", metadata["camera"]["timing"])
             self.assertIn("frame_utc_estimate", record["camera"]["timing"])
             self.assertNotIn("camera", record["camera"])
+
+    def test_schema_v5_capture_preserves_acquisition_time_roi(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CaptureStore(Path(temporary))
+            metadata = json.loads(json.dumps(CAMERA_METADATA))
+            metadata["schema_version"] = 5
+            roi = {"x": 0.125, "y": 0.25, "width": 0.5, "height": 0.625}
+            metadata["camera"]["requested"]["motion"] = {"roi": roi}
+            record = store.save_capture(JPEG, source="test", camera_metadata=metadata)
+            saved = json.loads((store.root / record["sidecar"]).read_text(encoding="utf-8"))
+            self.assertEqual(saved["firmware_metadata_schema_version"], 5)
+            self.assertEqual(saved["camera"]["requested"]["motion"]["roi"], roi)
+
+    def test_capture_roi_reads_only_the_matching_acquisition_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            image_path = Path(temporary) / "capture_one.jpg"
+            image_path.write_bytes(JPEG)
+            roi = {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4}
+            image_path.with_suffix(".json").write_text(
+                json.dumps({
+                    "capture_id": image_path.stem,
+                    "filename": image_path.name,
+                    "camera": {"requested": {"motion": {"roi": roi}}},
+                }),
+                encoding="utf-8",
+            )
+            value, source = capture_roi(image_path)
+            self.assertEqual(value, roi)
+            self.assertEqual(source, CAPTURE_ROI_SOURCE)
+
+    def test_capture_roi_does_not_invent_missing_or_invalid_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            image_path = Path(temporary) / "capture_one.jpg"
+            image_path.write_bytes(JPEG)
+            value, source = capture_roi(image_path)
+            self.assertIsNone(value)
+            self.assertEqual(source, CAPTURE_ROI_SOURCE)
+            image_path.with_suffix(".json").write_text("not json", encoding="utf-8")
+            value, _ = capture_roi(image_path)
+            self.assertIsNone(value)
+            image_path.with_suffix(".json").write_bytes(b"\xff\xfe")
+            value, _ = capture_roi(image_path)
+            self.assertIsNone(value)
+
+    def test_capture_roi_rejects_a_mismatched_sidecar_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            image_path = Path(temporary) / "capture_one.jpg"
+            image_path.write_bytes(JPEG)
+            roi = {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4}
+            image_path.with_suffix(".json").write_text(
+                json.dumps({
+                    "capture_id": "capture_other",
+                    "filename": image_path.name,
+                    "camera": {"requested": {"motion": {"roi": roi}}},
+                }),
+                encoding="utf-8",
+            )
+            value, _ = capture_roi(image_path)
+            self.assertIsNone(value)
+
+    def test_derived_motion_record_is_atomic_and_scoped_to_the_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CaptureStore(Path(temporary))
+            capture = store.save_capture(JPEG, source="test")
+            image_path = store.root / capture["filename"]
+            record = {"schema_version": 1, "capture_id": capture["capture_id"]}
+            destination = store.save_derived_record(image_path, "motion", record)
+            self.assertEqual(destination.name, f"{capture['capture_id']}.motion.json")
+            self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), record)
+            with self.assertRaises(ValueError):
+                store.save_derived_record(image_path, "bad.suffix", record)
+            with self.assertRaises(ValueError):
+                store.save_derived_record(store.root.parent / image_path.name, "motion", record)
 
 
 class LaptopServerTests(unittest.TestCase):
@@ -657,8 +735,11 @@ class RaspberryPiServerTests(unittest.TestCase):
         self.assertEqual(self.client.post("/camera/mode", json={"mode": "stream"}).status_code, 422)
 
     def test_inference_engine_persists_result_and_exposes_polling_api(self) -> None:
+        calls = []
+
         class FakeEngine:
-            def infer(self, image_path: Path) -> dict:
+            def infer(self, image_path: Path, *, roi=None, roi_source=None) -> dict:
+                calls.append((image_path, roi, roi_source))
                 return {
                     "schema_version": 1,
                     "status": "complete",
@@ -678,9 +759,26 @@ class RaspberryPiServerTests(unittest.TestCase):
         app = create_pi_app(self.save_dir / "models", inference_engine=FakeEngine())
         app.testing = True
         client = app.test_client()
-        response = client.post("/upload", data=JPEG, content_type="image/jpeg")
+        metadata = json.loads(json.dumps(CAMERA_METADATA))
+        metadata["schema_version"] = 5
+        roi = {"x": 0.125, "y": 0.25, "width": 0.5, "height": 0.625}
+        metadata["camera"]["requested"]["motion"] = {"roi": roi}
+        response = client.post(
+            "/upload",
+            data=JPEG,
+            content_type="image/jpeg",
+            headers={METADATA_HEADER: json.dumps(metadata)},
+        )
         self.assertEqual(response.status_code, 200)
         capture_id = response.get_json()["capture_id"]
+        self.assertEqual(
+            calls,
+            [(
+                self.save_dir / "models" / f"{capture_id}.jpg",
+                roi,
+                CAPTURE_ROI_SOURCE,
+            )],
+        )
         inference_path = self.save_dir / "models" / f"{capture_id}.inference.json"
         self.assertTrue(inference_path.is_file())
         inference = json.loads(inference_path.read_text(encoding="utf-8"))
@@ -701,6 +799,66 @@ class RaspberryPiServerTests(unittest.TestCase):
         health = client.get("/health").get_json()
         self.assertTrue(health["models"]["ready"])
         self.assertEqual(health["latest_inference"]["guess"], "sparrow")
+
+    def test_missing_historical_roi_is_a_durable_inference_error(self) -> None:
+        class CropAwareFakeEngine:
+            def infer(self, image_path: Path, *, roi=None, roi_source=None) -> dict:
+                del image_path, roi_source
+                if roi is None:
+                    raise ValueError("roi is required by crop-aware inference contract")
+                raise AssertionError("legacy upload unexpectedly supplied an ROI")
+
+            def describe(self) -> dict:
+                return {"ready": True, "geometry": "roi_crop_then_letterbox"}
+
+        root = self.save_dir / "missing-roi"
+        app = create_pi_app(root, inference_engine=CropAwareFakeEngine())
+        app.testing = True
+        response = app.test_client().post("/upload", data=JPEG, content_type="image/jpeg")
+        self.assertEqual(response.status_code, 200)
+        record = response.get_json()
+        self.assertIsNone(record["classification"])
+        self.assertIn("roi is required", record["classification_error"])
+        self.assertTrue((root / record["filename"]).is_file())
+        self.assertTrue((root / record["sidecar"]).is_file())
+        inference = json.loads(
+            (root / f"{record['capture_id']}.inference.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(inference["status"], "error")
+        self.assertIn("roi is required", inference["error"])
+
+    def test_pi_motion_service_lifecycle_is_explicit_and_reported_in_health(self) -> None:
+        class FakeEngine:
+            def describe(self):
+                return {"ready": True}
+
+        class FakeMotionService:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def describe(self):
+                return {"running": self.started, "frames_polled": 3}
+
+        app = create_pi_app(
+            self.save_dir / "motion-service",
+            "http://camera.local",
+            FakeEngine(),
+            start_motion_service=True,
+            motion_service_factory=FakeMotionService,
+        )
+        service = app.config["MOTION_SERVICE"]
+        self.assertTrue(service.started)
+        health = app.test_client().get("/health").get_json()
+        self.assertEqual(health["motion_service"]["frames_polled"], 3)
+
+    def test_pi_motion_service_requires_camera_and_engine(self) -> None:
+        with self.assertRaisesRegex(ValueError, "camera_url and inference_engine"):
+            create_pi_app(self.save_dir / "bad-motion", start_motion_service=True)
 
 
 if __name__ == "__main__":

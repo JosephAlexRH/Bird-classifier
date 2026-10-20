@@ -243,3 +243,23 @@ class CaptureStore:
         with self._lock:
             self._atomic_write(path, encoded)
         return {**record, "filename": str(path.relative_to(self.root))}
+
+    def save_derived_record(
+        self,
+        image_path: Path,
+        suffix: str,
+        record: dict[str, Any],
+    ) -> Path:
+        """Atomically persist an immutable derived record beside a stored image."""
+        image_path = Path(image_path).resolve()
+        if image_path.parent != self.root or not image_path.is_file():
+            raise ValueError("Derived records require an existing image directly inside the capture store.")
+        if not suffix or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in suffix):
+            raise ValueError("Derived record suffix must contain lowercase letters, digits, or underscores.")
+        if not isinstance(record, dict):
+            raise ValueError("Derived record must be a JSON object.")
+        destination = image_path.with_suffix(f".{suffix}.json")
+        encoded = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        with self._lock:
+            self._atomic_write(destination, encoded)
+        return destination

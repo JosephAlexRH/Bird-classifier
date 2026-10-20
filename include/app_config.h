@@ -2,6 +2,11 @@
 
 #include <Arduino.h>
 
+enum class MotionOwner {
+  Pi,
+  Firmware,
+};
+
 struct Config {
   char wifiSsid[33];
   char wifiPassword[65];
@@ -9,6 +14,7 @@ struct Config {
   float motionSensitivity;
   int motionCheckMs;
   bool motionEnabled;
+  MotionOwner motionOwner;
   int jpegQuality;
   int framesize;
   char serverIp[16];
@@ -46,6 +52,9 @@ constexpr int kMaxMotionSettleFrames = 20;
 
 extern Config cfg;
 extern bool sdReady;
+
+const char *motionOwnerName(MotionOwner owner);
+bool isFirmwareMotionOwner();
 
 void mountStorage();
 bool isConfigStorageReady();

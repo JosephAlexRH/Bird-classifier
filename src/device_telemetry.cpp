@@ -9,6 +9,7 @@
 namespace {
 
 String bootId;
+String cameraId;
 
 String formatUuid(const uint8_t bytes[16]) {
   char value[37];
@@ -32,6 +33,13 @@ String utcTimestamp(const timeval &now) {
 }  // namespace
 
 void initializeDeviceTelemetry() {
+  const uint64_t efuseMac = ESP.getEfuseMac() & 0x0000ffffffffffffULL;
+  char stableId[26];
+  snprintf(stableId, sizeof(stableId), "esp32cam-%04x%08x",
+           static_cast<unsigned int>((efuseMac >> 32) & 0xffff),
+           static_cast<unsigned int>(efuseMac & 0xffffffff));
+  cameraId = stableId;
+
   uint8_t randomBytes[16];
   esp_fill_random(randomBytes, sizeof(randomBytes));
   randomBytes[6] = static_cast<uint8_t>((randomBytes[6] & 0x0f) | 0x40);
@@ -44,6 +52,7 @@ void initializeDeviceTelemetry() {
 
 DeviceTelemetrySnapshot sampleDeviceTelemetry() {
   DeviceTelemetrySnapshot snapshot = {};
+  snapshot.cameraId = cameraId;
   snapshot.bootId = bootId;
 
   snapshot.chipTemperatureC = temperatureRead();
@@ -66,3 +75,5 @@ DeviceTelemetrySnapshot sampleDeviceTelemetry() {
 }
 
 const String &getBootId() { return bootId; }
+
+const String &getCameraId() { return cameraId; }

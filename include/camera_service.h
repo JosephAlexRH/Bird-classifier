@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <esp_camera.h>
 
+#include "app_config.h"
 #include "device_telemetry.h"
 
 struct CameraSettingsSnapshot {
@@ -86,9 +87,14 @@ struct CameraMetadataSnapshot {
   int requestedFramesize;
   int requestedJpegQuality;
   bool requestedMotionEnabled;
+  MotionOwner requestedMotionOwner;
   int requestedMotionThreshold;
   float requestedMotionSensitivity;
   int requestedMotionCheckMs;
+  float requestedMotionRoiX;
+  float requestedMotionRoiY;
+  float requestedMotionRoiWidth;
+  float requestedMotionRoiHeight;
   bool requestedSaveBirdsToSd;
   float requestedBirdConfidenceThreshold;
 

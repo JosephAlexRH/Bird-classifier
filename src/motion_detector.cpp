@@ -326,6 +326,7 @@ bool analyzeBlocks(float &changedFraction) {
 }  // namespace
 
 void checkMotion() {
+  if (!isFirmwareMotionOwner()) return;
   if (!cfg.motionEnabled || getCameraOperatingMode() != CameraOperatingMode::Motion ||
       isCameraStreamActive()) {
     return;
@@ -511,6 +512,14 @@ void checkMotion() {
 }
 
 void armMotionDetection() {
+  if (!isFirmwareMotionOwner()) {
+    cfg.motionEnabled = false;
+    selectCameraOperatingMode(CameraOperatingMode::Idle);
+    resetMotionReference();
+    clearCameraRuntimeError();
+    setCameraRuntimeState(CameraRuntimeState::Idle);
+    return;
+  }
   cfg.motionEnabled = true;
   selectCameraOperatingMode(CameraOperatingMode::Motion);
   resetMotionReference();

@@ -74,6 +74,35 @@ void restoreSelectedCameraMode() {
   }
 }
 
+void sendCapturedJpeg(WiFiClient &client, const char *source, const char *failureLabel) {
+  setCameraRuntimeState(CameraRuntimeState::Capturing);
+  CapturedJpeg capture;
+  if (!captureJpeg(capture, true)) {
+    setCameraRuntimeError(String(failureLabel) + " JPEG capture failed");
+    sendJson(client, 500, "Internal Server Error", "{\"error\":\"JPEG capture failed\"}");
+    restoreSelectedCameraMode();
+    return;
+  }
+
+  camera_fb_t *frameBuffer = capture.frameBuffer;
+  const String metadata = buildCameraMetadata(capture.metadata, source);
+  client.print("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n");
+  client.printf("Content-Length: %u\r\n", frameBuffer->len);
+  client.print("Connection: close\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\n");
+  client.print("X-ESP32-Camera-Metadata: ");
+  client.print(metadata);
+  client.print("\r\n\r\n");
+  const bool sent = writeAll(client, frameBuffer->buf, frameBuffer->len);
+  esp_camera_fb_return(frameBuffer);
+  if (sent) {
+    acknowledgeRegisterDumpDelivery(capture.metadata);
+    clearCameraRuntimeError();
+  } else {
+    setCameraRuntimeError(String(failureLabel) + " JPEG response was interrupted");
+  }
+  restoreSelectedCameraMode();
+}
+
 void streamJpegs(WiFiClient &client) {
   setCameraRuntimeState(CameraRuntimeState::Streaming);
   clearCameraRuntimeError();
@@ -195,6 +224,7 @@ String configJson() {
   document["motion_sensitivity"] = cfg.motionSensitivity;
   document["motion_check_ms"] = cfg.motionCheckMs;
   document["motion_enabled"] = cfg.motionEnabled;
+  document["motion_owner"] = motionOwnerName(cfg.motionOwner);
   document["jpeg_quality"] = cfg.jpegQuality;
   document["framesize"] = cfg.framesize;
   document["server_ip"] = cfg.serverIp;
@@ -229,6 +259,34 @@ String configJson() {
 }
 
 bool validConfig(const JsonDocument &document, String &error) {
+  MotionOwner requestedOwner = cfg.motionOwner;
+  if (document.containsKey("motion_owner")) {
+    if (!document["motion_owner"].is<const char *>()) {
+      error = "motion_owner must be pi or firmware";
+      return false;
+    }
+    const char *owner = document["motion_owner"];
+    if (strcmp(owner, "pi") == 0) {
+      requestedOwner = MotionOwner::Pi;
+    } else if (strcmp(owner, "firmware") == 0) {
+      requestedOwner = MotionOwner::Firmware;
+    } else {
+      error = "motion_owner must be pi or firmware";
+      return false;
+    }
+  }
+  if (document.containsKey("motion_enabled") && !document["motion_enabled"].is<bool>()) {
+    error = "motion_enabled must be true or false";
+    return false;
+  }
+  const bool requestedMotionEnabled = document.containsKey("motion_enabled")
+                                          ? document["motion_enabled"].as<bool>()
+                                          : (requestedOwner == MotionOwner::Pi ? false
+                                                                              : cfg.motionEnabled);
+  if (requestedOwner == MotionOwner::Pi && requestedMotionEnabled) {
+    error = "motion_enabled cannot be true while motion_owner is pi";
+    return false;
+  }
   if (document.containsKey("wifi_ssid")) {
     if (!document["wifi_ssid"].is<const char *>()) {
       error = "wifi_ssid must be a string";
@@ -439,6 +497,12 @@ void applyConfig(const JsonDocument &document) {
   if (document.containsKey("motion_sensitivity")) cfg.motionSensitivity = document["motion_sensitivity"];
   if (document.containsKey("motion_check_ms")) cfg.motionCheckMs = document["motion_check_ms"];
   if (document.containsKey("motion_enabled")) cfg.motionEnabled = document["motion_enabled"];
+  if (document.containsKey("motion_owner")) {
+    cfg.motionOwner = strcmp(document["motion_owner"].as<const char *>(), "firmware") == 0
+                          ? MotionOwner::Firmware
+                          : MotionOwner::Pi;
+  }
+  if (!isFirmwareMotionOwner()) cfg.motionEnabled = false;
   if (document.containsKey("jpeg_quality")) cfg.jpegQuality = document["jpeg_quality"];
   if (document.containsKey("framesize")) cfg.framesize = document["framesize"];
   if (document.containsKey("server_ip")) {
@@ -516,30 +580,9 @@ void handleClient(WiFiClient client) {
   } else if (request.method == "GET" && request.path == "/stream") {
     streamJpegs(client);
   } else if (request.method == "GET" && request.path == "/capture") {
-    setCameraRuntimeState(CameraRuntimeState::Capturing);
-    CapturedJpeg capture;
-    if (!captureJpeg(capture, true)) {
-      setCameraRuntimeError("Manual JPEG capture failed");
-      sendJson(client, 500, "Internal Server Error", "{\"error\":\"JPEG capture failed\"}");
-    } else {
-      camera_fb_t *frameBuffer = capture.frameBuffer;
-      const String metadata = buildCameraMetadata(capture.metadata, "preview");
-      client.print("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\n");
-      client.printf("Content-Length: %u\r\n", frameBuffer->len);
-      client.print("Connection: close\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\n");
-      client.print("X-ESP32-Camera-Metadata: ");
-      client.print(metadata);
-      client.print("\r\n\r\n");
-      const bool sent = writeAll(client, frameBuffer->buf, frameBuffer->len);
-      esp_camera_fb_return(frameBuffer);
-      if (sent) {
-        acknowledgeRegisterDumpDelivery(capture.metadata);
-        clearCameraRuntimeError();
-      } else {
-        setCameraRuntimeError("Manual JPEG response was interrupted");
-      }
-    }
-    restoreSelectedCameraMode();
+    sendCapturedJpeg(client, "preview", "Manual");
+  } else if (request.method == "GET" && request.path == "/monitor-frame") {
+    sendCapturedJpeg(client, "pi_motion_poll", "Pi motion poll");
   } else if (request.method == "GET" && request.path == "/metadata") {
     const CameraMetadataSnapshot snapshot = sampleCameraMetadata();
     sendJson(client, 200, "OK", buildCameraMetadata(snapshot, "profile"));
@@ -565,7 +608,8 @@ void handleClient(WiFiClient client) {
         saveConfig();
         const bool wifiSettingsChanged = strcmp(cfg.wifiSsid, previousConfig.wifiSsid) != 0 ||
                                          strcmp(cfg.wifiPassword, previousConfig.wifiPassword) != 0;
-        if (cfg.motionEnabled != previousConfig.motionEnabled) {
+        const bool motionOwnershipChanged = cfg.motionOwner != previousConfig.motionOwner;
+        if (motionOwnershipChanged || cfg.motionEnabled != previousConfig.motionEnabled) {
           if (cfg.motionEnabled) {
             armMotionDetection();
           } else {
@@ -593,18 +637,24 @@ void handleClient(WiFiClient client) {
       sendJson(client, 422, "Unprocessable Content",
                "{\"error\":\"mode must be either motion or idle\"}");
     } else {
-      if (strcmp(mode, "motion") == 0) {
+      const bool rejectedMotionArm = strcmp(mode, "motion") == 0 && !isFirmwareMotionOwner();
+      if (rejectedMotionArm) {
+        sendJson(client, 409, "Conflict",
+                 "{\"error\":\"Local motion mode is unavailable while motion_owner is pi\"}");
+      } else if (strcmp(mode, "motion") == 0) {
         armMotionDetection();
       } else {
         disarmMotionDetection();
       }
-      saveConfig();
-      JsonDocument response;
-      response["selected_mode"] = cameraOperatingModeName(getCameraOperatingMode());
-      response["runtime_state"] = cameraRuntimeStateName(getCameraRuntimeState());
-      String json;
-      serializeJson(response, json);
-      sendJson(client, 200, "OK", json);
+      if (!rejectedMotionArm) {
+        saveConfig();
+        JsonDocument response;
+        response["selected_mode"] = cameraOperatingModeName(getCameraOperatingMode());
+        response["runtime_state"] = cameraRuntimeStateName(getCameraRuntimeState());
+        String json;
+        serializeJson(response, json);
+        sendJson(client, 200, "OK", json);
+      }
     }
   } else if (request.method == "GET" && request.path == "/status") {
     JsonDocument document;
@@ -612,6 +662,8 @@ void handleClient(WiFiClient client) {
     document["runtime_state"] = cameraRuntimeStateName(getCameraRuntimeState());
     document["stream_active"] = isCameraStreamActive();
     document["boot_id"] = getBootId();
+    document["camera_id"] = getCameraId();
+    document["motion_owner"] = motionOwnerName(cfg.motionOwner);
     const DeviceTelemetrySnapshot device = sampleDeviceTelemetry();
     document["time_sync_status"] = device.timeSynchronized ? "synchronized" : "unsynchronized";
     if (device.timeSynchronized) {

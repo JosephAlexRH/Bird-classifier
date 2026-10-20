@@ -17,7 +17,10 @@ from server.bird_inference import (
     TFLiteModel,
     letterbox_array,
     letterbox_rgb,
+    roi_crop_geometry,
+    validate_selected_crop,
     tf_resize_with_pad_geometry,
+    validate_normalized_roi,
     read_inference_record,
     write_inference_record,
 )
@@ -83,6 +86,7 @@ class BirdInferenceTests(unittest.TestCase):
         self.assertGreater(int(pixels[112, 112, 0]), 200)
         self.assertTrue(np.all(pixels[-50:] == 0))
 
+
     def test_model_quantizes_uint8_input_and_dequantizes_output(self) -> None:
         class QuantizedFake(FakeInterpreter):
             outputs = {"binary.tflite": np.array([[128]], dtype=np.uint8)}
@@ -122,7 +126,7 @@ class BirdInferenceTests(unittest.TestCase):
             engine = BirdInferenceEngine(
                 binary, species, top_k=2, interpreter_factory=EngineFake
             )
-            result = engine.infer(image)
+            result = engine.infer(image, roi={"malformed": True}, roi_source="irrelevant")
             write_inference_record(image, result)
             restored = read_inference_record(image)
         self.assertTrue(result["is_bird"])
@@ -151,6 +155,26 @@ UINT8_CONTRACT = {
     "output_dtype": "uint8",
     "output_quantization": [0.00390625, 0],
 }
+
+ROI_CONTRACT = dict(
+    UINT8_CONTRACT,
+    geometry="roi_crop_then_letterbox",
+    roi_source="capture_sidecar.camera.requested.motion.roi",
+    roi_coordinate_space="normalized_original_frame",
+    roi_padding_fraction=0.2,
+    roi_padding_semantics="total_dimension_increase",
+    roi_pixel_rounding="floor_min_ceil_max",
+)
+
+SELECTED_CROP_CONTRACT = dict(
+    UINT8_CONTRACT,
+    geometry="selected_crop_then_letterbox",
+    crop_source="capture_motion_record.selection.final_bounds_px",
+    crop_coordinate_space="original_decoded_frame_pixels",
+    crop_bounds_semantics="half_open_left_top_right_bottom",
+    crop_is_final=True,
+    additional_runtime_margin=0,
+)
 
 
 def quantized_fake(raw_output: int):
@@ -224,6 +248,32 @@ class ContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, self.assertRaisesRegex(ValueError, "geometry"):
             self.build(Path(temporary), 242, contract=contract)
 
+    def test_crop_contract_requires_every_geometry_field(self) -> None:
+        required = (
+            "geometry_location", "roi_source", "roi_coordinate_space",
+            "roi_padding_fraction", "roi_padding_semantics", "roi_pixel_rounding",
+        )
+        for key in required:
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                contract = dict(ROI_CONTRACT)
+                del contract[key]
+                with self.assertRaisesRegex(ValueError, key):
+                    self.build(Path(temporary), 242, contract=contract)
+
+    def test_crop_contract_rejects_wrong_geometry_values(self) -> None:
+        bad_values = {
+            "roi_source": "somewhere.else",
+            "roi_coordinate_space": "pixels",
+            "roi_padding_fraction": 0.1,
+            "roi_padding_semantics": "each_side",
+            "roi_pixel_rounding": "round",
+        }
+        for key, value in bad_values.items():
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                contract = dict(ROI_CONTRACT, **{key: value})
+                with self.assertRaisesRegex(ValueError, key):
+                    self.build(Path(temporary), 242, contract=contract)
+
     def test_contract_and_threshold_file_must_agree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -235,6 +285,54 @@ class ContractTests(unittest.TestCase):
 
 
 class GeometryTests(unittest.TestCase):
+    def test_strict_normalized_roi_validation(self) -> None:
+        valid = {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4}
+        self.assertEqual(validate_normalized_roi(valid), valid)
+        invalid = (
+            None,
+            [0.1, 0.2, 0.3, 0.4],
+            {"x": 0.1, "y": 0.2, "width": 0.3},
+            dict(valid, extra=1),
+            dict(valid, x=True),
+            dict(valid, x="0.1"),
+            dict(valid, x=float("nan")),
+            dict(valid, x=float("inf")),
+            dict(valid, x=-0.01),
+            dict(valid, width=0),
+            dict(valid, width=-0.1),
+            dict(valid, x=0.8, width=0.3),
+            dict(valid, y=0.8, height=0.3),
+        )
+        for roi in invalid:
+            with self.subTest(roi=roi), self.assertRaises(ValueError):
+                validate_normalized_roi(roi)
+
+    def test_roi_padding_clips_and_rounds_outward(self) -> None:
+        requested, padded, bounds = roi_crop_geometry(
+            {"x": 0.03, "y": 0.2, "width": 0.5, "height": 0.3}, 101, 53
+        )
+        self.assertEqual(requested, {"x": 0.03, "y": 0.2, "width": 0.5, "height": 0.3})
+        # x padding clips at zero; y gains 0.03 (10% of height) on each side.
+        self.assertAlmostEqual(padded["x"], 0.0)
+        self.assertAlmostEqual(padded["width"], 0.58)
+        self.assertAlmostEqual(padded["y"], 0.17)
+        self.assertAlmostEqual(padded["height"], 0.36)
+        self.assertEqual(bounds, (0, 9, 59, 29))
+
+    def test_selected_crop_validation_is_strict_half_open_pixels(self) -> None:
+        self.assertEqual(
+            validate_selected_crop({"left": 10, "top": 20, "right": 30, "bottom": 40}, 100, 80),
+            (10, 20, 30, 40),
+        )
+        for crop in (
+            {"left": 10.0, "top": 20, "right": 30, "bottom": 40},
+            {"left": 10, "top": 20, "right": 10, "bottom": 40},
+            {"left": -1, "top": 20, "right": 30, "bottom": 40},
+            {"left": 10, "top": 20, "right": 101, "bottom": 40},
+        ):
+            with self.subTest(crop=crop), self.assertRaises(ValueError):
+                validate_selected_crop(crop, 100, 80)
+
     def test_resize_with_pad_geometry_matches_tensorflow(self) -> None:
         # Values from tf.image.resize_with_pad, including its float32 floor quirks.
         self.assertEqual(tf_resize_with_pad_geometry(480, 640, 224), (168, 224, 28, 0))
@@ -252,6 +350,158 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(pixels.dtype, np.float32)
         self.assertTrue(np.all(pixels[:28] == 0) and np.all(pixels[196:] == 0))
         np.testing.assert_allclose(pixels[28:196], np.broadcast_to([10, 120, 250], (168, 224, 3)), atol=1e-3)
+
+
+class RoiInferenceTests(unittest.TestCase):
+    def build(self, root: Path):
+        class RecordingFake(FakeInterpreter):
+            outputs = {
+                "binary.tflite": np.array([[0.9]], dtype=np.float32),
+                "species.tflite": np.array([[0.2, 0.7, 0.1]], dtype=np.float32),
+            }
+            instances = {}
+
+            def __init__(self, model_path: str) -> None:
+                super().__init__(model_path)
+                self.instances[Path(model_path).name] = self
+
+        binary = root / "binary.tflite"
+        species = root / "species.tflite"
+        binary.write_bytes(b"binary")
+        species.write_bytes(b"species")
+        (root / "labels.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+        contract = dict(
+            ROI_CONTRACT,
+            input_dtype="float32",
+            input_quantization=[0.0, 0],
+            output_dtype="float32",
+            output_quantization=[0.0, 0],
+            bird_probability_threshold=0.5,
+            uint8_output_threshold=None,
+        )
+        (root / "inference_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+        return BirdInferenceEngine(binary, species, interpreter_factory=RecordingFake), RecordingFake
+
+    def test_roi_is_required_with_matching_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            engine, _ = self.build(root)
+            image = root / "capture.jpg"
+            image.write_bytes(jpeg_bytes(size=(100, 50)))
+            with self.assertRaisesRegex(ValueError, "roi is required"):
+                engine.infer(image)
+            with self.assertRaisesRegex(ValueError, "roi_source is required"):
+                engine.infer(image, roi={"x": 0.2, "y": 0.2, "width": 0.4, "height": 0.4})
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                engine.infer(
+                    image,
+                    roi={"x": 0.2, "y": 0.2, "width": 0.4, "height": 0.4},
+                    roi_source="caller.guess",
+                )
+
+    def test_crop_precedes_letterbox_and_species_uses_whole_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            engine, fake = self.build(root)
+            # ROI region is red, while the rest of the wide whole frame is blue.
+            rgb = np.zeros((50, 100, 3), dtype=np.uint8)
+            rgb[:] = (0, 0, 255)
+            rgb[15:35, 30:70] = (255, 0, 0)
+            image = root / "capture.png"
+            Image.fromarray(rgb).save(image)
+            roi = {"x": 0.3, "y": 0.3, "width": 0.4, "height": 0.4}
+            result = engine.infer(
+                image,
+                roi=roi,
+                roi_source="capture_sidecar.camera.requested.motion.roi",
+            )
+            bird_tensor = fake.instances["binary.tflite"].tensor[0]
+            species_tensor = fake.instances["species.tflite"].tensor[0]
+
+        # Crop is 48x24 after 10% per-side padding, then letterboxed. Its centre is red.
+        self.assertGreater(float(bird_tensor[112, 112, 0]), 200)
+        self.assertLess(float(bird_tensor[112, 112, 2]), 30)
+        # Species gets the uncropped wide frame (black bars top/bottom and blue left area).
+        self.assertTrue(np.all(species_tensor[:50] == 0))
+        self.assertGreater(float(species_tensor[112, 20, 2]), 200)
+        self.assertEqual(result["preprocessing"]["is_bird"]["method"], "roi_crop_then_letterbox")
+        self.assertEqual(result["preprocessing"]["species"]["method"], "letterbox")
+        crop = result["preprocessing"]["crop"]
+        self.assertEqual(crop["requested_roi"], roi)
+        self.assertEqual(crop["pixel_bounds"], {
+            "left": 26, "top": 13, "right": 75, "bottom": 38, "width": 49, "height": 25,
+        })
+        self.assertEqual(crop["roi_source"], "capture_sidecar.camera.requested.motion.roi")
+
+    def test_letterbox_contract_remains_usable_without_roi(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # Reuse the normal float fake and override crop geometry back to legacy.
+            engine, _ = self.build(root)
+            engine.contract.geometry = "letterbox"
+            image = root / "capture.jpg"
+            image.write_bytes(jpeg_bytes())
+            result = engine.infer(image)
+        self.assertEqual(result["preprocessing"]["method"], "letterbox")
+        self.assertIsNone(result["preprocessing"]["crop"])
+        self.assertEqual(result["preprocessing"]["species"]["source"], "whole_original_frame")
+
+    def test_selected_crop_is_applied_once_and_species_remains_whole_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            class RecordingFake(FakeInterpreter):
+                outputs = {
+                    "binary.tflite": np.array([[0.9]], dtype=np.float32),
+                    "species.tflite": np.array([[0.2, 0.7, 0.1]], dtype=np.float32),
+                }
+                instances = {}
+
+                def __init__(self, model_path: str) -> None:
+                    super().__init__(model_path)
+                    self.instances[Path(model_path).name] = self
+
+            binary, species = root / "binary.tflite", root / "species.tflite"
+            binary.write_bytes(b"binary")
+            species.write_bytes(b"species")
+            (root / "labels.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+            contract = dict(
+                SELECTED_CROP_CONTRACT,
+                input_dtype="float32", input_quantization=[0.0, 0],
+                output_dtype="float32", output_quantization=[0.0, 0],
+                bird_probability_threshold=0.5, uint8_output_threshold=None,
+            )
+            (root / "inference_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+            image = np.zeros((50, 100, 3), dtype=np.uint8)
+            image[:, :] = (0, 0, 250)
+            image[10:30, 40:60] = (250, 0, 0)
+            Image.fromarray(image).save(root / "capture.png")
+            engine = BirdInferenceEngine(binary, species, interpreter_factory=RecordingFake)
+            result = engine.infer(
+                root / "capture.png",
+                selected_crop={"left": 40, "top": 10, "right": 60, "bottom": 30},
+                crop_source="capture_motion_record.selection.final_bounds_px",
+            )
+        bird_tensor = RecordingFake.instances["binary.tflite"].tensor[0]
+        species_tensor = RecordingFake.instances["species.tflite"].tensor[0]
+        self.assertGreater(float(bird_tensor[..., 0].mean()), 200)
+        self.assertGreater(float(species_tensor[112, 20, 2]), 200)
+        crop = result["preprocessing"]["crop"]
+        self.assertEqual(crop["pixel_bounds"]["width"], 20)
+        self.assertEqual(crop["additional_runtime_margin"], 0)
+
+    def test_selected_crop_contract_requires_final_crop_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary, species = root / "binary.tflite", root / "species.tflite"
+            binary.write_bytes(b"binary")
+            species.write_bytes(b"species")
+            (root / "labels.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+            bad = dict(SELECTED_CROP_CONTRACT)
+            del bad["crop_is_final"]
+            (root / "inference_contract.json").write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "crop_is_final"):
+                BirdInferenceEngine(binary, species, interpreter_factory=quantized_fake(200))
 
 
 class PiPollerTests(unittest.TestCase):

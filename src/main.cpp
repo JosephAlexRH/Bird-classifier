@@ -83,14 +83,16 @@ void loop() {
   // With the SD buffer available, motion capture keeps running through Wi-Fi drops.
   const bool wifiUp = WiFi.status() == WL_CONNECTED;
   if ((wifiUp || (cfg.bufferUploadsToSd && sdReady)) &&
-      getCameraOperatingMode() == CameraOperatingMode::Motion && !isCameraStreamActive() &&
+      isFirmwareMotionOwner() && getCameraOperatingMode() == CameraOperatingMode::Motion &&
+      !isCameraStreamActive() &&
       now - lastMotionCheck >= static_cast<unsigned long>(cfg.motionCheckMs)) {
     lastMotionCheck = now;
     checkMotion();
   }
 
   // One buffered frame per pass so motion checks run between deliveries.
-  if (wifiUp && !isCameraStreamActive() && now - lastBufferFlush >= kBufferFlushMs) {
+  if (isFirmwareMotionOwner() && wifiUp && !isCameraStreamActive() &&
+      now - lastBufferFlush >= kBufferFlushMs) {
     lastBufferFlush = now;
     flushOneBufferedUpload();
   }
@@ -106,7 +108,8 @@ void loop() {
       WiFi.disconnect();
       connectToWifi();
     }
-    if (cfg.motionEnabled != previousConfig.motionEnabled) {
+    if (cfg.motionOwner != previousConfig.motionOwner ||
+        cfg.motionEnabled != previousConfig.motionEnabled) {
       if (cfg.motionEnabled) {
         armMotionDetection();
       } else {

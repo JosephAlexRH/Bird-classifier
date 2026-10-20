@@ -126,7 +126,8 @@ Config cfg = {
     20,
     0.05f,
     200,
-    true,
+    false,
+    MotionOwner::Pi,
     10,
     8,  // FRAMESIZE_VGA
     "192.168.7.170",
@@ -157,6 +158,12 @@ Config cfg = {
 };
 
 bool sdReady = false;
+
+const char *motionOwnerName(MotionOwner owner) {
+  return owner == MotionOwner::Firmware ? "firmware" : "pi";
+}
+
+bool isFirmwareMotionOwner() { return cfg.motionOwner == MotionOwner::Firmware; }
 
 void mountStorage() {
   // One-bit mode avoids conflicts with the AI Thinker ESP32-CAM pins.
@@ -220,6 +227,20 @@ void loadConfig() {
 
   hashConfigFile();
 
+  if (document.containsKey("motion_owner")) {
+    const char *owner = document["motion_owner"] | "";
+    if (strcmp(owner, "firmware") == 0) {
+      cfg.motionOwner = MotionOwner::Firmware;
+    } else if (strcmp(owner, "pi") == 0) {
+      cfg.motionOwner = MotionOwner::Pi;
+    } else {
+      cfg.motionOwner = MotionOwner::Pi;
+      Serial.println("Invalid motion_owner in config.json; defaulting to pi");
+    }
+  } else {
+    cfg.motionOwner = MotionOwner::Pi;
+  }
+
   const char *ssid = document["wifi_ssid"] | "";
   const char *password = document["wifi_password"] | "";
   if (ssid[0] != '\0' && strlen(ssid) <= 32 && strlen(password) <= 64) {
@@ -243,6 +264,10 @@ void loadConfig() {
   }
   if (document.containsKey("motion_enabled")) {
     cfg.motionEnabled = document["motion_enabled"];
+  }
+  if (!isFirmwareMotionOwner() && cfg.motionEnabled) {
+    cfg.motionEnabled = false;
+    Serial.println("Ignoring motion_enabled=true because motion_owner is pi");
   }
   if (document.containsKey("jpeg_quality")) {
     cfg.jpegQuality = document["jpeg_quality"];
@@ -341,6 +366,7 @@ void loadConfig() {
   Serial.printf("  wifi_ssid:          %s\n", cfg.wifiSsid[0] == '\0' ? "(not configured)" : cfg.wifiSsid);
   Serial.printf("  wifi_password:      %s\n", cfg.wifiPassword[0] == '\0' ? "(not set)" : "(set)");
   Serial.printf("  motion_enabled:     %s\n", cfg.motionEnabled ? "true" : "false");
+  Serial.printf("  motion_owner:       %s\n", motionOwnerName(cfg.motionOwner));
   Serial.printf("  motion_threshold:   %d\n", cfg.motionThreshold);
   Serial.printf("  motion_sensitivity: %.2f\n", cfg.motionSensitivity);
   Serial.printf("  motion_check_ms:    %d\n", cfg.motionCheckMs);
@@ -381,6 +407,7 @@ void saveConfig() {
   document["motion_sensitivity"] = cfg.motionSensitivity;
   document["motion_check_ms"] = cfg.motionCheckMs;
   document["motion_enabled"] = cfg.motionEnabled;
+  document["motion_owner"] = motionOwnerName(cfg.motionOwner);
   document["jpeg_quality"] = cfg.jpegQuality;
   document["framesize"] = cfg.framesize;
   document["server_ip"] = cfg.serverIp;

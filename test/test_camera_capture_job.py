@@ -144,6 +144,26 @@ class CameraCaptureJobTests(unittest.TestCase):
         with self.assertRaisesRegex(CameraCaptureError, "camera.local/capture.*offline"):
             fetch_camera_capture("http://camera.local", opener=offline)
 
+    def test_monitor_frame_endpoint_uses_the_shared_bounded_fetcher(self) -> None:
+        def opener(request, timeout):
+            self.assertEqual(request.full_url, "http://camera.local/monitor-frame")
+            self.assertEqual(timeout, 2.0)
+            return FakeResponse(JPEG, metadata=json.dumps(METADATA))
+
+        image, metadata = fetch_camera_capture(
+            "http://camera.local",
+            endpoint="monitor-frame",
+            timeout_seconds=2.0,
+            opener=opener,
+        )
+        self.assertEqual(image, JPEG)
+        self.assertEqual(json.loads(metadata), METADATA)
+
+    def test_fetch_rejects_unsafe_endpoint_names(self) -> None:
+        for endpoint in ("", "/capture", "two/parts", "Capture", "capture?x=1"):
+            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                fetch_camera_capture("http://camera.local", endpoint=endpoint)
+
     def test_fixed_rate_loop_runs_immediately_and_continues_after_error(self) -> None:
         clock = FakeClock()
         attempted_at: list[float] = []

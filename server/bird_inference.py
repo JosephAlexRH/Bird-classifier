@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import numbers
 import os
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -24,6 +27,11 @@ except ImportError:  # Pillow fallback: accurate DCT, so pixels differ slightly 
 INFERENCE_SCHEMA_VERSION = 2
 DEFAULT_IMAGE_SIZE = 224
 CONTRACT_FILENAME = "inference_contract.json"
+LETTERBOX_GEOMETRY = "letterbox"
+ROI_CROP_GEOMETRY = "roi_crop_then_letterbox"
+SELECTED_CROP_GEOMETRY = "selected_crop_then_letterbox"
+ROI_PADDING_FRACTION = 0.20
+SELECTED_CROP_SOURCE = "capture_motion_record.selection.final_bounds_px"
 
 
 def _utc_now() -> str:
@@ -200,6 +208,93 @@ def letterbox_rgb(image_path: Path, image_size: int = DEFAULT_IMAGE_SIZE) -> np.
     return letterbox_array(decode_rgb(Path(image_path)), image_size)
 
 
+def validate_normalized_roi(roi: Any) -> dict[str, float]:
+    """Return a validated normalized ``{x, y, width, height}`` ROI.
+
+    Deliberately do not coerce strings, booleans, lists, extra keys, or partially
+    out-of-frame rectangles.  Capture metadata is an input to the model and a
+    malformed value must fail visibly rather than silently change its meaning.
+    """
+    keys = {"x", "y", "width", "height"}
+    if not isinstance(roi, dict) or set(roi) != keys:
+        raise ValueError("roi must be an object with exactly x, y, width, and height.")
+    result: dict[str, float] = {}
+    for key in ("x", "y", "width", "height"):
+        value = roi[key]
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise ValueError(f"roi.{key} must be a finite number.")
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError(f"roi.{key} must be a finite number.")
+        result[key] = value
+    x, y, width, height = (result[key] for key in ("x", "y", "width", "height"))
+    if x < 0.0 or y < 0.0 or width <= 0.0 or height <= 0.0:
+        raise ValueError("roi must have x/y >= 0 and width/height > 0.")
+    if x > 1.0 or y > 1.0 or width > 1.0 or height > 1.0:
+        raise ValueError("roi values must be normalized to the range 0..1.")
+    # Decimal(str(...)) applies the stated decimal coordinates without binary-float
+    # addition accidentally turning a boundary such as 0.1 + 0.7 + 0.2 into > 1.
+    if Decimal(str(x)) + Decimal(str(width)) > 1 or Decimal(str(y)) + Decimal(str(height)) > 1:
+        raise ValueError("roi must lie wholly inside the normalized image bounds.")
+    return result
+
+
+def roi_crop_geometry(
+    roi: Any, image_width: int, image_height: int
+) -> tuple[dict[str, float], dict[str, float], tuple[int, int, int, int]]:
+    """Validate, pad, clip and outward-round an ROI.
+
+    Padding is 20% of the original ROI dimension in total (10% on each side).
+    Pixel bounds are half-open ``(left, top, right, bottom)`` suitable for numpy
+    slicing.  Flooring minima and ceiling maxima guarantees the padded region is
+    never made smaller by conversion to pixels.
+    """
+    if image_width < 1 or image_height < 1:
+        raise ValueError("Image dimensions must be positive.")
+    normalized = validate_normalized_roi(roi)
+    # Match the notebook's TensorFlow graph: the decoded ROI tensor is float32
+    # before padding and pixel conversion.
+    f32 = np.float32
+    x, y, width, height = (f32(normalized[key]) for key in ("x", "y", "width", "height"))
+    half_padding = f32(ROI_PADDING_FRACTION / 2.0)
+    left_n = max(f32(0.0), f32(x - f32(width * half_padding)))
+    top_n = max(f32(0.0), f32(y - f32(height * half_padding)))
+    right_n = min(f32(1.0), f32(f32(x + width) + f32(width * half_padding)))
+    bottom_n = min(f32(1.0), f32(f32(y + height) + f32(height * half_padding)))
+    padded = {
+        "x": float(left_n),
+        "y": float(top_n),
+        "width": float(f32(right_n - left_n)),
+        "height": float(f32(bottom_n - top_n)),
+    }
+    left = int(np.floor(f32(left_n * f32(image_width))))
+    top = int(np.floor(f32(top_n * f32(image_height))))
+    right = int(np.ceil(f32(right_n * f32(image_width))))
+    bottom = int(np.ceil(f32(bottom_n * f32(image_height))))
+    if right <= left or bottom <= top:  # Defensive; positive normalized ROI should prevent this.
+        raise ValueError("roi produces an empty pixel crop.")
+    return normalized, padded, (left, top, right, bottom)
+
+
+def validate_selected_crop(
+    crop: Any, image_width: int, image_height: int
+) -> tuple[int, int, int, int]:
+    """Validate final half-open pixel bounds without adding another margin."""
+    keys = {"left", "top", "right", "bottom"}
+    if not isinstance(crop, dict) or set(crop) != keys:
+        raise ValueError("selected_crop must contain exactly left, top, right, and bottom.")
+    values: list[int] = []
+    for key in ("left", "top", "right", "bottom"):
+        value = crop[key]
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise ValueError(f"selected_crop.{key} must be an integer.")
+        values.append(int(value))
+    left, top, right, bottom = values
+    if not (0 <= left < right <= image_width and 0 <= top < bottom <= image_height):
+        raise ValueError("selected_crop must be a non-empty half-open box inside the original frame.")
+    return left, top, right, bottom
+
+
 def _quantize(values: np.ndarray, dtype: np.dtype, quantization: tuple[float, int]) -> np.ndarray:
     dtype = np.dtype(dtype)
     if np.issubdtype(dtype, np.floating):
@@ -343,7 +438,11 @@ class InferenceContract:
             if key in data and not allowed(data[key]):
                 problems.append(f"{key}={data[key]!r} (receiver supports {description})")
 
-        expect("geometry", lambda v: v == "letterbox", "'letterbox' only")
+        expect(
+            "geometry",
+            lambda v: v in (LETTERBOX_GEOMETRY, ROI_CROP_GEOMETRY, SELECTED_CROP_GEOMETRY),
+            f"'{LETTERBOX_GEOMETRY}', '{ROI_CROP_GEOMETRY}', or '{SELECTED_CROP_GEOMETRY}'",
+        )
         expect("geometry_location", lambda v: v == "outside the model", "'outside the model'")
         expect("color_order", lambda v: v == "RGB", "'RGB'")
         expect("jpeg_decode_channels", lambda v: v == 3, "3")
@@ -355,6 +454,35 @@ class InferenceContract:
             lambda v: "inside the model" in str(v),
             "scaling embedded in the model",
         )
+        self.geometry = data.get("geometry", LETTERBOX_GEOMETRY)
+        if self.geometry == ROI_CROP_GEOMETRY:
+            required_crop_fields = {
+                "geometry_location": "outside the model",
+                "roi_source": "capture_sidecar.camera.requested.motion.roi",
+                "roi_coordinate_space": "normalized_original_frame",
+                "roi_padding_fraction": ROI_PADDING_FRACTION,
+                "roi_padding_semantics": "total_dimension_increase",
+                "roi_pixel_rounding": "floor_min_ceil_max",
+            }
+            for key, expected in required_crop_fields.items():
+                if key not in data:
+                    problems.append(f"missing required {key}")
+                elif data[key] != expected:
+                    problems.append(f"{key}={data[key]!r} (receiver requires {expected!r})")
+        if self.geometry == SELECTED_CROP_GEOMETRY:
+            required_selected_fields = {
+                "geometry_location": "outside the model",
+                "crop_source": SELECTED_CROP_SOURCE,
+                "crop_coordinate_space": "original_decoded_frame_pixels",
+                "crop_bounds_semantics": "half_open_left_top_right_bottom",
+                "crop_is_final": True,
+                "additional_runtime_margin": 0,
+            }
+            for key, expected in required_selected_fields.items():
+                if key not in data:
+                    problems.append(f"missing required {key}")
+                elif data[key] != expected:
+                    problems.append(f"{key}={data[key]!r} (receiver requires {expected!r})")
         labels = data.get("labels")
         if labels is not None and str((labels or {}).get("1", "")).lower() != "bird":
             problems.append(f"labels={labels!r} (output index 1 must be 'bird')")
@@ -416,14 +544,24 @@ class InferenceContract:
             "path": str(self.path),
             "sha256": self.sha256,
             "model_file": self.data.get("model_file"),
-            "geometry": self.data.get("geometry"),
+            "geometry": self.geometry,
+            "geometry_location": self.data.get("geometry_location"),
+            "roi_source": self.data.get("roi_source"),
+            "roi_coordinate_space": self.data.get("roi_coordinate_space"),
+            "roi_padding_fraction": self.data.get("roi_padding_fraction"),
+            "roi_padding_semantics": self.data.get("roi_padding_semantics"),
+            "roi_pixel_rounding": self.data.get("roi_pixel_rounding"),
+            "crop_source": self.data.get("crop_source"),
+            "crop_coordinate_space": self.data.get("crop_coordinate_space"),
+            "crop_bounds_semantics": self.data.get("crop_bounds_semantics"),
+            "crop_is_final": self.data.get("crop_is_final"),
             "bird_probability_threshold": self.bird_probability_threshold,
             "uint8_output_threshold": self.raw_output_threshold,
         }
 
 
 class BirdInferenceEngine:
-    """Run bird-presence and species models over the same letterboxed pixels.
+    """Run bird-presence and species models with contract-selected preprocessing.
 
     The is-bird decision follows the model's ``inference_contract.json`` when one
     is present: for a quantized output the exact integer rule
@@ -532,15 +670,100 @@ class BirdInferenceEngine:
             return f"raw_output >= {self.raw_output_threshold}"
         return f"bird_probability >= {self.bird_threshold}"
 
-    def infer(self, image_path: Path) -> dict[str, Any]:
+    def infer(
+        self,
+        image_path: Path,
+        *,
+        roi: Any | None = None,
+        roi_source: str | None = None,
+        selected_crop: Any | None = None,
+        crop_source: str | None = None,
+    ) -> dict[str, Any]:
+        """Infer one capture, optionally using its normalized motion ROI.
+
+        Crop-aware is-bird contracts require both keyword arguments.  The species
+        model intentionally remains a whole-frame letterbox model: its training
+        contract is independent of the is-bird model's capture ROI.
+        """
         image_path = Path(image_path)
         started = time.perf_counter()
         preprocess_started = time.perf_counter()
-        pixels = letterbox_rgb(image_path, self.is_bird.image_size)
+        rgb = decode_rgb(image_path)
+        geometry = self.contract.geometry if self.contract is not None else LETTERBOX_GEOMETRY
+        crop_provenance: dict[str, Any] | None = None
+        if geometry == ROI_CROP_GEOMETRY:
+            if roi is None:
+                raise ValueError(
+                    f"roi is required by inference contract geometry={ROI_CROP_GEOMETRY!r}."
+                )
+            validated_roi = validate_normalized_roi(roi)
+            expected_source = str(self.contract.data["roi_source"])
+            if not isinstance(roi_source, str) or not roi_source.strip():
+                raise ValueError("roi_source is required for ROI-cropped inference.")
+            if roi_source != expected_source:
+                raise ValueError(
+                    f"roi_source={roi_source!r} does not match contract roi_source={expected_source!r}."
+                )
+            normalized, padded, bounds = roi_crop_geometry(
+                validated_roi, int(rgb.shape[1]), int(rgb.shape[0])
+            )
+            left, top, right, bottom = bounds
+            is_bird_rgb = rgb[top:bottom, left:right]
+            crop_provenance = {
+                "roi_source": roi_source,
+                "roi_coordinate_space": "normalized_original_frame",
+                "requested_roi": normalized,
+                "roi_padding_fraction": ROI_PADDING_FRACTION,
+                "roi_padding_semantics": "total_dimension_increase",
+                "clipped_padded_roi": padded,
+                "roi_pixel_rounding": "floor_min_ceil_max",
+                "pixel_bounds": {
+                    "left": left,
+                    "top": top,
+                    "right": right,
+                    "bottom": bottom,
+                    "width": right - left,
+                    "height": bottom - top,
+                },
+                "original_frame": {"width": int(rgb.shape[1]), "height": int(rgb.shape[0])},
+            }
+        elif geometry == SELECTED_CROP_GEOMETRY:
+            if selected_crop is None:
+                raise ValueError("selected_crop is required by selected_crop_then_letterbox inference.")
+            expected_source = str(self.contract.data["crop_source"])
+            if crop_source != expected_source:
+                raise ValueError(
+                    f"crop_source={crop_source!r} does not match contract crop_source={expected_source!r}."
+                )
+            left, top, right, bottom = validate_selected_crop(
+                selected_crop, int(rgb.shape[1]), int(rgb.shape[0])
+            )
+            is_bird_rgb = rgb[top:bottom, left:right]
+            crop_provenance = {
+                "crop_source": crop_source,
+                "crop_coordinate_space": "original_decoded_frame_pixels",
+                "crop_bounds_semantics": "half_open_left_top_right_bottom",
+                "crop_is_final": True,
+                "additional_runtime_margin": 0,
+                "pixel_bounds": {
+                    "left": left, "top": top, "right": right, "bottom": bottom,
+                    "width": right - left, "height": bottom - top,
+                },
+                "original_frame": {"width": int(rgb.shape[1]), "height": int(rgb.shape[0])},
+            }
+        else:
+            is_bird_rgb = rgb
+        bird_pixels = letterbox_array(is_bird_rgb, self.is_bird.image_size)
+        # Never pass ROI-cropped pixels to the whole-frame species classifier.
+        species_pixels = (
+            bird_pixels
+            if geometry == LETTERBOX_GEOMETRY and self.species.image_size == self.is_bird.image_size
+            else letterbox_array(rgb, self.species.image_size)
+        )
         preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
 
         bird_started = time.perf_counter()
-        bird_raw, bird_values = self.is_bird.predict(pixels)
+        bird_raw, bird_values = self.is_bird.predict(bird_pixels)
         bird_ms = (time.perf_counter() - bird_started) * 1000
         bird_probability = min(1.0, max(0.0, float(bird_values[0])))
         raw_output = int(bird_raw[0]) if self.is_bird.output_is_quantized else None
@@ -550,7 +773,7 @@ class BirdInferenceEngine:
             is_bird = bird_probability >= self.bird_threshold
 
         species_started = time.perf_counter()
-        species_scores = self.species.predict_pixels(pixels)
+        species_scores = self.species.predict_pixels(species_pixels)
         species_ms = (time.perf_counter() - species_started) * 1000
         order = np.argsort(-species_scores, kind="stable")[: self.top_k]
         top = [
@@ -583,7 +806,8 @@ class BirdInferenceEngine:
             },
             "contract": self.contract.describe() if self.contract is not None else None,
             "preprocessing": {
-                "method": "letterbox",
+                # Keep legacy summary fields for existing letterbox consumers.
+                "method": geometry,
                 "implementation": "TensorFlow resize_with_pad semantics, antialiased bilinear",
                 "size": self.is_bird.image_size,
                 "color": "RGB",
@@ -591,6 +815,18 @@ class BirdInferenceEngine:
                 "exif_orientation": "ignored (as tf.io.decode_jpeg)",
                 "jpeg_decoder": jpeg_decoder_name(),
                 "input_range": "float 0-255, quantized per model input tensor; model performs scaling",
+                "crop": crop_provenance,
+                "is_bird": {
+                    "method": geometry,
+                    "size": self.is_bird.image_size,
+                    "crop": crop_provenance,
+                },
+                "species": {
+                    "method": LETTERBOX_GEOMETRY,
+                    "size": self.species.image_size,
+                    "crop": None,
+                    "source": "whole_original_frame",
+                },
             },
             "timing_ms": {
                 "preprocess": preprocess_ms,

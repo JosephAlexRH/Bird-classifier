@@ -111,7 +111,8 @@ bool bufferUpload(const camera_fb_t *frameBuffer, const String &metadata) {
 }
 
 void flushOneBufferedUpload() {
-  if (bufferedCount == 0 || !sdReady || isMotionUploadCoolingDown()) return;
+  if (!isFirmwareMotionOwner() || bufferedCount == 0 || !sdReady ||
+      isMotionUploadCoolingDown()) return;
 
   File directory = SD_MMC.open(kPendingDirectory);
   if (!directory || !directory.isDirectory()) {
