@@ -235,6 +235,8 @@ class CaptureStorageTests(unittest.TestCase):
             destination = store.save_derived_record(image_path, "motion", record)
             self.assertEqual(destination.name, f"{capture['capture_id']}.motion.json")
             self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), record)
+            with self.assertRaises(FileExistsError):
+                store.save_derived_record(image_path, "motion", record)
             with self.assertRaises(ValueError):
                 store.save_derived_record(image_path, "bad.suffix", record)
             with self.assertRaises(ValueError):
@@ -827,6 +829,104 @@ class RaspberryPiServerTests(unittest.TestCase):
         self.assertEqual(inference["status"], "error")
         self.assertIn("roi is required", inference["error"])
 
+    def test_selected_crop_model_uses_static_fallback_for_firmware_upload(self) -> None:
+        calls = []
+
+        class Contract:
+            geometry = "selected_crop_then_letterbox"
+
+        class SelectedEngine:
+            contract = Contract()
+
+            def infer(self, image_path, **kwargs):
+                calls.append((Path(image_path), kwargs))
+                return {
+                    "schema_version": 3,
+                    "status": "complete",
+                    "is_bird": False,
+                    "bird_probability": 0.1,
+                    "bird_threshold": 0.8,
+                    "classification": {"is_bird": False, "confidence": 0.1, "label": "none"},
+                }
+
+            def describe(self):
+                return {"ready": True, "geometry": self.contract.geometry}
+
+        root = self.save_dir / "selected-fallback"
+        app = create_pi_app(root, inference_engine=SelectedEngine())
+        metadata = json.loads(json.dumps(CAMERA_METADATA))
+        metadata["schema_version"] = 5
+        metadata["device"]["camera_id"] = "esp32cam-aabbccddeeff"
+        metadata["camera"]["requested"]["motion"] = {
+            "owner": "firmware",
+            "roi": {"x": 0.25, "y": 0.25, "width": 0.5, "height": 0.5},
+        }
+        # Use a real JPEG because selected fallback decodes dimensions.
+        from PIL import Image
+        import io
+        output = io.BytesIO()
+        Image.new("RGB", (320, 240), (40, 50, 60)).save(output, "JPEG")
+        response = app.test_client().post(
+            "/upload", data=output.getvalue(), content_type="image/jpeg",
+            headers={METADATA_HEADER: json.dumps(metadata)},
+        )
+        self.assertEqual(response.status_code, 200)
+        capture_id = response.get_json()["capture_id"]
+        self.assertEqual(calls[0][1]["crop_source"], "capture_motion_record.selection.final_bounds_px")
+        self.assertEqual(set(calls[0][1]["selected_crop"]), {"left", "top", "right", "bottom"})
+        motion_path = root / f"{capture_id}.motion.json"
+        self.assertTrue(motion_path.is_file())
+        motion = json.loads(motion_path.read_text(encoding="utf-8"))
+        self.assertEqual(motion["selection"]["source"], "static_roi_fallback")
+
+    def test_restart_reuses_existing_dynamic_motion_crop(self) -> None:
+        calls = []
+
+        class Contract:
+            geometry = "selected_crop_then_letterbox"
+
+        class SelectedEngine:
+            contract = Contract()
+
+            def infer(self, image_path, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "schema_version": 3, "status": "complete", "is_bird": False,
+                    "bird_probability": 0.1, "bird_threshold": 0.8,
+                    "classification": {"is_bird": False, "confidence": 0.1, "label": "none"},
+                }
+
+            def describe(self):
+                return {"ready": True}
+
+        root = self.save_dir / "restart-motion"
+        store = CaptureStore(root)
+        from PIL import Image
+        import io
+        output = io.BytesIO(); Image.new("RGB", (320, 240), (0, 0, 0)).save(output, "JPEG")
+        metadata = json.loads(json.dumps(CAMERA_METADATA))
+        metadata["schema_version"] = 5
+        metadata["device"]["camera_id"] = "esp32cam-aabbccddeeff"
+        metadata["camera"]["requested"]["motion"] = {
+            "owner": "pi", "roi": {"x": 0, "y": 0, "width": 1, "height": 1},
+        }
+        record = store.save_capture(output.getvalue(), source="pi_motion_poll", camera_metadata=metadata)
+        image_path = root / record["filename"]
+        bounds = {"left": 40, "top": 30, "right": 200, "bottom": 190, "width": 160, "height": 160}
+        motion = {
+            "schema_version": 1,
+            "capture": {"capture_id": record["capture_id"], "image_sha256": record["sha256"]},
+            "selection": {"source": "dynamic_motion_blob", "final_bounds_px": bounds},
+        }
+        store.save_derived_record(image_path, "motion", motion)
+        app = create_pi_app(root, inference_engine=SelectedEngine())
+        app.config["CLASSIFICATION_QUEUE"].join()
+        self.assertEqual(
+            calls[0]["selected_crop"],
+            {key: bounds[key] for key in ("left", "top", "right", "bottom")},
+        )
+        self.assertEqual(json.loads(image_path.with_suffix(".motion.json").read_text()), motion)
+
     def test_pi_motion_service_lifecycle_is_explicit_and_reported_in_health(self) -> None:
         class FakeEngine:
             def describe(self):
@@ -840,6 +940,9 @@ class RaspberryPiServerTests(unittest.TestCase):
 
             def start(self):
                 self.started = True
+
+            def stop(self):
+                self.started = False
 
             def describe(self):
                 return {"running": self.started, "frames_polled": 3}
@@ -855,6 +958,24 @@ class RaspberryPiServerTests(unittest.TestCase):
         self.assertTrue(service.started)
         health = app.test_client().get("/health").get_json()
         self.assertEqual(health["motion_service"]["frames_polled"], 3)
+        app.config["CLEANUP"]()
+        self.assertFalse(service.started)
+
+    def test_motion_record_is_exposed_by_capture_api(self) -> None:
+        root = self.save_dir / "motion-api"
+        store = CaptureStore(root)
+        record = store.save_capture(JPEG, source="pi_motion_poll")
+        image_path = root / record["filename"]
+        motion = {"schema_version": 1, "capture": {"capture_id": record["capture_id"]}}
+        store.save_derived_record(image_path, "motion", motion)
+        app = create_pi_app(root)
+        client = app.test_client()
+        summary = client.get(f"/api/captures/{record['capture_id']}").get_json()
+        self.assertEqual(summary["motion"], motion)
+        self.assertEqual(
+            client.get(summary["motion_url"]).get_json(),
+            motion,
+        )
 
     def test_pi_motion_service_requires_camera_and_engine(self) -> None:
         with self.assertRaisesRegex(ValueError, "camera_url and inference_engine"):

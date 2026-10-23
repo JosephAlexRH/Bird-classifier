@@ -261,5 +261,7 @@ class CaptureStore:
         destination = image_path.with_suffix(f".{suffix}.json")
         encoded = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
         with self._lock:
+            if destination.exists():
+                raise FileExistsError(f"Derived record already exists: {destination.name}")
             self._atomic_write(destination, encoded)
         return destination

@@ -24,7 +24,7 @@ except ImportError:  # Pillow fallback: accurate DCT, so pixels differ slightly 
     _simplejpeg = None
 
 
-INFERENCE_SCHEMA_VERSION = 2
+INFERENCE_SCHEMA_VERSION = 3
 DEFAULT_IMAGE_SIZE = 224
 CONTRACT_FILENAME = "inference_contract.json"
 LETTERBOX_GEOMETRY = "letterbox"

@@ -19,6 +19,10 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 try:
     from .bird_inference import (
         BirdInferenceEngine,
+        INFERENCE_SCHEMA_VERSION,
+        SELECTED_CROP_GEOMETRY,
+        SELECTED_CROP_SOURCE,
+        decode_rgb,
         inference_path,
         jpeg_decoder_name,
         read_inference_record,
@@ -27,10 +31,15 @@ try:
     from .capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from .laptop_test_server import camera_url_argument, normalize_camera_url
     from .pi_motion import MotionService
+    from .motion_crop import rgb_to_gray, select_motion_crop
     from .roi_control import ROI_CONTROL_JS
 except ImportError:  # Direct execution: python server/raspberry_pi_server.py
     from bird_inference import (
         BirdInferenceEngine,
+        INFERENCE_SCHEMA_VERSION,
+        SELECTED_CROP_GEOMETRY,
+        SELECTED_CROP_SOURCE,
+        decode_rgb,
         inference_path,
         jpeg_decoder_name,
         read_inference_record,
@@ -39,6 +48,7 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
     from capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from laptop_test_server import camera_url_argument, normalize_camera_url
     from pi_motion import MotionService
+    from motion_crop import rgb_to_gray, select_motion_crop
     from roi_control import ROI_CONTROL_JS
 
 
@@ -259,6 +269,7 @@ def create_app(
     pending: queue.Queue[Path] = queue.Queue()
     app.config["CLASSIFICATION_QUEUE"] = pending
     app.config["MOTION_SERVICE"] = None
+    app.config["CLEANUP"] = lambda: None
 
     def failed_record(destination: Path, error: str) -> dict[str, Any]:
         return {
@@ -279,18 +290,55 @@ def create_app(
         try:
             if inference_engine is not None:
                 roi, roi_source = capture_roi(destination)
+                kwargs: dict[str, Any] = {"roi": roi, "roi_source": roi_source}
+                geometry = getattr(getattr(inference_engine, "contract", None), "geometry", None)
+                if geometry == SELECTED_CROP_GEOMETRY:
+                    rgb = decode_rgb(destination)
+                    motion_path = destination.with_suffix(".motion.json")
+                    motion = None
+                    if motion_path.is_file():
+                        loaded = json.loads(motion_path.read_text(encoding="utf-8"))
+                        capture = loaded.get("capture") if isinstance(loaded, dict) else None
+                        if (
+                            isinstance(capture, dict)
+                            and capture.get("capture_id") == destination.stem
+                            and capture.get("image_sha256") == hashlib.sha256(destination.read_bytes()).hexdigest()
+                        ):
+                            motion = loaded
+                        else:
+                            raise ValueError("Existing motion record does not match the stored capture")
+                    if motion is None:
+                        motion = select_motion_crop(rgb_to_gray(rgb), None, roi)
+                    bounds = motion["selection"]["final_bounds_px"]
+                    sidecar_path = destination.with_suffix(".json")
+                    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                    if not motion_path.is_file():
+                        motion["capture"] = {
+                            "capture_id": destination.stem,
+                            "filename": destination.name,
+                            "image_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+                            "width": int(rgb.shape[1]),
+                            "height": int(rgb.shape[0]),
+                            "camera_id": sidecar.get("camera_id") or ((sidecar.get("device") or {}).get("camera_id")),
+                            "boot_id": (sidecar.get("device") or {}).get("boot_id"),
+                        }
+                        motion["static_roi"]["capture_sidecar"] = sidecar_path.name
+                        motion["static_roi"]["capture_sidecar_sha256"] = hashlib.sha256(
+                            sidecar_path.read_bytes()
+                        ).hexdigest()
+                        store.save_derived_record(destination, "motion", motion)
+                    kwargs = {
+                        "selected_crop": {key: bounds[key] for key in ("left", "top", "right", "bottom")},
+                        "crop_source": SELECTED_CROP_SOURCE,
+                    }
                 with inference_lock:
-                    inference = inference_engine.infer(
-                        destination,
-                        roi=roi,
-                        roi_source=roi_source,
-                    )
+                    inference = inference_engine.infer(destination, **kwargs)
                 inference["capture_id"] = destination.stem
                 classification, error = validate_classification(inference.get("classification"))
             else:
                 classification, error = validate_classification(classify(destination))
                 inference = {
-                    "schema_version": 1,
+                    "schema_version": INFERENCE_SCHEMA_VERSION,
                     "status": "complete" if error is None else "error",
                     "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "capture_id": destination.stem,
@@ -362,6 +410,7 @@ def create_app(
         )
         motion_service.start()
         app.config["MOTION_SERVICE"] = motion_service
+        app.config["CLEANUP"] = motion_service.stop
 
     # A process restart must not strand accepted captures whose in-memory queue was lost.
     if inference_engine is not None:
@@ -711,4 +760,9 @@ if __name__ == "__main__":
         motion_poll_seconds=args.motion_poll_seconds,
         motion_timeout_seconds=args.motion_timeout_seconds,
     )
-    application.run(host=args.host, port=args.port, debug=False, threaded=True)
+    try:
+        application.run(host=args.host, port=args.port, debug=False, threaded=True)
+    finally:
+        motion_service = application.config.get("MOTION_SERVICE")
+        if motion_service is not None:
+            motion_service.stop()

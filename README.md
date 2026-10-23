@@ -8,12 +8,20 @@ exclusive camera endpoint and does not run its local detector or flush legacy
 buffered motion uploads. Set `motion_owner` to `firmware` only as an explicit
 fallback to the on-device detector.
 
+The Pi keeps a per-camera running median of confident not-bird grayscale frames.
+It removes global brightness shift, thresholds the full-resolution residual,
+and uses the largest unambiguous changed component. The final crop receives 20%
+total context and is at least 160×160 pixels; cold, noisy, broad, or ambiguous
+frames fall back to the capture-time static ROI. Quiet polls remain memory-only.
+Clear-blob events and birds are stored with immutable `.motion.json` and
+`.inference.json` provenance beside the JPEG.
+
 ## Responsibilities
 
 - Connects the ESP32-CAM to Wi-Fi
-- Detects motion by diffing low-resolution luminance samples against a running reference frame
-- Captures a JPEG at full resolution when motion crosses a threshold
-- POSTs the JPEG to a configured Raspberry Pi classifier over HTTP
+- Lets the Raspberry Pi poll fresh full-resolution JPEGs and detect/localize motion
+- Retains the low-resolution firmware detector, burst upload, and SD buffering as a manual fallback
+- Classifies selected Pi crops while keeping the species model on the whole frame
 - Saves the JPEG under `/birds` on microSD only when the Pi explicitly confirms a bird
 - Exposes HTTP endpoints for on-demand capture, live config, and status
 - Loads and persists configuration on a microSD card, so settings survive reflashing
@@ -317,6 +325,22 @@ pio run                  # build
 pio run --target upload  # build and flash
 pio device monitor       # serial monitor at 115200 baud
 ```
+
+The Pi receiver starts active polling whenever `--camera-url` is supplied:
+
+```bash
+python3 server/raspberry_pi_server.py \
+  --camera-url http://192.168.1.84 \
+  --motion-poll-seconds 0.25 \
+  --motion-timeout-seconds 2
+```
+
+`/health` reports poll counts, background readiness/epoch, persistence count,
+last crop selection, and the latest polling error. OpenCV is used automatically
+when installed; a tested NumPy fallback keeps the service functional without an
+additional Pi wheel. Existing `letterbox` and static `roi_crop_then_letterbox`
+models keep their original inputs. Retrain with the generated `.motion.json`
+records before deploying a `selected_crop_then_letterbox` model.
 
 ## License
 
