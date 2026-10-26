@@ -38,6 +38,22 @@ struct CameraSettingsSnapshot {
   bool binning;
 };
 
+struct Ov5640RegisterSnapshot {
+  bool supported;
+  bool exposureValid;
+  bool exposureConsistent;
+  uint8_t exposureReadAttempts;
+  uint32_t exposureRaw16ths;
+  uint32_t exposureLines;
+  bool frameLengthValid;
+  uint16_t frameLengthLines;
+  bool gainValid;
+  uint16_t gainRaw;
+  float nominalGainMultiplier;
+  bool exposureGainProductValid;
+  float exposureGainProduct;
+};
+
 struct Ov2640RegisterSnapshot {
   bool supported;
   bool exposureValid;
@@ -46,7 +62,7 @@ struct Ov2640RegisterSnapshot {
   uint8_t aecHigh;
   uint8_t aecMiddle;
   uint8_t aecLow;
-  uint32_t exposure;
+  uint32_t exposureLines;
   uint32_t aecDriverLimitLines;
   bool aeSaturatedValid;
   bool aeSaturated;
@@ -61,13 +77,13 @@ struct Ov2640RegisterSnapshot {
   uint8_t dspControlCe;
 };
 
-// A lightweight post-frame AEC/AGC observation for motion gating. The OV2640
+// A lightweight post-frame AEC/AGC observation for motion gating. Sensor
 // registers are not an atomic exposure-start snapshot, so callers compare this
 // relative product only between frames captured in the same sensor mode.
 struct ExposureGainSample {
   bool valid;
   uint32_t exposureLines;
-  uint8_t gainRaw;
+  uint16_t gainRaw;
   float nominalGainMultiplier;
   float product;
 };
@@ -81,7 +97,8 @@ struct CameraMetadataSnapshot {
   uint8_t sensorAddress;
   int xclkHz;
   CameraSettingsSnapshot driverCache;
-  Ov2640RegisterSnapshot observed;
+  Ov2640RegisterSnapshot ov2640Observed;
+  Ov5640RegisterSnapshot ov5640Observed;
   DeviceTelemetrySnapshot device;
 
   int requestedFramesize;
@@ -124,6 +141,10 @@ struct CapturedJpeg {
 };
 
 bool initializeCamera();
+const char *cameraSensorModelName(uint16_t pid, uint8_t version = 0);
+uint16_t cameraSensorConfigKey(uint16_t pid, uint8_t version);
+bool applyCameraProfile();
+bool isCameraRestartRequired();
 void applyCameraSettings();
 bool drainCameraBuffer();
 bool discardQueuedCameraFrame();

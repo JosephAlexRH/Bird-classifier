@@ -244,7 +244,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _print_saved(store: CaptureStore, record: dict[str, Any]) -> None:
     print(
         f"Saved environment candidate: {store.root / record['filename']} "
-        f"({record['bytes']} bytes)",
+        f"({record['bytes']} bytes, camera={record.get('camera_model') or 'unknown'})",
         flush=True,
     )
 

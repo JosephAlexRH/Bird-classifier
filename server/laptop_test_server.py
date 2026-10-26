@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
 
 try:
+    from .camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
     from .capture_storage import (
         METADATA_HEADER,
         CalibrationType,
@@ -27,6 +28,7 @@ try:
     )
     from .roi_control import ROI_CONTROL_JS
 except ImportError:  # Direct execution: python server/laptop_test_server.py
+    from camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
     from capture_storage import (
         METADATA_HEADER,
         CalibrationType,
@@ -269,12 +271,60 @@ DASHBOARD_HTML = r"""
 }</textarea>
       <button class="camera-action" onclick="saveConfig()">Send config to camera</button>
     </section>
+    <section>
+      <h2>Camera fleet</h2>
+      <p class="muted">Add an ESP32-CAM using its IP address or HTTP base URL. Set one as default for the controls above.</p>
+      <input id="camera-name" placeholder="Camera name (optional)">
+      <input id="camera-address" placeholder="192.168.1.84">
+      <button onclick="addCamera()">Add camera</button>
+      <button onclick="loadCameras()">Refresh cameras</button>
+      <div id="camera-list" class="muted">Loading cameras...</div>
+    </section>
   </main>
   <script>
     let cameraConfigured = false;
     let liveRunning = false;
     const result = document.getElementById('result');
     const liveImage = document.getElementById('live');
+
+    function cameraSummary(camera) {
+      const sensor = camera.sensor?.model || camera.status?.camera_sensor_model || 'unknown sensor';
+      const state = camera.reachable === true ? 'reachable' : camera.reachable === false ? 'offline' : 'not checked';
+      return `<p><strong>${camera.name}</strong>${camera.default ? ' (default)' : ''}<br>${camera.url}<br>${sensor} | ${state}<br>` +
+        `<button onclick="setDefaultCamera('${camera.id}')">Set default</button> ` +
+        `<button onclick="toggleCamera('${camera.id}', ${!camera.enabled})">${camera.enabled ? 'Disable' : 'Enable'}</button> ` +
+        `<button onclick="pollCamera('${camera.id}')">Poll</button> ` +
+        `<button onclick="removeCamera('${camera.id}')">Remove</button></p>`;
+    }
+    async function loadCameras() {
+      const response = await fetch('/api/cameras', {cache: 'no-store'});
+      const payload = await response.json();
+      document.getElementById('camera-list').innerHTML = payload.cameras.length
+        ? payload.cameras.map(cameraSummary).join('') : 'No cameras registered.';
+    }
+    async function addCamera() {
+      const address = document.getElementById('camera-address').value.trim();
+      const name = document.getElementById('camera-name').value.trim() || null;
+      const response = await fetch('/api/cameras', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({address, name})
+      });
+      const payload = await response.json();
+      if (!response.ok) { result.textContent = payload.error || 'Could not add camera.'; return; }
+      document.getElementById('camera-address').value = '';
+      await loadCameras();
+    }
+    async function updateCamera(id, values) {
+      const response = await fetch(`/api/cameras/${id}`, {
+        method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(values)
+      });
+      const payload = await response.json();
+      if (!response.ok) result.textContent = payload.error || 'Could not update camera.';
+      await loadCameras();
+    }
+    const setDefaultCamera = id => updateCamera(id, {default: true});
+    const toggleCamera = (id, enabled) => updateCamera(id, {enabled});
+    async function pollCamera(id) { await fetch(`/api/cameras/${id}/poll`, {method: 'POST'}); await loadCameras(); }
+    async function removeCamera(id) { await fetch(`/api/cameras/${id}`, {method: 'DELETE'}); await loadCameras(); }
 
     function setState(label, style = 'muted') {
       const badge = document.getElementById('camera-state');
@@ -303,7 +353,7 @@ DASHBOARD_HTML = r"""
       if (info.latest_upload) {
         document.getElementById('latest').src = `/latest.jpg?t=${Date.now()}`;
         document.getElementById('upload-message').textContent =
-          `${info.latest_upload.name} | ${info.latest_upload.source || 'legacy'} | ${info.latest_upload.bytes} bytes`;
+          `${info.latest_upload.name} | ${info.latest_upload.source || 'legacy'} | ${info.latest_upload.camera_model || 'unknown camera'} | ${info.latest_upload.bytes} bytes`;
       }
       if (!liveRunning && info.camera_streaming) {
         setState('streaming', 'running');
@@ -446,7 +496,7 @@ DASHBOARD_HTML = r"""
     window.addEventListener('beforeunload', () => {
       stopLive();
     });
-    Promise.all([refreshInfo(), refreshCameraStatus()]).catch(showError);
+    Promise.all([loadCameras(), refreshInfo(), refreshCameraStatus()]).catch(showError);
     setInterval(() => {
       refreshInfo().catch(showError);
       refreshCameraStatus().catch(showError);
@@ -462,13 +512,31 @@ def create_app(
     save_dir: Path = DEFAULT_SAVE_DIR,
     camera_url: str | None = None,
     probe_camera: bool = False,
+    *,
+    registry_file: Path | None = None,
+    camera_registry: CameraRegistry | None = None,
+    start_registry_poller: bool = False,
 ) -> Flask:
     """Create the Flask application. Parameters are injectable for tests."""
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_JPEG_BYTES
     store = CaptureStore(save_dir)
     camera_url = normalize_camera_url(camera_url)
-    camera_lock = threading.Lock()
+    registry = camera_registry or CameraRegistry(
+        registry_file or (store.root / "cameras.json"),
+        timeout_seconds=CAMERA_PROBE_TIMEOUT_SECONDS,
+        opener=lambda *args, **kwargs: urlopen(*args, **kwargs),
+    )
+    if camera_url:
+        matching = next((camera for camera in registry.snapshot() if camera["url"] == camera_url), None)
+        if matching is None:
+            registry.add("Default camera", camera_url, make_default=True)
+        else:
+            registry.update(matching["id"], default=True)
+    if start_registry_poller:
+        registry.start()
+    app.config["CAMERA_REGISTRY"] = registry
+    app.config["CLEANUP"] = registry.stop
     state_lock = threading.Lock()
     camera_state: dict[str, Any] = {
         "reachable": None,
@@ -505,12 +573,17 @@ def create_app(
         body: bytes | None = None,
         timeout: int = PROXY_TIMEOUT_SECONDS,
     ) -> tuple[bytes, int, str, str | None]:
-        if not camera_url:
-            raise RuntimeError("Camera URL is not configured. Start the server with --camera-url.")
-        target = f"{camera_url}/{endpoint.lstrip('/')}"
+        selected = registry.resolve()
+        if selected is None:
+            if registry.snapshot():
+                raise RuntimeError("Multiple cameras are configured; set a default camera.")
+            raise RuntimeError("Camera URL is not configured. Add a camera or start with --camera-url.")
+        target = f"{selected['url']}/{endpoint.lstrip('/')}"
         headers = {"Content-Type": "application/json"} if body is not None else {}
         outgoing = Request(target, data=body, headers=headers, method=method)
-        if not camera_lock.acquire(blocking=False):
+        selected_lock = registry.operation_lock(selected["id"])
+        assert selected_lock is not None
+        if not selected_lock.acquire(blocking=False):
             raise CameraBusyError("Camera is busy streaming. Stop the stream and try again.")
         try:
             with urlopen(outgoing, timeout=timeout) as upstream:
@@ -529,15 +602,18 @@ def create_app(
             record_camera_state(False, camera_error_message(error, target, timeout))
             raise
         finally:
-            camera_lock.release()
+            selected_lock.release()
 
     def stream_response() -> Response | tuple[Response, int]:
-        if not camera_url:
-            return jsonify(error="Camera URL is not configured. Start the server with --camera-url."), 503
-        if not camera_lock.acquire(blocking=False):
-            return jsonify(error="Camera is busy. Stop the active operation and try again."), 409
-
-        target = f"{camera_url}/stream"
+        selected = registry.resolve()
+        if selected is None:
+            status = 409 if registry.snapshot() else 503
+            return jsonify(error="No default camera is configured."), status
+        selected_lock = registry.operation_lock(selected["id"])
+        assert selected_lock is not None
+        if not selected_lock.acquire(blocking=False):
+            return jsonify(error="Camera is busy streaming or handling another request."), 409
+        target = f"{selected['url']}/stream"
         upstream = None
         try:
             upstream = urlopen(Request(target, method="GET"), timeout=PROXY_TIMEOUT_SECONDS)
@@ -546,15 +622,16 @@ def create_app(
                 "multipart/x-mixed-replace"
             ):
                 upstream.close()
-                camera_lock.release()
+                selected_lock.release()
                 return jsonify(error="Camera did not return an MJPEG stream."), 502
             with state_lock:
                 camera_state["streaming"] = True
+            registry.set_streaming(selected["id"], True)
             record_camera_state(True)
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
             if upstream is not None:
                 upstream.close()
-            camera_lock.release()
+            selected_lock.release()
             record_camera_state(False, camera_error_message(error, target))
             return jsonify(error=camera_error_message(error, target)), 502
 
@@ -571,7 +648,8 @@ def create_app(
                 upstream.close()
                 with state_lock:
                     camera_state["streaming"] = False
-                camera_lock.release()
+                registry.set_streaming(selected["id"], False)
+                selected_lock.release()
 
         response = Response(generate(), status=upstream.status, content_type=content_type)
         response.headers["Cache-Control"] = "no-store"
@@ -615,8 +693,115 @@ def create_app(
         except HTTPError as error:
             return Response(error.read(), status=error.code, content_type="text/plain")
         except (URLError, TimeoutError, OSError, ValueError) as error:
-            target = f"{camera_url}/{endpoint.lstrip('/')}"
+            selected = registry.resolve()
+            target = f"{selected['url'] if selected else 'unknown'}/{endpoint.lstrip('/')}"
             return jsonify(error=camera_error_message(error, target)), 502
+
+    def registered_camera(camera_id: str) -> dict[str, Any]:
+        camera = registry.get(camera_id)
+        if camera is None:
+            raise LookupError("Camera not found.")
+        if not camera["enabled"]:
+            raise RuntimeError("Camera is disabled.")
+        return camera
+
+    def registered_upstream_request(
+        camera_id: str,
+        endpoint: str,
+        method: str = "GET",
+        body: bytes | None = None,
+        timeout: int = PROXY_TIMEOUT_SECONDS,
+    ) -> tuple[bytes, int, str, str | None]:
+        camera = registered_camera(camera_id)
+        target = f"{camera['url']}/{endpoint.lstrip('/')}"
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        outgoing = Request(target, data=body, headers=headers, method=method)
+        operation_lock = registry.operation_lock(camera_id)
+        assert operation_lock is not None
+        if not operation_lock.acquire(blocking=False):
+            raise CameraBusyError(f"Camera {camera['name']} is busy with another operation.")
+        try:
+            with urlopen(outgoing, timeout=timeout) as upstream:
+                content = upstream.read(MAX_JPEG_BYTES + 1)
+                if len(content) > MAX_JPEG_BYTES:
+                    raise ValueError("Camera response exceeded the 10 MiB limit.")
+                return (
+                    content,
+                    upstream.status,
+                    upstream.headers.get_content_type(),
+                    upstream.headers.get(METADATA_HEADER),
+                )
+        finally:
+            operation_lock.release()
+
+    def registered_proxy_response(
+        camera_id: str,
+        endpoint: str,
+        method: str = "GET",
+        body: bytes | None = None,
+    ) -> Response:
+        try:
+            content, status, content_type, metadata_header = registered_upstream_request(
+                camera_id, endpoint, method, body
+            )
+            response = Response(content, status=status, content_type=content_type)
+            if metadata_header:
+                response.headers[METADATA_HEADER] = metadata_header
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        except LookupError as error:
+            return jsonify(error=str(error)), 404
+        except CameraBusyError as error:
+            return jsonify(error=str(error)), 409
+        except RuntimeError as error:
+            return jsonify(error=str(error)), 503
+        except HTTPError as error:
+            return Response(error.read(), status=error.code, content_type="text/plain")
+        except (URLError, TimeoutError, OSError, ValueError) as error:
+            camera = registry.get(camera_id)
+            target = f"{camera['url'] if camera else 'unknown'}/{endpoint.lstrip('/')}"
+            return jsonify(error=camera_error_message(error, target)), 502
+
+    def registered_stream_response(camera_id: str) -> Response | tuple[Response, int]:
+        try:
+            camera = registered_camera(camera_id)
+        except LookupError as error:
+            return jsonify(error=str(error)), 404
+        except RuntimeError as error:
+            return jsonify(error=str(error)), 503
+        operation_lock = registry.operation_lock(camera_id)
+        assert operation_lock is not None
+        if not operation_lock.acquire(blocking=False):
+            return jsonify(error=f"Camera {camera['name']} is busy with another operation."), 409
+        target = f"{camera['url']}/stream"
+        upstream = None
+        try:
+            upstream = urlopen(Request(target), timeout=PROXY_TIMEOUT_SECONDS)
+            content_type = upstream.headers.get("Content-Type", "")
+            if "multipart/x-mixed-replace" not in content_type.lower():
+                raise ValueError("Camera stream did not return multipart/x-mixed-replace.")
+            registry.set_streaming(camera_id, True)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as error:
+            if upstream is not None:
+                upstream.close()
+            operation_lock.release()
+            return jsonify(error=camera_error_message(error, target)), 502
+
+        def generate():
+            try:
+                while True:
+                    chunk = upstream.read(STREAM_READ_BYTES)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                upstream.close()
+                registry.set_streaming(camera_id, False)
+                operation_lock.release()
+
+        response = Response(generate(), status=upstream.status, content_type=content_type)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     def update_latest(record: dict[str, Any]) -> None:
         with state_lock:
@@ -635,14 +820,25 @@ def create_app(
         if not is_jpeg(image):
             return jsonify(error="Request body is not a complete JPEG image."), 415
         metadata, metadata_error = parse_camera_metadata(request.headers.get(METADATA_HEADER))
+        device = (metadata or {}).get("device")
+        hardware_camera_id = device.get("camera_id") if isinstance(device, dict) else None
+        registered = registry.get_by_hardware_id(hardware_camera_id)
         record = store.save_capture(
             image,
             source=(metadata or {}).get("source", "motion"),
             camera_metadata=metadata,
             metadata_error=metadata_error,
+            extra={
+                "camera_registry_id": registered.get("id") if registered else None,
+                "camera_name": registered.get("name") if registered else None,
+            },
         )
         update_latest(record)
-        print(f"Received {len(image)} bytes: {store.root / record['filename']}", flush=True)
+        print(
+            f"Received {len(image)} bytes from {record.get('camera_model') or 'unknown'}: "
+            f"{store.root / record['filename']}",
+            flush=True,
+        )
         return jsonify(status="ok", **record)
 
     @app.post("/api/captures")
@@ -672,11 +868,13 @@ def create_app(
         except HTTPError as error:
             return jsonify(error=f"Camera capture failed with HTTP {error.code}."), 502
         except (URLError, TimeoutError, OSError, ValueError) as error:
-            target = f"{camera_url}/capture"
+            selected = registry.resolve()
+            target = f"{selected['url'] if selected else 'unknown'}/capture"
             return jsonify(error=camera_error_message(error, target)), 502
         if status != 200 or content_type != "image/jpeg" or not is_jpeg(image):
             return jsonify(error="Camera did not return a complete JPEG."), 502
         metadata, metadata_error = parse_camera_metadata(metadata_header)
+        selected = registry.resolve()
         record = store.save_capture(
             image,
             source="manual",
@@ -685,6 +883,10 @@ def create_app(
             calibration_type=calibration_type,
             label=str(options.get("label", ""))[:120],
             note=str(options.get("note", ""))[:500],
+            extra={
+                "camera_registry_id": (selected or {}).get("id"),
+                "camera_name": (selected or {}).get("name"),
+            },
         )
         update_latest(record)
         return jsonify(status="ok", **record)
@@ -704,6 +906,9 @@ def create_app(
             return jsonify(error=str(error)), 503
         except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as error:
             return jsonify(error=f"Could not save camera profile: {error}"), 502
+        selected = registry.resolve()
+        profile["camera_registry_id"] = (selected or {}).get("id")
+        profile["camera_name"] = (selected or {}).get("name")
         return jsonify(result="ok", **store.save_profile(profile))
 
     @app.get("/latest.jpg")
@@ -726,14 +931,16 @@ def create_app(
                 "bytes": path.stat().st_size,
                 "received_at": (record or {}).get("received_at"),
                 "source": (record or {}).get("source"),
+                "camera_model": (record or {}).get("camera_model"),
             }
         with state_lock:
             reachable = camera_state["reachable"]
             camera_error = camera_state["error"]
             checked_at = camera_state["checked_at"]
             streaming = camera_state["streaming"]
+        selected = registry.resolve()
         return jsonify(
-            camera_url=camera_url,
+            camera_url=(selected or {}).get("url"),
             camera_reachable=reachable,
             camera_error=camera_error,
             camera_checked_at=checked_at,
@@ -744,7 +951,163 @@ def create_app(
 
     @app.get("/health")
     def health() -> Response:
-        return jsonify(status="ok", save_dir=str(store.root), camera_configured=bool(camera_url))
+        cameras = registry.snapshot()
+        return jsonify(
+            status="ok",
+            save_dir=str(store.root),
+            camera_configured=bool(camera_url or cameras),
+            cameras=len(cameras),
+            healthy=sum(1 for camera in cameras if camera["healthy"]),
+        )
+
+    @app.get("/api/cameras")
+    def registered_cameras() -> Response:
+        return jsonify(cameras=registry.snapshot())
+
+    @app.post("/api/cameras")
+    def add_registered_camera() -> tuple[Response, int] | Response:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(error="Expected a valid JSON object."), 400
+        address = payload.get("address", payload.get("url"))
+        try:
+            camera = registry.add(
+                payload.get("name"),
+                normalize_camera_address(address),
+                enabled=payload.get("enabled", True),
+                make_default=payload.get("default"),
+            )
+        except ValueError as error:
+            return jsonify(error=str(error)), 422
+        discovered = registry.poll(camera["id"])
+        duplicate_error = ((discovered or {}).get("errors") or {}).get("metadata")
+        if duplicate_error:
+            registry.remove(camera["id"])
+            return jsonify(error=duplicate_error), 409
+        return jsonify(camera=registry.get(camera["id"])), 201
+
+    @app.patch("/api/cameras/<camera_id>")
+    def update_registered_camera(camera_id: str) -> tuple[Response, int] | Response:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(error="Expected a valid JSON object."), 400
+        try:
+            camera = registry.update(camera_id, **payload)
+        except ValueError as error:
+            return jsonify(error=str(error)), 422
+        if camera is None:
+            return jsonify(error="Camera not found."), 404
+        return jsonify(camera=camera)
+
+    @app.delete("/api/cameras/<camera_id>")
+    def delete_registered_camera(camera_id: str) -> tuple[Response, int] | Response:
+        camera = registry.remove(camera_id)
+        if camera is None:
+            return jsonify(error="Camera not found."), 404
+        return jsonify(status="removed", camera=camera)
+
+    @app.post("/api/cameras/<camera_id>/poll")
+    def poll_registered_camera(camera_id: str) -> tuple[Response, int] | Response:
+        camera = registry.poll(camera_id)
+        if camera is None:
+            return jsonify(error="Camera not found."), 404
+        return jsonify(camera=camera)
+
+    @app.post("/api/cameras/<camera_id>/captures")
+    def registered_manual_capture(camera_id: str) -> tuple[Response, int] | Response:
+        options = request.get_json(silent=True) or {}
+        if not isinstance(options, dict):
+            return jsonify(error="Expected a JSON object."), 400
+        try:
+            calibration_type = parse_calibration_type(
+                options.get("calibration_type", CalibrationType.NORMAL.value)
+            )
+            image, status, content_type, metadata_header = registered_upstream_request(
+                camera_id, "capture"
+            )
+        except ValueError as error:
+            return jsonify(error=str(error)), 422
+        except LookupError as error:
+            return jsonify(error=str(error)), 404
+        except CameraBusyError as error:
+            return jsonify(error=str(error)), 409
+        except RuntimeError as error:
+            return jsonify(error=str(error)), 503
+        except (HTTPError, URLError, TimeoutError, OSError) as error:
+            camera = registry.get(camera_id)
+            target = f"{camera['url'] if camera else 'unknown'}/capture"
+            return jsonify(error=camera_error_message(error, target)), 502
+        if status != 200 or content_type != "image/jpeg" or not is_jpeg(image):
+            return jsonify(error="Camera did not return a complete JPEG."), 502
+        metadata, metadata_error = parse_camera_metadata(metadata_header)
+        camera = registry.get(camera_id) or {}
+        record = store.save_capture(
+            image,
+            source="manual",
+            camera_metadata=metadata,
+            metadata_error=metadata_error,
+            calibration_type=calibration_type,
+            label=str(options.get("label", ""))[:120],
+            note=str(options.get("note", ""))[:500],
+            extra={
+                "camera_registry_id": camera_id,
+                "camera_name": camera.get("name"),
+            },
+        )
+        update_latest(record)
+        return jsonify(status="ok", **record)
+
+    @app.post("/api/cameras/<camera_id>/profiles")
+    def registered_profile(camera_id: str) -> tuple[Response, int] | Response:
+        profile: dict[str, Any] = {}
+        try:
+            for endpoint in ("metadata", "config", "status"):
+                content, status, _, _ = registered_upstream_request(camera_id, endpoint)
+                if status != 200:
+                    return jsonify(error=f"Camera {endpoint} request returned HTTP {status}."), 502
+                profile[endpoint] = json.loads(content)
+        except LookupError as error:
+            return jsonify(error=str(error)), 404
+        except CameraBusyError as error:
+            return jsonify(error=str(error)), 409
+        except (RuntimeError, HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as error:
+            return jsonify(error=f"Could not save camera profile: {error}"), 502
+        camera = registry.get(camera_id) or {}
+        profile["camera_registry_id"] = camera_id
+        profile["camera_name"] = camera.get("name")
+        return jsonify(result="ok", **store.save_profile(profile))
+
+    @app.get("/api/cameras/<camera_id>/capture")
+    def registered_capture_proxy(camera_id: str) -> Response:
+        return registered_proxy_response(camera_id, "capture")
+
+    @app.get("/api/cameras/<camera_id>/stream")
+    def registered_stream_proxy(camera_id: str) -> Response | tuple[Response, int]:
+        return registered_stream_response(camera_id)
+
+    @app.get("/api/cameras/<camera_id>/<endpoint>")
+    def registered_get_proxy(camera_id: str, endpoint: str) -> Response:
+        if endpoint not in {"status", "motion", "metadata", "config"}:
+            return jsonify(error="Unsupported camera endpoint."), 404
+        return registered_proxy_response(camera_id, endpoint)
+
+    @app.post("/api/cameras/<camera_id>/config")
+    def registered_config_post(camera_id: str) -> Response:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(error="Expected a valid JSON object."), 400
+        return registered_proxy_response(
+            camera_id, "config", method="POST", body=json.dumps(payload).encode("utf-8")
+        )
+
+    @app.post("/api/cameras/<camera_id>/mode")
+    def registered_mode_post(camera_id: str) -> Response:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or payload.get("mode") not in {"motion", "idle"}:
+            return jsonify(error="mode must be either motion or idle"), 422
+        return registered_proxy_response(
+            camera_id, "mode", method="POST", body=json.dumps(payload).encode("utf-8")
+        )
 
     @app.get("/camera/capture")
     def camera_capture() -> Response:
@@ -797,6 +1160,12 @@ def parse_args() -> argparse.Namespace:
         help="ESP32-CAM plain HTTP(S) base URL, for example http://192.168.1.84",
     )
     parser.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIR, help="Dataset folder")
+    parser.add_argument(
+        "--registry-file",
+        type=Path,
+        default=DEFAULT_REGISTRY_FILE,
+        help=f"Persistent multi-camera registry (default: {DEFAULT_REGISTRY_FILE})",
+    )
     return parser.parse_args()
 
 
@@ -807,5 +1176,14 @@ if __name__ == "__main__":
     except (ValueError, RuntimeError) as error:
         raise SystemExit(f"Startup error: {error}") from error
     print_startup_targets(args.host, args.port, args.camera_url)
-    application = create_app(args.save_dir, args.camera_url, probe_camera=True)
-    application.run(host=args.host, port=args.port, debug=False, threaded=True)
+    application = create_app(
+        args.save_dir,
+        args.camera_url,
+        probe_camera=True,
+        registry_file=args.registry_file,
+        start_registry_poller=True,
+    )
+    try:
+        application.run(host=args.host, port=args.port, debug=False, threaded=True)
+    finally:
+        application.config["CLEANUP"]()

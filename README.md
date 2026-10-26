@@ -30,7 +30,9 @@ Clear-blob events and birds are stored with immutable `.motion.json` and
 ## Hardware
 
 - AI Thinker ESP32-CAM
-- OV2640 camera
+- OV2640 or OV5640 camera. The firmware detects the sensor at boot and selects
+  its matching `sensors` profile from `config.json`; other or unconfigured
+  sensor identities are rejected.
 - ESP32-CAM-MB programmer (or an FTDI adapter wired to the UART pins)
 - FAT32-formatted microSD card
 - Stable 5V power source (brownouts during Wi-Fi TX are the most common cause of random resets)
@@ -43,6 +45,8 @@ Clear-blob events and birds are stored with immutable `.motion.json` and
    `config.json`. Set `wifi_ssid` and `wifi_password` for a **2.4 GHz** network,
    and set `server_ip` to the LAN address of the machine running the receiver.
    The example contains placeholders only; do not commit your populated file.
+   Keep both `sensors["0x2642"]` and `sensors["0x5640"]` profiles so either
+   supported module can be installed without reflashing.
 4. Optional fallback: copy `include/secrets.example.h` to `include/secrets.h`
    and fill in the same Wi-Fi credentials. `secrets.h` is gitignored. The SD
    card values are intended for normal provisioning so changing networks does
@@ -106,6 +110,12 @@ Settings live in `config.json` on the SD card and are re-read every 10 seconds,
 so most changes don't require a reflash. Wi-Fi credential changes take effect
 when the device next connects; reboot after changing them. If no card is
 available, the firmware can use the SPIFFS copy uploaded from `data/config.json`.
+Camera frame-size changes safely reinitialize the driver so framebuffer storage
+is allocated for the new dimensions; JPEG-quality changes apply live. An
+`xclk_hz` change is saved immediately but requires a restart because the camera
+driver selects XCLK during initialization. `GET /config` and `GET /status`
+report `camera_restart_required` while the configured clock differs from the
+running clock.
 
 | Field | Type | Description |
 |---|---|---|
@@ -126,12 +136,14 @@ available, the firmware can use the SPIFFS copy uploaded from `data/config.json`
 | `motion_max_clipped_fraction` | float | Maximum clipped fraction allowed in both versions of a usable block |
 | `motion_min_valid_blocks` | int | Minimum non-clipped blocks required to make a motion decision |
 | `motion_max_changed_fraction` | float | Upper changed-block fraction; broader changes are treated as lighting/scene changes and refresh the reference without triggering |
-| `jpeg_quality` | int | JPEG quality passed to the camera driver (0 = best, 63 = worst) |
-| `framesize` | int | `framesize_t` enum value used for full-resolution captures (8 = VGA) |
+| `sensors` | object | Required camera profiles keyed by sensor identity. Keep both `0x2642` (OV2640) and `0x5640` (OV5640) entries |
+| `sensors.<key>.frame_size` | string or int | Capture size from `QQVGA` through the sensor maximum, such as `VGA`; numeric `framesize_t` values remain accepted for migration |
+| `sensors.<key>.jpeg_quality` | int | Sensor-specific JPEG quality (0 = best, 63 = worst) |
+| `sensors.<key>.xclk_hz` | int | Sensor-specific boot clock in Hz: 6-24 MHz for OV2640 and 6-27 MHz for OV5640; changing it requires a restart |
 | `server_ip` | string | IP address of the receiving server |
 | `server_port` | int | Port the receiving server listens on |
 | `save_birds_to_sd` | bool | Save classifier-confirmed bird JPEGs under `/birds` on the physical SD card |
-| `bird_confidence_threshold` | float | Minimum classifier confidence (0-1) required for an SD save |
+| `pipeline.bird_confidence_threshold` | float | Minimum classifier confidence (0-1) required for an SD save |
 | `wait_for_classification` | bool | `true`: wait for the receiver's classification after each upload (needed for SD bird saves). `false`: send `X-ESP32-Classification: deferred`, let the receiver queue inference, and re-arm motion immediately; nothing is saved to SD |
 | `burst_count` | int | JPEGs captured and uploaded per motion trigger (1-10) |
 | `burst_interval_ms` | int | Pause between burst JPEGs in milliseconds (0-5000) |
@@ -140,6 +152,12 @@ available, the firmware can use the SPIFFS copy uploaded from `data/config.json`
 | `buffer_uploads_to_sd` | bool | Write motion JPEGs that cannot be delivered to `/pending` on the SD card and upload them later, one every 2 s, once the receiver answers again |
 
 You can also read or update these live over HTTP — see below.
+The ESP32 camera driver reports OV2640 as PID `0x26` and version `0x42`; the
+firmware combines those bytes into the configuration key `0x2642`. OV5640 is
+reported directly as PID/configuration key `0x5640`; the pinned driver does not
+populate its version or manufacturer-ID fields, so metadata marks those fields
+unavailable instead of treating zero as a measured value. The raw identity and
+selected configuration key remain separate in capture metadata and `/status`.
 
 ## HTTP API
 
@@ -179,7 +197,7 @@ Local motion mode is available only when `motion_owner` is `firmware`:
   suspended. Disconnecting the viewer restores idle or re-arms motion according
   to the previously selected mode.
 
-The OV2640 is not providing a hardware motion interrupt here. Motion detection
+Neither supported sensor provides a hardware motion interrupt here. Motion detection
 is performed by the ESP32 inside the configured ROI. The ROI is divided into
 blocks and each current/reference mean-luminance ratio is calculated. Their
 median estimates global illumination change; only blocks that deviate from this
@@ -190,7 +208,8 @@ not a bird, and refreshes the reference. The legacy
 `GET /motion` endpoint only consumes the last detected-event flag; use
 `POST /mode` to arm or disarm detection.
 
-`GET /status` includes `selected_mode`, `runtime_state`, `stream_active`, motion
+`GET /status` includes detected camera identity, `camera_restart_required`,
+`selected_mode`, `runtime_state`, `stream_active`, motion
 event count and changed fraction, exposure-settle/product state, global ratio,
 valid/clipped/changed block counts, effective ROI pixels, a decision reason,
 last capture/upload results, upload cooldown, and the last camera error. The runtime state can be `idle`, `motion_arming`,
@@ -200,7 +219,7 @@ last capture/upload results, upload cooldown, and the last camera error. The run
 `GET /capture` includes the same capture-specific JSON in the
 `X-ESP32-Camera-Metadata` response header. Motion-triggered `POST /upload`
 requests include that header too. Camera metadata schema version 5 separates
-requested capture settings from observed frame, driver, and OV2640 state. It
+requested capture settings from observed frame, driver, and OV5640 state. It
 keeps frame size, pixel format, and JPEG quality in only the intentional
 `requested.capture` and `observed.capture` locations. Actual dimensions,
 `framebuffer_bytes`, and the frame sequence occur only under observed capture.
@@ -238,21 +257,17 @@ the framebuffer timestamp, not exposure start.
 `register_read_boot_us` is sampled immediately before the first SCCB register
 read. Their difference can be used to estimate queue/register lag. It is not an
 exposure-start measurement: `fb_count`, `grab_mode`, queued frames, and the
-OV2640 AEC/AGC control pipeline can make the returned image one or more control
-cycles older than the post-frame register sample. Register keys expose the real
-bank and physical address, for example `sensor_bank_0x04_mask_0x03` rather than
-the driver's virtual address `0x104`.
-
-The assembled AEC line count is accompanied by `aec_max_lines` (1200 for the
-bundled driver's supported AEC range) and a qualified `ae_saturated` derivation.
-This is not a hardware saturation status bit. It is only valid when automatic
-exposure is enabled and the repeated exposure-register reads are consistent.
+OV5640 AEC/AGC control pipeline can make the returned image one or more control
+cycles older than the post-frame register sample. Exposure is read from
+`0x3500` as sixteenths of a line, analog gain from `0x350A`, and frame length
+from `0x380E`; these post-frame reads are not an atomic exposure snapshot.
 
 `camera.timing.settings_revision` tracks runtime sensor-mode changes, while
 `camera.register_dump.revision` identifies the persistent capture configuration
-used for a cached register dump. The first capture or profile after startup or a persistent frame-size/JPEG-
-quality change includes a compact base64 best-effort sweep of both OV2640
-register banks. The canonical dump is SHA-256 addressed; later captures carry
+used for a cached register dump. The first capture or profile after startup or a
+persistent frame-size/JPEG-quality change includes a base64 best-effort register
+snapshot: the OV2640 uses a full two-bank dump and the OV5640 uses a compact
+sparse dump. The canonical dump is SHA-256 addressed; later captures carry
 only the hash until another relevant settings change. The sweep is non-atomic
 and is a diagnostic catch-all, not the exact register state of one frame. The
 laptop and Raspberry Pi receivers retain all of this metadata in JSON sidecars.
@@ -271,7 +286,7 @@ the firmware to retain the frame on its own SD card:
 }
 ```
 
-Only `is_bird: true` results at or above `bird_confidence_threshold` are written
+Only `is_bird: true` results at or above `pipeline.bird_confidence_threshold` are written
 to `/birds/<capture_id>.jpg`. Missing or malformed classifications, classifier
 errors, HTTP errors, low-confidence results, and non-birds are not written. A
 motion JPEG must still exist briefly in RAM and be uploaded so the Pi can decide
@@ -292,10 +307,15 @@ transition frames as well as retained JPEGs.
 `exposure_gain_product` is `AEC lines × nominal analog gain`. It is a relative
 exposure/sensitivity proxy when timing and camera mode are unchanged, not a lux
 measurement or direct JPEG-brightness value. A darker scene normally makes an
-automatic camera increase this product. DSP registers `0xCC` through `0xCE`
-are retained as raw white-balance controls; public OV2640 documentation does
-not establish them as readable live AWB channel decisions, so they are not
-reported as such.
+automatic camera increase this product.
+
+Every receiver sidecar and `manifest.jsonl` row denormalizes the canonical
+`camera.sensor.model` into top-level `camera_model`. Pi motion and inference
+records also contain `camera_provenance` with the model and SHA-256 of the exact
+capture sidecar. Treat historical OV2640 and new OV5640 captures as separate
+evaluation/training cohorts: do not backfill missing legacy camera models or
+pool sensor metrics without explicitly accounting for the camera-induced data
+shift.
 
 ## Security note
 
@@ -319,6 +339,42 @@ This firmware has no authentication and is meant for a trusted home LAN only. Do
   still matches the receiver's current DHCP address.
 
 ## Commands
+
+### Run multiple cameras through the laptop or Pi server
+
+Start either server normally, open its dashboard, and add cameras in the
+**Camera fleet** section using each camera's IP address. Definitions persist in
+`~/.esp32-cameras/cameras.json` unless `--registry-file` specifies another
+location. The existing `--camera-url` argument remains a shortcut that creates
+the initial default camera.
+
+The servers discover the stable `esp32cam-...` hardware ID and sensor model
+from the firmware. Per-camera locks allow different ESP32 cameras—including a
+mix of OV2640 and OV5640 sensors—to operate concurrently. On the Pi, every
+enabled camera receives an independent motion/background worker while all
+workers safely share the inference engine.
+
+### Monitor multiple cameras without inference
+
+Run the standalone camera monitor when you only need fleet visibility and
+configuration inspection:
+
+```bash
+python server/camera_monitor.py
+```
+
+Open `http://127.0.0.1:5051`, then add each ESP32-CAM by name and base URL. The
+monitor persists the registry in `~/.esp32-camera-monitor/cameras.json`, polls
+every camera's `/status` and `/config` endpoints concurrently, and keeps each
+camera's last successful values visible when one endpoint temporarily fails.
+Use `--registry-file`, `--poll-seconds`, and `--timeout-seconds` to override the
+defaults. The management API provides `GET`/`POST /api/cameras`,
+`DELETE /api/cameras/<id>`, `POST /api/cameras/poll`, and
+`POST /api/cameras/<id>/poll`; cached endpoint values are available from
+`/api/cameras/<id>/status` and `/api/cameras/<id>/config`.
+
+Like the firmware, this monitor has no authentication. Bind it to the default
+loopback address or keep it on a trusted LAN.
 
 ```bash
 pio run                  # build

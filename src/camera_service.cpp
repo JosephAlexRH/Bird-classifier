@@ -37,19 +37,34 @@ constexpr int kPclkPin = 22;
 constexpr uint8_t kMaxExposureConsistencyAttempts = 3;
 constexpr int kFrameBufferCount = 1;
 constexpr camera_grab_mode_t kGrabMode = CAMERA_GRAB_WHEN_EMPTY;
-constexpr uint32_t kAecDriverLimitLines = 1200;
-constexpr size_t kRegisterCountPerBank = 255;
-constexpr size_t kRegisterValidityBytes = 32;
-constexpr size_t kRegisterDumpBytes = 4 + 2 * (kRegisterCountPerBank + kRegisterValidityBytes);
+constexpr int kProbeXclkHz = 20000000;
+constexpr uint32_t kOv2640AecDriverLimitLines = 1200;
+constexpr size_t kOv2640RegisterCountPerBank = 255;
+constexpr size_t kOv2640RegisterValidityBytes = 32;
+constexpr size_t kOv2640RegisterDumpBytes =
+    4 + 2 * (kOv2640RegisterCountPerBank + kOv2640RegisterValidityBytes);
+constexpr uint16_t kOv5640DumpAddresses[] = {
+    0x300a, 0x300b, 0x3400, 0x3401, 0x3402, 0x3403, 0x3404, 0x3405, 0x3406,
+    0x3500, 0x3501, 0x3502, 0x350a, 0x350b, 0x380e, 0x380f,
+};
+constexpr size_t kOv5640RegisterDumpEntryBytes = 4;
+constexpr size_t kOv5640RegisterDumpBytes =
+    4 + sizeof(kOv5640DumpAddresses) / sizeof(uint16_t) * kOv5640RegisterDumpEntryBytes;
+constexpr size_t kMaximumRegisterDumpBytes =
+    kOv2640RegisterDumpBytes > kOv5640RegisterDumpBytes ? kOv2640RegisterDumpBytes
+                                                        : kOv5640RegisterDumpBytes;
 
 uint64_t framesSinceBoot = 0;
 uint32_t settingsRevision = 0;
 int64_t lastSettingsChangeUs = 0;
 bool settingsChangeTimeValid = false;
 uint32_t persistentSettingsRevision = 1;
+int initializedFramesize = static_cast<int>(FRAMESIZE_VGA);
+int initializedXclkHz = kProbeXclkHz;
 bool registerDumpPending = true;
 bool registerDumpCacheValid = false;
-uint8_t registerDumpCache[kRegisterDumpBytes];
+uint8_t registerDumpCache[kMaximumRegisterDumpBytes];
+size_t registerDumpCacheBytes = 0;
 String registerDumpSha256;
 String registerDumpPayloadBase64;
 
@@ -73,14 +88,15 @@ const char *grabModeName(int value) {
 }
 
 String encodeRegisterDump() {
-  const size_t capacity = 4 * ((sizeof(registerDumpCache) + 2) / 3) + 1;
+  if (registerDumpCacheBytes == 0) return String();
+  const size_t capacity = 4 * ((registerDumpCacheBytes + 2) / 3) + 1;
   String encoded;
   if (!encoded.reserve(capacity)) return String();
   std::unique_ptr<unsigned char[]> buffer(new (std::nothrow) unsigned char[capacity]);
   if (!buffer) return String();
   size_t written = 0;
   if (mbedtls_base64_encode(buffer.get(), capacity, &written, registerDumpCache,
-                            sizeof(registerDumpCache)) != 0) {
+                            registerDumpCacheBytes) != 0) {
     return String();
   }
   buffer[written] = '\0';
@@ -89,26 +105,42 @@ String encodeRegisterDump() {
 }
 
 bool refreshRegisterDump(sensor_t *sensor) {
-  if (sensor == nullptr || sensor->id.PID != OV2640_PID || sensor->get_reg == nullptr) return false;
+  if (sensor == nullptr || sensor->get_reg == nullptr) return false;
   memset(registerDumpCache, 0, sizeof(registerDumpCache));
-  memcpy(registerDumpCache, "OVD1", 4);
   size_t offset = 4;
-  for (int bank = 0; bank <= 1; ++bank) {
-    uint8_t *values = registerDumpCache + offset;
-    uint8_t *validity = values + kRegisterCountPerBank;
-    for (size_t address = 0; address < kRegisterCountPerBank; ++address) {
-      const int virtualAddress = (bank << 8) | static_cast<int>(address);
-      const int value = sensor->get_reg(sensor, virtualAddress, 0xff);
-      if (value >= 0) {
-        values[address] = static_cast<uint8_t>(value);
-        validity[address / 8] |= static_cast<uint8_t>(1U << (address % 8));
+  if (sensor->id.PID == OV2640_PID) {
+    memcpy(registerDumpCache, "OVD1", 4);
+    for (int bank = 0; bank <= 1; ++bank) {
+      uint8_t *values = registerDumpCache + offset;
+      uint8_t *validity = values + kOv2640RegisterCountPerBank;
+      for (size_t address = 0; address < kOv2640RegisterCountPerBank; ++address) {
+        const int virtualAddress = (bank << 8) | static_cast<int>(address);
+        const int value = sensor->get_reg(sensor, virtualAddress, 0xff);
+        if (value >= 0) {
+          values[address] = static_cast<uint8_t>(value);
+          validity[address / 8] |= static_cast<uint8_t>(1U << (address % 8));
+        }
       }
+      offset += kOv2640RegisterCountPerBank + kOv2640RegisterValidityBytes;
     }
-    offset += kRegisterCountPerBank + kRegisterValidityBytes;
+    registerDumpCacheBytes = kOv2640RegisterDumpBytes;
+  } else if (sensor->id.PID == OV5640_PID) {
+    memcpy(registerDumpCache, "OV5D", 4);
+    for (uint16_t address : kOv5640DumpAddresses) {
+      const int value = sensor->get_reg(sensor, address, 0xff);
+      registerDumpCache[offset++] = static_cast<uint8_t>(address >> 8);
+      registerDumpCache[offset++] = static_cast<uint8_t>(address & 0xff);
+      registerDumpCache[offset++] = value >= 0 ? 1 : 0;
+      registerDumpCache[offset++] = value >= 0 ? static_cast<uint8_t>(value) : 0;
+    }
+    registerDumpCacheBytes = kOv5640RegisterDumpBytes;
+  } else {
+    registerDumpCacheBytes = 0;
+    return false;
   }
 
   uint8_t digest[32];
-  if (mbedtls_sha256_ret(registerDumpCache, sizeof(registerDumpCache), digest, 0) != 0) return false;
+  if (mbedtls_sha256_ret(registerDumpCache, registerDumpCacheBytes, digest, 0) != 0) return false;
   registerDumpSha256 = bytesToHex(digest, sizeof(digest));
   registerDumpPayloadBase64 = encodeRegisterDump();
   if (registerDumpPayloadBase64.length() == 0) return false;
@@ -171,6 +203,62 @@ void noteSettingsChange() {
   settingsChangeTimeValid = true;
 }
 
+camera_config_t cameraConfigFor(framesize_t framesize, int jpegQuality, int xclkHz) {
+  camera_config_t config = {};
+  config.pin_pwdn = kPowerDownPin;
+  config.pin_reset = kResetPin;
+  config.pin_xclk = kXclkPin;
+  config.pin_sccb_sda = kSiodPin;
+  config.pin_sccb_scl = kSiocPin;
+  config.pin_d7 = kY9Pin;
+  config.pin_d6 = kY8Pin;
+  config.pin_d5 = kY7Pin;
+  config.pin_d4 = kY6Pin;
+  config.pin_d3 = kY5Pin;
+  config.pin_d2 = kY4Pin;
+  config.pin_d1 = kY3Pin;
+  config.pin_d0 = kY2Pin;
+  config.pin_vsync = kVsyncPin;
+  config.pin_href = kHrefPin;
+  config.pin_pclk = kPclkPin;
+  config.xclk_freq_hz = xclkHz;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = framesize;
+  config.jpeg_quality = jpegQuality;
+  config.fb_count = kFrameBufferCount;
+  config.grab_mode = kGrabMode;
+  return config;
+}
+
+bool reinitializeCameraForProfile(uint16_t expectedSensorKey,
+                                  const CameraSensorProfile &profile) {
+  camera_config_t cameraConfig =
+      cameraConfigFor(static_cast<framesize_t>(profile.framesize), profile.jpegQuality,
+                      profile.xclkHz);
+  esp_camera_deinit();
+  delay(50);
+  const esp_err_t error = esp_camera_init(&cameraConfig);
+  if (error != ESP_OK) {
+    Serial.printf("Camera profile initialization failed: 0x%x\n", error);
+    return false;
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == nullptr ||
+      cameraSensorConfigKey(sensor->id.PID, sensor->id.VER) != expectedSensorKey) {
+    Serial.println("Camera identity changed after applying the selected profile");
+    esp_camera_deinit();
+    return false;
+  }
+
+  initializedFramesize = profile.framesize;
+  initializedXclkHz = profile.xclkHz;
+  noteSettingsChange();
+  return true;
+}
+
 bool setJpegMode(sensor_t *sensor, framesize_t framesize, int quality, bool &changed) {
   changed = false;
   if (sensor->pixformat != PIXFORMAT_JPEG) {
@@ -210,22 +298,22 @@ CameraSettingsSnapshot copyDriverCache(const sensor_t *sensor) {
       status.colorbar, status.scale, status.binning};
 }
 
-bool readRegister(sensor_t *sensor, int address, int mask, uint8_t &value) {
+bool readByteRegister(sensor_t *sensor, int address, int mask, uint8_t &value) {
   const int result = sensor->get_reg(sensor, address, mask);
   if (result < 0) return false;
   value = static_cast<uint8_t>(result);
   return true;
 }
 
-bool readExposureTriplet(sensor_t *sensor, uint8_t &high, uint8_t &middle, uint8_t &low) {
-  return readRegister(sensor, 0x145, 0x3f, high) &&
-         readRegister(sensor, 0x110, 0xff, middle) &&
-         readRegister(sensor, 0x104, 0x03, low);
+bool readOv2640Exposure(sensor_t *sensor, uint8_t &high, uint8_t &middle, uint8_t &low) {
+  return readByteRegister(sensor, 0x145, 0x3f, high) &&
+         readByteRegister(sensor, 0x110, 0xff, middle) &&
+         readByteRegister(sensor, 0x104, 0x03, low);
 }
 
-Ov2640RegisterSnapshot readExposureGainRegisters(sensor_t *sensor) {
+Ov2640RegisterSnapshot readObservedOv2640(sensor_t *sensor) {
   Ov2640RegisterSnapshot result = {};
-  result.supported = sensor->id.PID == OV2640_PID;
+  result.supported = sensor != nullptr && sensor->id.PID == OV2640_PID;
   if (!result.supported || sensor->get_reg == nullptr) return result;
 
   for (uint8_t attempt = 1; attempt <= kMaxExposureConsistencyAttempts; ++attempt) {
@@ -236,8 +324,8 @@ Ov2640RegisterSnapshot readExposureGainRegisters(sensor_t *sensor) {
     uint8_t secondMiddle = 0;
     uint8_t secondLow = 0;
     result.exposureReadAttempts = attempt;
-    if (!readExposureTriplet(sensor, firstHigh, firstMiddle, firstLow) ||
-        !readExposureTriplet(sensor, secondHigh, secondMiddle, secondLow)) {
+    if (!readOv2640Exposure(sensor, firstHigh, firstMiddle, firstLow) ||
+        !readOv2640Exposure(sensor, secondHigh, secondMiddle, secondLow)) {
       break;
     }
     result.exposureValid = true;
@@ -250,15 +338,16 @@ Ov2640RegisterSnapshot readExposureGainRegisters(sensor_t *sensor) {
     }
   }
   if (result.exposureValid) {
-    result.exposure = (static_cast<uint32_t>(result.aecHigh) << 10) |
-                      (static_cast<uint32_t>(result.aecMiddle) << 2) | result.aecLow;
+    result.exposureLines = (static_cast<uint32_t>(result.aecHigh) << 10) |
+                           (static_cast<uint32_t>(result.aecMiddle) << 2) | result.aecLow;
   }
-  result.aecDriverLimitLines = kAecDriverLimitLines;
-  result.aeSaturatedValid = result.exposureValid && result.exposureConsistent &&
-                            sensor->status.aec != 0;
-  result.aeSaturated = result.aeSaturatedValid && result.exposure >= kAecDriverLimitLines;
+  result.aecDriverLimitLines = kOv2640AecDriverLimitLines;
+  result.aeSaturatedValid =
+      result.exposureValid && result.exposureConsistent && sensor->status.aec != 0;
+  result.aeSaturated =
+      result.aeSaturatedValid && result.exposureLines >= kOv2640AecDriverLimitLines;
 
-  result.gainValid = readRegister(sensor, 0x100, 0xff, result.gainRaw);
+  result.gainValid = readByteRegister(sensor, 0x100, 0xff, result.gainRaw);
   if (result.gainValid) {
     uint8_t highNibble = result.gainRaw >> 4;
     uint8_t setBits = 0;
@@ -272,62 +361,153 @@ Ov2640RegisterSnapshot readExposureGainRegisters(sensor_t *sensor) {
   result.exposureGainProductValid =
       result.exposureValid && result.exposureConsistent && result.gainValid;
   if (result.exposureGainProductValid) {
-    result.exposureGainProduct = result.exposure * result.nominalGainMultiplier;
+    result.exposureGainProduct = result.exposureLines * result.nominalGainMultiplier;
   }
 
+  result.dspRawControlsValid =
+      readByteRegister(sensor, 0x0cc, 0xff, result.dspControlCc) &&
+      readByteRegister(sensor, 0x0cd, 0xff, result.dspControlCd) &&
+      readByteRegister(sensor, 0x0ce, 0xff, result.dspControlCe);
   return result;
 }
 
-Ov2640RegisterSnapshot readObservedOv2640(sensor_t *sensor) {
-  Ov2640RegisterSnapshot result = readExposureGainRegisters(sensor);
-  if (!result.supported || sensor == nullptr || sensor->get_reg == nullptr) return result;
-  result.dspRawControlsValid =
-      readRegister(sensor, 0x0cc, 0xff, result.dspControlCc) &&
-      readRegister(sensor, 0x0cd, 0xff, result.dspControlCd) &&
-      readRegister(sensor, 0x0ce, 0xff, result.dspControlCe);
+Ov5640RegisterSnapshot readExposureGainRegisters(sensor_t *sensor) {
+  Ov5640RegisterSnapshot result = {};
+  result.supported = sensor != nullptr && sensor->id.PID == OV5640_PID;
+  if (!result.supported || sensor->get_reg == nullptr) return result;
+
+  uint32_t exposure = 0;
+  for (uint8_t attempt = 1; attempt <= kMaxExposureConsistencyAttempts; ++attempt) {
+    const int first = sensor->get_reg(sensor, 0x3500, 0xffff0);
+    const int second = sensor->get_reg(sensor, 0x3500, 0xffff0);
+    result.exposureReadAttempts = attempt;
+    if (first < 0 || second < 0) break;
+    exposure = static_cast<uint32_t>(second);
+    result.exposureValid = true;
+    result.exposureConsistent = first == second;
+    if (result.exposureConsistent) break;
+  }
+  if (result.exposureValid) {
+    result.exposureRaw16ths = exposure;
+    result.exposureLines = exposure >> 4;
+  }
+
+  const int frameLength = sensor->get_reg(sensor, 0x380e, 0xffff);
+  result.frameLengthValid = frameLength >= 0;
+  if (result.frameLengthValid) result.frameLengthLines = static_cast<uint16_t>(frameLength);
+
+  const int gain = sensor->get_reg(sensor, 0x350a, 0x03ff);
+  result.gainValid = gain >= 0;
+  if (result.gainValid) {
+    result.gainRaw = static_cast<uint16_t>(gain);
+    result.nominalGainMultiplier = static_cast<float>(result.gainRaw) / 16.0f;
+  }
+  result.exposureGainProductValid =
+      result.exposureValid && result.exposureConsistent && result.gainValid;
+  if (result.exposureGainProductValid) {
+    result.exposureGainProduct = static_cast<float>(result.exposureLines) *
+                                 result.nominalGainMultiplier;
+  }
+
   return result;
 }
 
 }  // namespace
 
-bool initializeCamera() {
-  camera_config_t cameraConfig = {
-      .pin_pwdn = kPowerDownPin,
-      .pin_reset = kResetPin,
-      .pin_xclk = kXclkPin,
-      .pin_sccb_sda = kSiodPin,
-      .pin_sccb_scl = kSiocPin,
-      .pin_d7 = kY9Pin,
-      .pin_d6 = kY8Pin,
-      .pin_d5 = kY7Pin,
-      .pin_d4 = kY6Pin,
-      .pin_d3 = kY5Pin,
-      .pin_d2 = kY4Pin,
-      .pin_d1 = kY3Pin,
-      .pin_d0 = kY2Pin,
-      .pin_vsync = kVsyncPin,
-      .pin_href = kHrefPin,
-      .pin_pclk = kPclkPin,
-      .xclk_freq_hz = 20000000,
-      .ledc_timer = LEDC_TIMER_0,
-      .ledc_channel = LEDC_CHANNEL_0,
-      .pixel_format = PIXFORMAT_JPEG,
-      .frame_size = FRAMESIZE_VGA,
-      .jpeg_quality = 10,
-      .fb_count = kFrameBufferCount,
-      .grab_mode = kGrabMode,
-  };
+uint16_t cameraSensorConfigKey(uint16_t pid, uint8_t version) {
+  if (pid == OV2640_PID) return (pid << 8) | version;
+  return pid;
+}
 
-  const esp_err_t error = esp_camera_init(&cameraConfig);
+const char *cameraSensorModelName(uint16_t pid, uint8_t version) {
+  const uint16_t key = cameraSensorConfigKey(pid, version);
+  if (key == kOv2640SensorKey) return "OV2640";
+  if (key == kOv5640SensorKey) return "OV5640";
+  return "unknown";
+}
+
+bool initializeCamera() {
+  camera_config_t cameraConfig = cameraConfigFor(FRAMESIZE_VGA, 10, kProbeXclkHz);
+
+  esp_err_t error = esp_camera_init(&cameraConfig);
   if (error != ESP_OK) {
     Serial.printf("Camera init failed: 0x%x\n", error);
     return false;
   }
 
-  // The driver's initialization establishes the first frame-affecting state.
-  noteSettingsChange();
-  applyCameraSettings();
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == nullptr) {
+    Serial.println("Camera sensor detection failed");
+    esp_camera_deinit();
+    return false;
+  }
+
+  const uint16_t sensorKey = cameraSensorConfigKey(sensor->id.PID, sensor->id.VER);
+  const CameraSensorProfile *profile = getCameraSensorProfile(sensorKey);
+  if (profile == nullptr || !selectCameraSensorProfile(sensorKey)) {
+    Serial.printf("Unsupported or unconfigured camera sensor: PID 0x%04x, VER 0x%02x, key 0x%04x\n",
+                  static_cast<unsigned int>(sensor->id.PID), sensor->id.VER,
+                  static_cast<unsigned int>(sensorKey));
+    esp_camera_deinit();
+    return false;
+  }
+
+  if (cfg.framesize < static_cast<int>(FRAMESIZE_QQVGA) ||
+      cfg.framesize > cameraSensorMaximumFramesize(sensorKey)) {
+    Serial.printf("Configured frame size %s is unsupported by %s\n",
+                  configFramesizeName(cfg.framesize), cameraSensorModelName(sensor->id.PID, sensor->id.VER));
+    esp_camera_deinit();
+    return false;
+  }
+
+  if (!reinitializeCameraForProfile(sensorKey, *profile)) return false;
+  sensor = esp_camera_sensor_get();
+
+  Serial.printf("Camera ready: %s (PID 0x%04x, VER 0x%02x, config %s, SCCB 0x%02x, XCLK %d Hz)\n",
+                cameraSensorModelName(sensor->id.PID, sensor->id.VER),
+                static_cast<unsigned int>(sensor->id.PID), sensor->id.VER,
+                cameraSensorKeyName(sensorKey), sensor->slv_addr, sensor->xclk_freq_hz);
+
   return true;
+}
+
+bool applyCameraProfile() {
+  const uint16_t sensorKey = getActiveCameraSensorKey();
+  const CameraSensorProfile *profile = getCameraSensorProfile(sensorKey);
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (profile == nullptr || sensor == nullptr ||
+      cameraSensorConfigKey(sensor->id.PID, sensor->id.VER) != sensorKey) {
+    return false;
+  }
+  if (profile->framesize == initializedFramesize && profile->xclkHz == initializedXclkHz) {
+    applyCameraSettings();
+    return true;
+  }
+  if (profile->framesize == initializedFramesize) {
+    applyCameraSettings();
+    return true;
+  }
+
+  const CameraSensorProfile previousLiveProfile = {
+      initializedFramesize,
+      sensor->status.quality,
+      initializedXclkHz,
+  };
+  CameraSensorProfile runtimeProfile = *profile;
+  runtimeProfile.xclkHz = initializedXclkHz;
+  if (reinitializeCameraForProfile(sensorKey, runtimeProfile)) return true;
+
+  Serial.println("Restoring previous live camera profile after reinitialization failure");
+  if (!reinitializeCameraForProfile(sensorKey, previousLiveProfile)) {
+    Serial.println("Could not restore previous live camera profile");
+  }
+  markRegisterDumpPending();
+  return false;
+}
+
+bool isCameraRestartRequired() {
+  const CameraSensorProfile *profile = getCameraSensorProfile(getActiveCameraSensorKey());
+  return profile != nullptr && profile->xclkHz != initializedXclkHz;
 }
 
 void applyCameraSettings() {
@@ -381,7 +561,7 @@ bool configureMotionCapture(bool &changed) {
   }
 
   // The camera HAL was initialized for JPEG and cannot safely be changed to
-  // raw grayscale by updating only the OV2640 sensor. Keep the HAL and sensor
+  // raw grayscale by updating only the OV5640 sensor. Keep the HAL and sensor
   // in JPEG mode. QQVGA, QVGA, and VGA can all be decoded directly to the same
   // 80x60 analysis image. Keeping those configured capture sizes here avoids an
   // AEC/AGC restart immediately before the first JPEG in a motion burst.
@@ -455,7 +635,8 @@ CameraMetadataSnapshot sampleCameraMetadata(const camera_fb_t *frameBuffer) {
     snapshot.driverCache = copyDriverCache(sensor);
     snapshot.registerReadBootUs = esp_timer_get_time();
     if (!registerDumpCacheValid) refreshRegisterDump(sensor);
-    snapshot.observed = readObservedOv2640(sensor);
+    snapshot.ov2640Observed = readObservedOv2640(sensor);
+    snapshot.ov5640Observed = readExposureGainRegisters(sensor);
     snapshot.registerDumpValid = registerDumpCacheValid;
     snapshot.registerDumpSha256 = registerDumpSha256;
     snapshot.includeRegisterDumpPayload = registerDumpPending && registerDumpCacheValid;
@@ -486,13 +667,23 @@ ExposureGainSample sampleExposureGain() {
   sensor_t *sensor = esp_camera_sensor_get();
   if (sensor == nullptr) return sample;
 
-  const Ov2640RegisterSnapshot observed = readExposureGainRegisters(sensor);
-  sample.valid = observed.supported && observed.exposureGainProductValid &&
-                 observed.exposureGainProduct > 0.0f && isfinite(observed.exposureGainProduct);
-  sample.exposureLines = observed.exposure;
-  sample.gainRaw = observed.gainRaw;
-  sample.nominalGainMultiplier = observed.nominalGainMultiplier;
-  sample.product = observed.exposureGainProduct;
+  if (sensor->id.PID == OV2640_PID) {
+    const Ov2640RegisterSnapshot observed = readObservedOv2640(sensor);
+    sample.valid = observed.supported && observed.exposureGainProductValid &&
+                   observed.exposureGainProduct > 0.0f && isfinite(observed.exposureGainProduct);
+    sample.exposureLines = observed.exposureLines;
+    sample.gainRaw = observed.gainRaw;
+    sample.nominalGainMultiplier = observed.nominalGainMultiplier;
+    sample.product = observed.exposureGainProduct;
+  } else {
+    const Ov5640RegisterSnapshot observed = readExposureGainRegisters(sensor);
+    sample.valid = observed.supported && observed.exposureGainProductValid &&
+                   observed.exposureGainProduct > 0.0f && isfinite(observed.exposureGainProduct);
+    sample.exposureLines = observed.exposureLines;
+    sample.gainRaw = observed.gainRaw;
+    sample.nominalGainMultiplier = observed.nominalGainMultiplier;
+    sample.product = observed.exposureGainProduct;
+  }
   return sample;
 }
 
@@ -500,6 +691,7 @@ void markRegisterDumpPending() {
   ++persistentSettingsRevision;
   registerDumpPending = true;
   registerDumpCacheValid = false;
+  registerDumpCacheBytes = 0;
   registerDumpSha256 = "";
   registerDumpPayloadBase64 = "";
 }
@@ -571,20 +763,35 @@ String buildCameraMetadata(const CameraMetadataSnapshot &snapshot, const char *s
 
   if (snapshot.sensorAvailable) {
     JsonObject identity = camera["sensor"].to<JsonObject>();
-    identity["model"] = snapshot.sensorPid == OV2640_PID ? "OV2640" : "unknown";
-    identity["manufacturer"] = snapshot.sensorPid == OV2640_PID ? "OmniVision" : "unknown";
-    const uint16_t manufacturerId =
-        (static_cast<uint16_t>(snapshot.manufacturerHigh) << 8) | snapshot.manufacturerLow;
+    const char *model = cameraSensorModelName(snapshot.sensorPid, snapshot.sensorVersion);
+    identity["model"] = model;
+    identity["manufacturer"] = strcmp(model, "unknown") == 0 ? "unknown" : "OmniVision";
     identity["pid"] = snapshot.sensorPid;
     identity["pid_hex"] = hexValue(snapshot.sensorPid, 4);
-    identity["version"] = snapshot.sensorVersion;
-    identity["version_hex"] = hexValue(snapshot.sensorVersion, 2);
-    identity["manufacturer_high"] = snapshot.manufacturerHigh;
-    identity["manufacturer_high_hex"] = hexValue(snapshot.manufacturerHigh, 2);
-    identity["manufacturer_low"] = snapshot.manufacturerLow;
-    identity["manufacturer_low_hex"] = hexValue(snapshot.manufacturerLow, 2);
-    identity["manufacturer_id"] = manufacturerId;
-    identity["manufacturer_id_hex"] = hexValue(manufacturerId, 4);
+    const bool extendedIdentityAvailable = snapshot.sensorPid == OV2640_PID;
+    identity["version_available"] = extendedIdentityAvailable;
+    if (extendedIdentityAvailable) {
+      identity["version"] = snapshot.sensorVersion;
+      identity["version_hex"] = hexValue(snapshot.sensorVersion, 2);
+    } else {
+      identity["version"] = nullptr;
+      identity["version_hex"] = nullptr;
+    }
+    identity["config_key"] = cameraSensorKeyName(
+        cameraSensorConfigKey(snapshot.sensorPid, snapshot.sensorVersion));
+    const uint16_t manufacturerId =
+        (static_cast<uint16_t>(snapshot.manufacturerHigh) << 8) | snapshot.manufacturerLow;
+    identity["manufacturer_id_available"] = extendedIdentityAvailable;
+    if (extendedIdentityAvailable) {
+      identity["manufacturer_id"] = manufacturerId;
+      identity["manufacturer_id_hex"] = hexValue(manufacturerId, 4);
+    } else {
+      identity["manufacturer_id"] = nullptr;
+      identity["manufacturer_id_hex"] = nullptr;
+    }
+    identity["identity_qualifier"] = snapshot.sensorPid == OV2640_PID
+        ? "ov2640_config_key_combines_driver_pid_0x26_and_version_0x42"
+        : "ov5640_driver_detection_populates_pid_only";
     identity["sccb_address"] = snapshot.sensorAddress;
     identity["sccb_address_hex"] = hexValue(snapshot.sensorAddress, 2);
     identity["xclk_hz"] = snapshot.xclkHz;
@@ -656,55 +863,82 @@ String buildCameraMetadata(const CameraMetadataSnapshot &snapshot, const char *s
   frameBuffer["queue_age_possible"] =
       snapshot.frameBufferCount > 1 || snapshot.grabMode == CAMERA_GRAB_WHEN_EMPTY;
   frameBuffer["age_qualifier"] =
-      "queued_frame_and_ov2640_aec_agc_pipeline_can_make_frame_older_than_post_frame_registers";
+      "queued_frame_and_sensor_aec_agc_pipeline_can_make_frame_older_than_post_frame_registers";
 
-  if (snapshot.observed.supported) {
+  if (snapshot.ov2640Observed.supported) {
+    const Ov2640RegisterSnapshot &sample = snapshot.ov2640Observed;
     JsonObject registers = observed["ov2640_registers"].to<JsonObject>();
     registers["observation_qualifier"] = snapshot.hasFrame
         ? "post_frame_non_atomic_with_buffer_and_sensor_pipeline_delay"
-        : "live_non_atomic_not_frame_associated";
+        : "profile_time_non_atomic_live_register_reads";
     registers["registers_are_exact_frame_state"] = false;
     JsonObject exposure = registers["aec"].to<JsonObject>();
-    exposure["valid"] = snapshot.observed.exposureValid;
-    exposure["consistent"] = snapshot.observed.exposureConsistent;
-    exposure["read_attempts"] = snapshot.observed.exposureReadAttempts;
+    exposure["valid"] = sample.exposureValid;
+    exposure["consistent"] = sample.exposureConsistent;
+    exposure["read_attempts"] = sample.exposureReadAttempts;
     exposure["max_consistency_attempts"] = kMaxExposureConsistencyAttempts;
-    exposure["sensor_bank_0x45_mask_0x3f"] = snapshot.observed.aecHigh;
-    exposure["sensor_bank_0x10_mask_0xff"] = snapshot.observed.aecMiddle;
-    exposure["sensor_bank_0x04_mask_0x03"] = snapshot.observed.aecLow;
-    if (snapshot.observed.exposureValid) exposure["aec_lines"] = snapshot.observed.exposure;
-    exposure["aec_driver_limit_lines"] = snapshot.observed.aecDriverLimitLines;
-    exposure["aec_max_lines"] = snapshot.observed.aecDriverLimitLines;
+    exposure["sensor_bank_0x45_mask_0x3f"] = sample.aecHigh;
+    exposure["sensor_bank_0x10_mask_0xff"] = sample.aecMiddle;
+    exposure["sensor_bank_0x04_mask_0x03"] = sample.aecLow;
+    if (sample.exposureValid) exposure["aec_lines"] = sample.exposureLines;
+    exposure["aec_driver_limit_lines"] = sample.aecDriverLimitLines;
+    exposure["aec_max_lines"] = sample.aecDriverLimitLines;
     exposure["aec_max_lines_source"] = "esp32_camera_f0bb429_set_aec_value_driver_limit";
-    exposure["ae_saturated_valid"] = snapshot.observed.aeSaturatedValid;
-    if (snapshot.observed.aeSaturatedValid) {
-      exposure["ae_saturated"] = snapshot.observed.aeSaturated;
-    } else {
-      exposure["ae_saturated"] = nullptr;
-    }
+    exposure["ae_saturated_valid"] = sample.aeSaturatedValid;
+    if (sample.aeSaturatedValid) exposure["ae_saturated"] = sample.aeSaturated;
+    else exposure["ae_saturated"] = nullptr;
     exposure["ae_saturated_qualifier"] =
         "derived_from_aec_enabled_consistent_lines_at_driver_limit_not_sensor_status_bit";
+    JsonObject gain = registers["gain"].to<JsonObject>();
+    gain["valid"] = sample.gainValid;
+    gain["sensor_bank_0x00_mask_0xff"] = sample.gainRaw;
+    gain["nominal_multiplier_formula"] = "2^popcount(high_nibble)*(1+low_nibble/16)";
+    if (sample.gainValid) gain["nominal_multiplier"] = sample.nominalGainMultiplier;
+    if (sample.exposureGainProductValid) registers["exposure_gain_product"] = sample.exposureGainProduct;
+    else registers["exposure_gain_product"] = nullptr;
+    JsonObject dsp = registers["dsp_raw_controls"].to<JsonObject>();
+    dsp["label"] = "raw_controls_not_verified_live_awb_gains";
+    dsp["verified_live_awb_gains"] = false;
+    dsp["valid"] = sample.dspRawControlsValid;
+    dsp["dsp_bank_0xcc"] = sample.dspControlCc;
+    dsp["dsp_bank_0xcd"] = sample.dspControlCd;
+    dsp["dsp_bank_0xce"] = sample.dspControlCe;
+  } else if (snapshot.ov5640Observed.supported) {
+    const Ov5640RegisterSnapshot &sample = snapshot.ov5640Observed;
+    JsonObject registers = observed["ov5640_registers"].to<JsonObject>();
+    registers["observation_qualifier"] = snapshot.hasFrame
+        ? "post_frame_non_atomic_with_buffer_and_sensor_pipeline_delay"
+        : "profile_time_non_atomic_live_register_reads";
+    registers["registers_are_exact_frame_state"] = false;
+    JsonObject exposure = registers["aec"].to<JsonObject>();
+    exposure["valid"] = sample.exposureValid;
+    exposure["consistent"] = sample.exposureConsistent;
+    exposure["read_attempts"] = sample.exposureReadAttempts;
+    exposure["max_consistency_attempts"] = kMaxExposureConsistencyAttempts;
+    exposure["register_0x3500_mask_0xffff0_raw_1_16_lines"] =
+        sample.exposureRaw16ths;
+    if (sample.exposureValid) exposure["aec_lines"] = sample.exposureLines;
+    exposure["frame_length_valid"] = sample.frameLengthValid;
+    if (sample.frameLengthValid) {
+      exposure["frame_length_lines_register_0x380e_mask_0xffff"] =
+          sample.frameLengthLines;
+    }
+    exposure["qualifier"] =
+        "ov5640_exposure_is_reported_in_1_16_line_units_then_floor_converted_to_lines";
 
     JsonObject gain = registers["gain"].to<JsonObject>();
-    gain["valid"] = snapshot.observed.gainValid;
-    gain["sensor_bank_0x00_mask_0xff"] = snapshot.observed.gainRaw;
-    gain["nominal_multiplier_formula"] = "2^popcount(high_nibble)*(1+low_nibble/16)";
-    if (snapshot.observed.gainValid) {
-      gain["nominal_multiplier"] = snapshot.observed.nominalGainMultiplier;
+    gain["valid"] = sample.gainValid;
+    gain["register_0x350a_mask_0x03ff"] = sample.gainRaw;
+    gain["nominal_multiplier_formula"] = "raw_10_bit_gain/16";
+    if (sample.gainValid) {
+      gain["nominal_multiplier"] = sample.nominalGainMultiplier;
     }
-    if (snapshot.observed.exposureGainProductValid) {
-      registers["exposure_gain_product"] = snapshot.observed.exposureGainProduct;
+    if (sample.exposureGainProductValid) {
+      registers["exposure_gain_product"] = sample.exposureGainProduct;
     } else {
       registers["exposure_gain_product"] = nullptr;
     }
 
-    JsonObject dsp = registers["dsp_raw_controls"].to<JsonObject>();
-    dsp["label"] = "raw_controls_not_verified_live_awb_gains";
-    dsp["verified_live_awb_gains"] = false;
-    dsp["valid"] = snapshot.observed.dspRawControlsValid;
-    dsp["dsp_bank_0xcc"] = snapshot.observed.dspControlCc;
-    dsp["dsp_bank_0xcd"] = snapshot.observed.dspControlCd;
-    dsp["dsp_bank_0xce"] = snapshot.observed.dspControlCe;
   }
 
   JsonObject timing = camera["timing"].to<JsonObject>();
@@ -729,11 +963,20 @@ String buildCameraMetadata(const CameraMetadataSnapshot &snapshot, const char *s
 
   JsonObject dump = camera["register_dump"].to<JsonObject>();
   dump["valid"] = snapshot.registerDumpValid;
-  dump["format"] = "ov2640_banked_register_dump_v1";
-  dump["canonical_bytes"] = kRegisterDumpBytes;
-  dump["address_range"] = "0x00-0xfe_per_bank";
-  dump["binary_layout"] =
-      "ascii_OVD1_then_dsp_255_values_then_dsp_32_byte_validity_bitmap_then_sensor_equivalent";
+  if (snapshot.sensorPid == OV2640_PID) {
+    dump["format"] = "ov2640_banked_register_dump_v1";
+    dump["canonical_bytes"] = kOv2640RegisterDumpBytes;
+    dump["address_range"] = "0x00-0xfe_per_bank";
+    dump["binary_layout"] =
+        "ascii_OVD1_then_dsp_255_values_then_dsp_32_byte_validity_bitmap_then_sensor_equivalent";
+  } else {
+    dump["format"] = "ov5640_sparse_register_dump_v1";
+    dump["canonical_bytes"] = kOv5640RegisterDumpBytes;
+    dump["addresses"] =
+        "0x300a,0x300b,0x3400-0x3406,0x3500-0x3502,0x350a-0x350b,0x380e-0x380f";
+    dump["binary_layout"] =
+        "ascii_OV5D_then_repeated_big_endian_address_validity_byte_value_byte";
+  }
   dump["revision"] = snapshot.persistentSettingsRevision;
   dump["payload_included"] = snapshot.includeRegisterDumpPayload;
   dump["qualifier"] = "best_effort_non_atomic_register_sweep";

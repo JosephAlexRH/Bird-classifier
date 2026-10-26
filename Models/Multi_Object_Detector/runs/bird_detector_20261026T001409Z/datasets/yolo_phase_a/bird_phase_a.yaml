@@ -1,0 +1,6 @@
+path: /mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Models/Multi_Object_Detector/runs/bird_detector_20261026T001409Z/datasets/yolo_phase_a
+train: images/train
+val: images/validation
+test: ''
+names:
+  0: bird

@@ -225,12 +225,24 @@ String configJson() {
   document["motion_check_ms"] = cfg.motionCheckMs;
   document["motion_enabled"] = cfg.motionEnabled;
   document["motion_owner"] = motionOwnerName(cfg.motionOwner);
-  document["jpeg_quality"] = cfg.jpegQuality;
-  document["framesize"] = cfg.framesize;
+  JsonObject sensors = document["sensors"].to<JsonObject>();
+  JsonObject ov2640 = sensors["0x2642"].to<JsonObject>();
+  ov2640["frame_size"] = configFramesizeName(cfg.ov2640.framesize);
+  ov2640["jpeg_quality"] = cfg.ov2640.jpegQuality;
+  ov2640["xclk_hz"] = cfg.ov2640.xclkHz;
+  JsonObject ov5640 = sensors["0x5640"].to<JsonObject>();
+  ov5640["frame_size"] = configFramesizeName(cfg.ov5640.framesize);
+  ov5640["jpeg_quality"] = cfg.ov5640.jpegQuality;
+  ov5640["xclk_hz"] = cfg.ov5640.xclkHz;
+  document["active_sensor_key"] = getActiveCameraSensorKey() == 0
+                                      ? nullptr
+                                      : cameraSensorKeyName(getActiveCameraSensorKey());
+  document["camera_restart_required"] = isCameraRestartRequired();
   document["server_ip"] = cfg.serverIp;
   document["server_port"] = cfg.serverPort;
   document["save_birds_to_sd"] = cfg.saveBirdsToSd;
-  document["bird_confidence_threshold"] = cfg.birdConfidenceThreshold;
+  JsonObject pipeline = document["pipeline"].to<JsonObject>();
+  pipeline["bird_confidence_threshold"] = cfg.birdConfidenceThreshold;
   document["wait_for_classification"] = cfg.waitForClassification;
   document["burst_count"] = cfg.burstCount;
   document["burst_interval_ms"] = cfg.burstIntervalMs;
@@ -256,6 +268,53 @@ String configJson() {
   String json;
   serializeJson(document, json);
   return json;
+}
+
+bool validSensorProfile(JsonVariantConst value, uint16_t sensorKey, String &error) {
+  if (!value.is<JsonObjectConst>()) {
+    error = String("sensors.") + cameraSensorKeyName(sensorKey) + " must be an object";
+    return false;
+  }
+  JsonObjectConst profile = value.as<JsonObjectConst>();
+  int framesize = getCameraSensorProfile(sensorKey)->framesize;
+  if (profile.containsKey("frame_size")) {
+    JsonVariantConst frameSize = profile["frame_size"];
+    if (frameSize.is<const char *>()) {
+      if (!parseConfigFramesize(frameSize.as<const char *>(), framesize)) {
+        error = String("sensors.") + cameraSensorKeyName(sensorKey) + ".frame_size is unknown";
+        return false;
+      }
+    } else if (frameSize.is<int>()) {
+      framesize = frameSize.as<int>();
+    } else {
+      error = String("sensors.") + cameraSensorKeyName(sensorKey) +
+              ".frame_size must be a name or enum value";
+      return false;
+    }
+  }
+  const int maximum = cameraSensorMaximumFramesize(sensorKey);
+  if (framesize < static_cast<int>(FRAMESIZE_QQVGA) || framesize > maximum) {
+    error = String("sensors.") + cameraSensorKeyName(sensorKey) +
+            ".frame_size is unsupported by that sensor";
+    return false;
+  }
+  if (profile.containsKey("jpeg_quality")) {
+    const int value = profile["jpeg_quality"];
+    if (value < 0 || value > 63) {
+      error = String("sensors.") + cameraSensorKeyName(sensorKey) +
+              ".jpeg_quality must be between 0 and 63";
+      return false;
+    }
+  }
+  if (profile.containsKey("xclk_hz")) {
+    const int value = profile["xclk_hz"];
+    if (value < kMinimumCameraXclkHz || value > cameraSensorMaximumXclkHz(sensorKey)) {
+      error = String("sensors.") + cameraSensorKeyName(sensorKey) +
+              ".xclk_hz must be within that sensor's supported clock range";
+      return false;
+    }
+  }
+  return true;
 }
 
 bool validConfig(const JsonDocument &document, String &error) {
@@ -329,6 +388,17 @@ bool validConfig(const JsonDocument &document, String &error) {
       return false;
     }
   }
+  if (document.containsKey("sensors")) {
+    if (!document["sensors"].is<JsonObjectConst>()) {
+      error = "sensors must be an object";
+      return false;
+    }
+    JsonObjectConst sensors = document["sensors"].as<JsonObjectConst>();
+    if (sensors.containsKey("0x2642") &&
+        !validSensorProfile(sensors["0x2642"], kOv2640SensorKey, error)) return false;
+    if (sensors.containsKey("0x5640") &&
+        !validSensorProfile(sensors["0x5640"], kOv5640SensorKey, error)) return false;
+  }
   if (document.containsKey("jpeg_quality")) {
     const int value = document["jpeg_quality"];
     if (value < 0 || value > 63) {
@@ -338,8 +408,12 @@ bool validConfig(const JsonDocument &document, String &error) {
   }
   if (document.containsKey("framesize")) {
     const int value = document["framesize"];
-    if (value < static_cast<int>(FRAMESIZE_96X96) || value > static_cast<int>(FRAMESIZE_UXGA)) {
-      error = "framesize is unsupported by the OV2640";
+    sensor_t *sensor = esp_camera_sensor_get();
+    camera_sensor_info_t *sensorInfo = sensor == nullptr ? nullptr : esp_camera_sensor_get_info(&sensor->id);
+    const int maximum = sensorInfo == nullptr ? static_cast<int>(FRAMESIZE_QSXGA)
+                                              : static_cast<int>(sensorInfo->max_size);
+    if (value < static_cast<int>(FRAMESIZE_QQVGA) || value > maximum) {
+      error = "framesize is unsupported by the detected camera sensor";
       return false;
     }
   }
@@ -362,6 +436,20 @@ bool validConfig(const JsonDocument &document, String &error) {
     if (value < 0.0f || value > 1.0f) {
       error = "bird_confidence_threshold must be between 0 and 1";
       return false;
+    }
+  }
+  if (document.containsKey("pipeline")) {
+    if (!document["pipeline"].is<JsonObjectConst>()) {
+      error = "pipeline must be an object";
+      return false;
+    }
+    JsonObjectConst pipeline = document["pipeline"].as<JsonObjectConst>();
+    if (pipeline.containsKey("bird_confidence_threshold")) {
+      const float value = pipeline["bird_confidence_threshold"];
+      if (value < 0.0f || value > 1.0f) {
+        error = "pipeline.bird_confidence_threshold must be between 0 and 1";
+        return false;
+      }
     }
   }
   if (document.containsKey("wait_for_classification") &&
@@ -503,14 +591,41 @@ void applyConfig(const JsonDocument &document) {
                           : MotionOwner::Pi;
   }
   if (!isFirmwareMotionOwner()) cfg.motionEnabled = false;
-  if (document.containsKey("jpeg_quality")) cfg.jpegQuality = document["jpeg_quality"];
-  if (document.containsKey("framesize")) cfg.framesize = document["framesize"];
+  if (document.containsKey("sensors")) {
+    JsonObjectConst sensors = document["sensors"].as<JsonObjectConst>();
+    for (uint16_t sensorKey : {kOv2640SensorKey, kOv5640SensorKey}) {
+      const char *key = cameraSensorKeyName(sensorKey);
+      if (!sensors.containsKey(key)) continue;
+      CameraSensorProfile *target = getMutableCameraSensorProfile(sensorKey);
+      JsonObjectConst source = sensors[key].as<JsonObjectConst>();
+      if (source.containsKey("frame_size")) {
+        JsonVariantConst frameSize = source["frame_size"];
+        if (frameSize.is<const char *>()) parseConfigFramesize(frameSize.as<const char *>(), target->framesize);
+        else target->framesize = frameSize.as<int>();
+      }
+      if (source.containsKey("jpeg_quality")) target->jpegQuality = source["jpeg_quality"];
+      if (source.containsKey("xclk_hz")) target->xclkHz = source["xclk_hz"];
+    }
+  } else {
+    if (document.containsKey("jpeg_quality")) {
+      cfg.ov2640.jpegQuality = document["jpeg_quality"];
+      cfg.ov5640.jpegQuality = document["jpeg_quality"];
+    }
+    if (document.containsKey("framesize")) {
+      cfg.ov2640.framesize = document["framesize"];
+      cfg.ov5640.framesize = document["framesize"];
+    }
+  }
+  if (getActiveCameraSensorKey() != 0) selectCameraSensorProfile(getActiveCameraSensorKey());
   if (document.containsKey("server_ip")) {
     strlcpy(cfg.serverIp, document["server_ip"] | cfg.serverIp, sizeof(cfg.serverIp));
   }
   if (document.containsKey("server_port")) cfg.serverPort = document["server_port"];
   if (document.containsKey("save_birds_to_sd")) cfg.saveBirdsToSd = document["save_birds_to_sd"];
-  if (document.containsKey("bird_confidence_threshold")) {
+  if (document.containsKey("pipeline") &&
+      document["pipeline"].as<JsonObjectConst>().containsKey("bird_confidence_threshold")) {
+    cfg.birdConfidenceThreshold = document["pipeline"]["bird_confidence_threshold"];
+  } else if (document.containsKey("bird_confidence_threshold")) {
     cfg.birdConfidenceThreshold = document["bird_confidence_threshold"];
   }
   if (document.containsKey("wait_for_classification")) {
@@ -605,10 +720,24 @@ void handleClient(WiFiClient client) {
       } else {
         const Config previousConfig = cfg;
         applyConfig(document);
-        saveConfig();
         const bool wifiSettingsChanged = strcmp(cfg.wifiSsid, previousConfig.wifiSsid) != 0 ||
                                          strcmp(cfg.wifiPassword, previousConfig.wifiPassword) != 0;
         const bool motionOwnershipChanged = cfg.motionOwner != previousConfig.motionOwner;
+        const bool framesizeChanged = cfg.framesize != previousConfig.framesize;
+        const CameraSensorProfile *activeProfile = getCameraSensorProfile(getActiveCameraSensorKey());
+        const CameraSensorProfile *previousActiveProfile =
+            getActiveCameraSensorKey() == kOv2640SensorKey ? &previousConfig.ov2640
+                                                          : &previousConfig.ov5640;
+        const bool xclkChanged = activeProfile != nullptr && previousActiveProfile != nullptr &&
+                                 activeProfile->xclkHz != previousActiveProfile->xclkHz;
+        if (framesizeChanged && !applyCameraProfile()) {
+          cfg = previousConfig;
+          selectCameraSensorProfile(getActiveCameraSensorKey());
+          sendJson(client, 500, "Internal Server Error",
+                   "{\"error\":\"Could not apply camera frame size; previous profile restored\"}");
+          return;
+        }
+        saveConfig();
         if (motionOwnershipChanged || cfg.motionEnabled != previousConfig.motionEnabled) {
           if (cfg.motionEnabled) {
             armMotionDetection();
@@ -617,7 +746,7 @@ void handleClient(WiFiClient client) {
           }
         } else if (getCameraOperatingMode() == CameraOperatingMode::Motion) {
           resetMotionReference();
-        } else {
+        } else if (!framesizeChanged) {
           applyCameraSettings();
         }
         if (cfg.jpegQuality != previousConfig.jpegQuality || cfg.framesize != previousConfig.framesize) {
@@ -625,6 +754,9 @@ void handleClient(WiFiClient client) {
         }
         if (wifiSettingsChanged) {
           Serial.println("Wi-Fi configuration saved; it will be used after restart");
+        }
+        if (xclkChanged) {
+          Serial.println("Camera XCLK configuration saved; it will be used after restart");
         }
         sendJson(client, 200, "OK", configJson());
       }
@@ -663,6 +795,23 @@ void handleClient(WiFiClient client) {
     document["stream_active"] = isCameraStreamActive();
     document["boot_id"] = getBootId();
     document["camera_id"] = getCameraId();
+    sensor_t *statusSensor = esp_camera_sensor_get();
+    document["camera_model"] = statusSensor == nullptr
+                                   ? "unknown"
+                                   : cameraSensorModelName(statusSensor->id.PID, statusSensor->id.VER);
+    document["camera_sensor_pid"] = statusSensor == nullptr ? 0 : statusSensor->id.PID;
+    document["camera_sensor_version_available"] =
+        statusSensor != nullptr && statusSensor->id.PID == OV2640_PID;
+    if (statusSensor != nullptr && statusSensor->id.PID == OV2640_PID) {
+      document["camera_sensor_version"] = statusSensor->id.VER;
+    } else {
+      document["camera_sensor_version"] = nullptr;
+    }
+    document["camera_sensor_config_key"] = statusSensor == nullptr
+                                               ? nullptr
+                                               : cameraSensorKeyName(cameraSensorConfigKey(
+                                                     statusSensor->id.PID, statusSensor->id.VER));
+    document["camera_restart_required"] = isCameraRestartRequired();
     document["motion_owner"] = motionOwnerName(cfg.motionOwner);
     const DeviceTelemetrySnapshot device = sampleDeviceTelemetry();
     document["time_sync_status"] = device.timeSynchronized ? "synchronized" : "unsynchronized";

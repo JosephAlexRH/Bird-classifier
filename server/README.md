@@ -4,6 +4,49 @@ The firmware sends raw JPEG bytes to `POST /upload` with the content type
 `image/jpeg`. Capture metadata is sent in the optional
 `X-ESP32-Camera-Metadata` JSON header.
 
+## Multiple cameras
+
+Both `laptop_test_server.py` and `raspberry_pi_server.py` maintain a persistent
+camera registry. Open either dashboard and use **Camera fleet** to add an
+ESP32-CAM by IP address, for example `192.168.1.84`. A complete base URL such as
+`http://192.168.1.84` is also accepted. The optional name is used in the
+dashboard and capture sidecars.
+
+The registry stores each camera's URL, enabled/default state, stable ESP32
+hardware `camera_id`, and detected sensor identity. OV2640 and OV5640 cameras
+can run together without sharing camera locks or Pi motion backgrounds. Each
+camera has an independent operation lock, so one stream or failed camera does
+not block the others.
+
+By default the command-line servers store their registry at
+`~/.esp32-cameras/cameras.json`. Override this with `--registry-file`. The
+existing `--camera-url` option remains supported and creates or selects the
+default registry entry.
+
+Camera management API:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/cameras` | List definitions, sensor data, health, and Pi worker state |
+| `POST` | `/api/cameras` | Add `{"address":"192.168.1.84","name":"Backyard"}` |
+| `PATCH` | `/api/cameras/<id>` | Rename, enable/disable, or set the default |
+| `DELETE` | `/api/cameras/<id>` | Remove a camera and stop its Pi worker |
+| `POST` | `/api/cameras/<id>/poll` | Refresh status/config/metadata and identity |
+| `GET` | `/api/cameras/<id>/capture` | Proxy a selected-camera capture |
+| `GET`/`POST` | `/api/cameras/<id>/config` | Read or update selected-camera config |
+| `POST` | `/api/cameras/<id>/mode` | Set selected camera to `motion` or `idle` |
+
+The laptop also exposes `/api/cameras/<id>/stream`,
+`/api/cameras/<id>/captures`, and `/api/cameras/<id>/profiles`. Existing
+unscoped `/camera/...` routes target the configured default or sole camera.
+
+On the Pi, every enabled camera gets its own `MotionService` and running-median
+background. TFLite inference remains serialized through a shared lock. Capture
+records include `camera_id`, `camera_registry_id`, `camera_name`, and
+`camera_model`. Filter with `/api/captures?camera_id=esp32cam-...` or
+`/api/captures?camera_registry_id=<registry-id>`.
+
+
 
 The Raspberry Pi server validates its classifier output and returns this
 contract to the ESP32:
@@ -169,7 +212,7 @@ The **Motion** control arms the ESP32's software luminance frame-difference
 detector. It does not use an OV2640 hardware motion interrupt. Every valid
 motion-triggered JPEG uploaded to the laptop or Pi receiver is saved there. The
 ESP32 microSD copy remains restricted to classifier-confirmed birds meeting
-`bird_confidence_threshold`.
+`pipeline.bird_confidence_threshold`.
 
 Images are saved to `Pictures\ESP32Cam` by default. Override this with:
 

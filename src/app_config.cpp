@@ -5,6 +5,7 @@
 #include <FS.h>
 #include <SD_MMC.h>
 #include <SPIFFS.h>
+#include <esp_camera.h>
 #include <mbedtls/sha256.h>
 
 #if __has_include("secrets.h")
@@ -22,6 +23,56 @@ fs::FS *configStorage = nullptr;
 const char *configStorageName = "none";
 String configFileSha256;
 bool configFileHashValid = false;
+uint16_t activeCameraSensorKey = 0;
+
+bool loadSensorProfile(JsonVariantConst value, CameraSensorProfile &profile, uint16_t sensorKey) {
+  const char *key = cameraSensorKeyName(sensorKey);
+  if (!value.is<JsonObjectConst>()) {
+    Serial.printf("Ignoring sensors.%s because it is not an object\n", key);
+    return false;
+  }
+
+  JsonObjectConst object = value.as<JsonObjectConst>();
+  CameraSensorProfile candidate = profile;
+  if (object.containsKey("frame_size")) {
+    JsonVariantConst frameSize = object["frame_size"];
+    if (frameSize.is<const char *>()) {
+      if (!parseConfigFramesize(frameSize.as<const char *>(), candidate.framesize)) {
+        Serial.printf("Ignoring invalid sensors.%s.frame_size\n", key);
+        return false;
+      }
+    } else if (frameSize.is<int>()) {
+      candidate.framesize = frameSize.as<int>();
+    } else {
+      Serial.printf("Ignoring invalid sensors.%s.frame_size\n", key);
+      return false;
+    }
+  }
+  if (candidate.framesize < static_cast<int>(FRAMESIZE_QQVGA) ||
+      candidate.framesize > cameraSensorMaximumFramesize(sensorKey)) {
+    Serial.printf("Ignoring unsupported sensors.%s.frame_size\n", key);
+    return false;
+  }
+  if (object.containsKey("jpeg_quality")) candidate.jpegQuality = object["jpeg_quality"];
+  if (candidate.jpegQuality < 0 || candidate.jpegQuality > 63) {
+    Serial.printf("Ignoring invalid sensors.%s.jpeg_quality\n", key);
+    return false;
+  }
+  if (object.containsKey("xclk_hz")) candidate.xclkHz = object["xclk_hz"];
+  if (candidate.xclkHz < kMinimumCameraXclkHz ||
+      candidate.xclkHz > cameraSensorMaximumXclkHz(sensorKey)) {
+    Serial.printf("Ignoring invalid sensors.%s.xclk_hz\n", key);
+    return false;
+  }
+  profile = candidate;
+  return true;
+}
+
+void writeSensorProfile(JsonObject object, const CameraSensorProfile &profile) {
+  object["frame_size"] = configFramesizeName(profile.framesize);
+  object["jpeg_quality"] = profile.jpegQuality;
+  object["xclk_hz"] = profile.xclkHz;
+}
 
 void applyCompiledWifiFallback() {
   cfg.wifiSsid[0] = '\0';
@@ -128,8 +179,10 @@ Config cfg = {
     200,
     false,
     MotionOwner::Pi,
+    {static_cast<int>(FRAMESIZE_VGA), 12, 20000000},
+    {static_cast<int>(FRAMESIZE_VGA), 10, 20000000},
     10,
-    8,  // FRAMESIZE_VGA
+    static_cast<int>(FRAMESIZE_VGA),
     "192.168.7.170",
     5000,
     true,
@@ -164,6 +217,87 @@ const char *motionOwnerName(MotionOwner owner) {
 }
 
 bool isFirmwareMotionOwner() { return cfg.motionOwner == MotionOwner::Firmware; }
+
+const CameraSensorProfile *getCameraSensorProfile(uint16_t sensorKey) {
+  if (sensorKey == kOv2640SensorKey) return &cfg.ov2640;
+  if (sensorKey == kOv5640SensorKey) return &cfg.ov5640;
+  return nullptr;
+}
+
+CameraSensorProfile *getMutableCameraSensorProfile(uint16_t sensorKey) {
+  if (sensorKey == kOv2640SensorKey) return &cfg.ov2640;
+  if (sensorKey == kOv5640SensorKey) return &cfg.ov5640;
+  return nullptr;
+}
+
+bool selectCameraSensorProfile(uint16_t sensorKey) {
+  const CameraSensorProfile *profile = getCameraSensorProfile(sensorKey);
+  if (profile == nullptr) return false;
+  activeCameraSensorKey = sensorKey;
+  cfg.framesize = profile->framesize;
+  cfg.jpegQuality = profile->jpegQuality;
+  return true;
+}
+
+uint16_t getActiveCameraSensorKey() { return activeCameraSensorKey; }
+
+const char *cameraSensorKeyName(uint16_t sensorKey) {
+  if (sensorKey == kOv2640SensorKey) return "0x2642";
+  if (sensorKey == kOv5640SensorKey) return "0x5640";
+  return "unknown";
+}
+
+int cameraSensorMaximumFramesize(uint16_t sensorKey) {
+  if (sensorKey == kOv2640SensorKey) return static_cast<int>(FRAMESIZE_UXGA);
+  if (sensorKey == kOv5640SensorKey) return static_cast<int>(FRAMESIZE_QSXGA);
+  return -1;
+}
+
+int cameraSensorMaximumXclkHz(uint16_t sensorKey) {
+  if (sensorKey == kOv2640SensorKey) return kOv2640MaximumXclkHz;
+  if (sensorKey == kOv5640SensorKey) return kOv5640MaximumXclkHz;
+  return -1;
+}
+
+const char *configFramesizeName(int framesize) {
+  switch (static_cast<framesize_t>(framesize)) {
+    case FRAMESIZE_96X96: return "96X96";
+    case FRAMESIZE_QQVGA: return "QQVGA";
+    case FRAMESIZE_QCIF: return "QCIF";
+    case FRAMESIZE_HQVGA: return "HQVGA";
+    case FRAMESIZE_240X240: return "240X240";
+    case FRAMESIZE_QVGA: return "QVGA";
+    case FRAMESIZE_CIF: return "CIF";
+    case FRAMESIZE_HVGA: return "HVGA";
+    case FRAMESIZE_VGA: return "VGA";
+    case FRAMESIZE_SVGA: return "SVGA";
+    case FRAMESIZE_XGA: return "XGA";
+    case FRAMESIZE_HD: return "HD";
+    case FRAMESIZE_SXGA: return "SXGA";
+    case FRAMESIZE_UXGA: return "UXGA";
+    case FRAMESIZE_FHD: return "FHD";
+    case FRAMESIZE_P_HD: return "P_HD";
+    case FRAMESIZE_P_3MP: return "P_3MP";
+    case FRAMESIZE_QXGA: return "QXGA";
+    case FRAMESIZE_QHD: return "QHD";
+    case FRAMESIZE_WQXGA: return "WQXGA";
+    case FRAMESIZE_P_FHD: return "P_FHD";
+    case FRAMESIZE_QSXGA: return "QSXGA";
+    default: return "UNKNOWN";
+  }
+}
+
+bool parseConfigFramesize(const char *name, int &framesize) {
+  if (name == nullptr) return false;
+  for (int value = static_cast<int>(FRAMESIZE_96X96);
+       value <= static_cast<int>(FRAMESIZE_QSXGA); ++value) {
+    if (strcasecmp(name, configFramesizeName(value)) == 0) {
+      framesize = value;
+      return true;
+    }
+  }
+  return false;
+}
 
 void mountStorage() {
   // One-bit mode avoids conflicts with the AI Thinker ESP32-CAM pins.
@@ -200,6 +334,11 @@ bool isConfigFileHashValid() { return configFileHashValid; }
 
 const String &getConfigFileSha256() { return configFileSha256; }
 
+void invalidateConfigFileHash() {
+  configFileHashValid = false;
+  configFileSha256 = "";
+}
+
 void loadConfig() {
   configFileHashValid = false;
   configFileSha256 = "";
@@ -215,7 +354,7 @@ void loadConfig() {
     return;
   }
 
-  StaticJsonDocument<2048> document;
+  StaticJsonDocument<3072> document;
   const DeserializationError error = deserializeJson(document, file);
   file.close();
 
@@ -269,11 +408,33 @@ void loadConfig() {
     cfg.motionEnabled = false;
     Serial.println("Ignoring motion_enabled=true because motion_owner is pi");
   }
-  if (document.containsKey("jpeg_quality")) {
-    cfg.jpegQuality = document["jpeg_quality"];
+  JsonObjectConst sensors = document["sensors"].as<JsonObjectConst>();
+  if (!sensors.isNull()) {
+    if (sensors.containsKey("0x2642")) {
+      loadSensorProfile(sensors["0x2642"], cfg.ov2640, kOv2640SensorKey);
+    }
+    if (sensors.containsKey("0x5640")) {
+      loadSensorProfile(sensors["0x5640"], cfg.ov5640, kOv5640SensorKey);
+    }
   }
-  if (document.containsKey("framesize")) {
-    cfg.framesize = document["framesize"];
+  if (sensors.isNull() && document.containsKey("jpeg_quality")) {
+    const int legacyQuality = document["jpeg_quality"];
+    if (legacyQuality >= 0 && legacyQuality <= 63) {
+      cfg.ov2640.jpegQuality = legacyQuality;
+      cfg.ov5640.jpegQuality = legacyQuality;
+    } else {
+      Serial.println("Ignoring invalid legacy jpeg_quality");
+    }
+  }
+  if (sensors.isNull() && document.containsKey("framesize")) {
+    const int legacyFramesize = document["framesize"];
+    if (legacyFramesize >= static_cast<int>(FRAMESIZE_QQVGA) &&
+        legacyFramesize <= cameraSensorMaximumFramesize(kOv2640SensorKey)) {
+      cfg.ov2640.framesize = legacyFramesize;
+      cfg.ov5640.framesize = legacyFramesize;
+    } else {
+      Serial.println("Ignoring invalid legacy framesize");
+    }
   }
   if (document.containsKey("server_ip")) {
     strlcpy(cfg.serverIp, document["server_ip"] | cfg.serverIp, sizeof(cfg.serverIp));
@@ -284,7 +445,10 @@ void loadConfig() {
   if (document.containsKey("save_birds_to_sd")) {
     cfg.saveBirdsToSd = document["save_birds_to_sd"];
   }
-  if (document.containsKey("bird_confidence_threshold")) {
+  JsonObjectConst pipeline = document["pipeline"].as<JsonObjectConst>();
+  if (!pipeline.isNull() && pipeline.containsKey("bird_confidence_threshold")) {
+    cfg.birdConfidenceThreshold = pipeline["bird_confidence_threshold"];
+  } else if (document.containsKey("bird_confidence_threshold")) {
     cfg.birdConfidenceThreshold = document["bird_confidence_threshold"];
   }
   if (document.containsKey("wait_for_classification")) {
@@ -361,6 +525,7 @@ void loadConfig() {
         constrain(document["motion_max_changed_fraction"].as<float>(), 0.0f, 1.0f);
   }
   sanitizeMotionConfig();
+  if (activeCameraSensorKey != 0) selectCameraSensorProfile(activeCameraSensorKey);
 
   Serial.printf("Config loaded from %s:\n", configStorageName);
   Serial.printf("  wifi_ssid:          %s\n", cfg.wifiSsid[0] == '\0' ? "(not configured)" : cfg.wifiSsid);
@@ -370,8 +535,12 @@ void loadConfig() {
   Serial.printf("  motion_threshold:   %d\n", cfg.motionThreshold);
   Serial.printf("  motion_sensitivity: %.2f\n", cfg.motionSensitivity);
   Serial.printf("  motion_check_ms:    %d\n", cfg.motionCheckMs);
-  Serial.printf("  jpeg_quality:       %d\n", cfg.jpegQuality);
-  Serial.printf("  framesize:          %d\n", cfg.framesize);
+  Serial.printf("  OV2640 profile:      %s, quality %d, xclk %d Hz\n",
+                configFramesizeName(cfg.ov2640.framesize), cfg.ov2640.jpegQuality,
+                cfg.ov2640.xclkHz);
+  Serial.printf("  OV5640 profile:      %s, quality %d, xclk %d Hz\n",
+                configFramesizeName(cfg.ov5640.framesize), cfg.ov5640.jpegQuality,
+                cfg.ov5640.xclkHz);
   Serial.printf("  server_ip:          %s\n", cfg.serverIp);
   Serial.printf("  server_port:        %d\n", cfg.serverPort);
   Serial.printf("  save_birds_to_sd:   %s\n", cfg.saveBirdsToSd ? "true" : "false");
@@ -400,7 +569,7 @@ void saveConfig() {
     return;
   }
 
-  StaticJsonDocument<2048> document;
+  StaticJsonDocument<3072> document;
   document["wifi_ssid"] = cfg.wifiSsid;
   document["wifi_password"] = cfg.wifiPassword;
   document["motion_threshold"] = cfg.motionThreshold;
@@ -408,12 +577,14 @@ void saveConfig() {
   document["motion_check_ms"] = cfg.motionCheckMs;
   document["motion_enabled"] = cfg.motionEnabled;
   document["motion_owner"] = motionOwnerName(cfg.motionOwner);
-  document["jpeg_quality"] = cfg.jpegQuality;
-  document["framesize"] = cfg.framesize;
+  JsonObject sensors = document["sensors"].to<JsonObject>();
+  writeSensorProfile(sensors["0x2642"].to<JsonObject>(), cfg.ov2640);
+  writeSensorProfile(sensors["0x5640"].to<JsonObject>(), cfg.ov5640);
   document["server_ip"] = cfg.serverIp;
   document["server_port"] = cfg.serverPort;
   document["save_birds_to_sd"] = cfg.saveBirdsToSd;
-  document["bird_confidence_threshold"] = cfg.birdConfidenceThreshold;
+  JsonObject pipeline = document["pipeline"].to<JsonObject>();
+  pipeline["bird_confidence_threshold"] = cfg.birdConfidenceThreshold;
   document["wait_for_classification"] = cfg.waitForClassification;
   document["burst_count"] = cfg.burstCount;
   document["burst_interval_ms"] = cfg.burstIntervalMs;

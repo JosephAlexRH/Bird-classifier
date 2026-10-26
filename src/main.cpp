@@ -101,6 +101,13 @@ void loop() {
     lastConfigCheck = now;
     const Config previousConfig = cfg;
     loadConfig();
+    const bool framesizeChanged = cfg.framesize != previousConfig.framesize;
+    if (framesizeChanged && !applyCameraProfile()) {
+      Serial.println("Could not apply reloaded camera frame size; restoring previous config");
+      cfg = previousConfig;
+      selectCameraSensorProfile(getActiveCameraSensorKey());
+      invalidateConfigFileHash();
+    }
     const bool wifiSettingsChanged = strcmp(cfg.wifiSsid, previousConfig.wifiSsid) != 0 ||
                                      strcmp(cfg.wifiPassword, previousConfig.wifiPassword) != 0;
     if (wifiSettingsChanged) {
@@ -140,9 +147,19 @@ void loop() {
     }
     const bool captureSettingsChanged =
         cfg.jpegQuality != previousConfig.jpegQuality || cfg.framesize != previousConfig.framesize;
+    const CameraSensorProfile *activeProfile = getCameraSensorProfile(getActiveCameraSensorKey());
+    const CameraSensorProfile *previousActiveProfile =
+        getActiveCameraSensorKey() == kOv2640SensorKey ? &previousConfig.ov2640
+                                                      : &previousConfig.ov5640;
+    if (activeProfile != nullptr && previousActiveProfile != nullptr &&
+        activeProfile->xclkHz != previousActiveProfile->xclkHz) {
+      Serial.println("Camera XCLK configuration changed; restart required to apply it");
+    }
     if (captureSettingsChanged) {
       markRegisterDumpPending();
-      if (getCameraOperatingMode() == CameraOperatingMode::Idle) applyCameraSettings();
+      if (!framesizeChanged && getCameraOperatingMode() == CameraOperatingMode::Idle) {
+        applyCameraSettings();
+      }
     }
   }
 }

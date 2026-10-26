@@ -60,7 +60,8 @@ def parse_camera_metadata(value: str | None) -> tuple[dict[str, Any] | None, str
         return None, f"Camera metadata was invalid JSON: {error}"
     if not isinstance(metadata, dict):
         return None, "Camera metadata must be a JSON object."
-    dump = ((metadata.get("camera") or {}).get("register_dump") or {})
+    camera = metadata.get("camera")
+    dump = camera.get("register_dump") if isinstance(camera, dict) else {}
     if isinstance(dump, dict) and dump.get("payload_included"):
         encoded = dump.get("payload_base64")
         expected_hash = dump.get("sha256")
@@ -74,6 +75,29 @@ def parse_camera_metadata(value: str | None) -> tuple[dict[str, Any] | None, str
         if actual_hash != expected_hash.lower():
             return metadata, "Camera register dump SHA-256 did not match its decoded payload."
     return metadata, None
+
+
+def camera_model_from_metadata(metadata: dict[str, Any] | None) -> str | None:
+    """Return the acquisition sensor model without guessing for legacy records."""
+    if not isinstance(metadata, dict):
+        return None
+    camera = metadata.get("camera")
+    sensor = camera.get("sensor") if isinstance(camera, dict) else None
+    model = sensor.get("model") if isinstance(sensor, dict) else None
+    if not isinstance(model, str) or not model.strip():
+        return None
+    return model.strip()
+
+
+def camera_id_from_metadata(metadata: dict[str, Any] | None) -> str | None:
+    """Return the stable ESP32 hardware identity when firmware supplied it."""
+    if not isinstance(metadata, dict):
+        return None
+    device = metadata.get("device")
+    camera_id = device.get("camera_id") if isinstance(device, dict) else None
+    if not isinstance(camera_id, str) or not camera_id.strip():
+        return None
+    return camera_id.strip()
 
 
 def _frame_utc_estimate(metadata: dict[str, Any]) -> str | None:
@@ -117,6 +141,8 @@ def _flatten_camera_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
     if metadata is None:
         return {
             "firmware_metadata_schema_version": None,
+            "camera_id": None,
+            "camera_model": None,
             "device": None,
             "camera": None,
         }
@@ -131,6 +157,8 @@ def _flatten_camera_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
         timing["frame_utc_estimate"] = _frame_utc_estimate(metadata)
     return {
         "firmware_metadata_schema_version": metadata.get("schema_version"),
+        "camera_id": camera_id_from_metadata(metadata),
+        "camera_model": camera_model_from_metadata(metadata),
         "device": device,
         "camera": camera,
     }

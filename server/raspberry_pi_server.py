@@ -28,6 +28,7 @@ try:
         read_inference_record,
         write_inference_record,
     )
+    from .camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
     from .capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from .laptop_test_server import camera_url_argument, normalize_camera_url
     from .pi_motion import MotionService
@@ -45,6 +46,7 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
         read_inference_record,
         write_inference_record,
     )
+    from camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
     from capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from laptop_test_server import camera_url_argument, normalize_camera_url
     from pi_motion import MotionService
@@ -128,9 +130,52 @@ PI_DASHBOARD_HTML = r"""
       <img id="latest-image" src="/latest.jpg" alt="No image has been uploaded yet">
       <pre id="inference">Waiting for a classified upload.</pre>
     </section>
+    <section>
+      <h2>Camera fleet</h2>
+      <p class="muted">Add cameras by IP address. Enabled cameras receive an independent Pi motion worker.</p>
+      <input id="fleet-name" placeholder="Camera name (optional)">
+      <input id="fleet-address" placeholder="192.168.1.84">
+      <button onclick="addFleetCamera()">Add camera</button>
+      <button onclick="loadFleet()">Refresh cameras</button>
+      <div id="fleet-list" class="muted">Loading cameras...</div>
+    </section>
   </main>
   <script>
     const result = document.getElementById('result');
+    function fleetSummary(camera) {
+      const sensor = camera.sensor?.model || camera.status?.camera_sensor_model || 'unknown sensor';
+      const service = camera.motion_service || {running: false};
+      return `<p><strong>${camera.name}</strong>${camera.default ? ' (default)' : ''}<br>${camera.url}<br>` +
+        `${sensor} | ${camera.reachable === true ? 'reachable' : camera.reachable === false ? 'offline' : 'not checked'} | ` +
+        `motion ${service.running ? 'running' : 'stopped'}<br>` +
+        `<button onclick="updateFleetCamera('${camera.id}', {default:true})">Set default</button> ` +
+        `<button onclick="updateFleetCamera('${camera.id}', {enabled:${!camera.enabled}})">${camera.enabled ? 'Disable' : 'Enable'}</button> ` +
+        `<button onclick="pollFleetCamera('${camera.id}')">Poll</button> ` +
+        `<button onclick="removeFleetCamera('${camera.id}')">Remove</button></p>`;
+    }
+    async function loadFleet() {
+      const response = await fetch('/api/cameras', {cache:'no-store'});
+      const payload = await response.json();
+      document.getElementById('fleet-list').innerHTML = payload.cameras.length
+        ? payload.cameras.map(fleetSummary).join('') : 'No cameras registered.';
+    }
+    async function addFleetCamera() {
+      const address = document.getElementById('fleet-address').value.trim();
+      const name = document.getElementById('fleet-name').value.trim() || null;
+      const response = await fetch('/api/cameras', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address,name})});
+      const payload = await response.json();
+      if (!response.ok) { showCameraResult(payload.error || 'Could not add camera.', true); return; }
+      document.getElementById('fleet-address').value = '';
+      await loadFleet();
+    }
+    async function updateFleetCamera(id, values) {
+      const response = await fetch(`/api/cameras/${id}`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
+      const payload = await response.json();
+      if (!response.ok) showCameraResult(payload.error || 'Could not update camera.', true);
+      await loadFleet();
+    }
+    async function pollFleetCamera(id) { await fetch(`/api/cameras/${id}/poll`, {method:'POST'}); await loadFleet(); }
+    async function removeFleetCamera(id) { await fetch(`/api/cameras/${id}`, {method:'DELETE'}); await loadFleet(); }
     window.showCameraResult = (text, failed = false) => {
       result.className = failed ? 'error' : 'ok';
       try { result.textContent = JSON.stringify(JSON.parse(text), null, 2); }
@@ -171,6 +216,7 @@ PI_DASHBOARD_HTML = r"""
         document.getElementById('inference').textContent = String(error);
       }
     }
+    loadFleet();
     refreshInference();
     setInterval(refreshInference, 3000);
   </script>
@@ -250,13 +296,33 @@ def create_app(
     motion_poll_seconds: float = DEFAULT_MOTION_POLL_SECONDS,
     motion_timeout_seconds: float = DEFAULT_MOTION_TIMEOUT_SECONDS,
     motion_service_factory: Callable[..., Any] = MotionService,
+    registry_file: Path | None = None,
+    camera_registry: CameraRegistry | None = None,
+    start_registry_poller: bool = False,
+    manage_motion_services: bool | None = None,
 ) -> Flask:
     """Create the receiver/classifier app, with optional ESP32 camera controls."""
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_JPEG_BYTES
     store = CaptureStore(save_dir)
     camera_url = normalize_camera_url(camera_url)
-    camera_lock = threading.Lock()
+    registry = camera_registry or CameraRegistry(
+        registry_file or (store.root / "cameras.json"),
+        timeout_seconds=motion_timeout_seconds,
+        opener=lambda *args, **kwargs: urlopen(*args, **kwargs),
+    )
+    if camera_url:
+        matching = next((camera for camera in registry.snapshot() if camera["url"] == camera_url), None)
+        if matching is None:
+            registry.add("Default camera", camera_url, make_default=True)
+        else:
+            registry.update(matching["id"], default=True)
+    if start_registry_poller:
+        registry.start()
+    app.config["CAMERA_REGISTRY"] = registry
+    default_camera = registry.resolve()
+    if camera_url is None and default_camera is not None:
+        camera_url = default_camera["url"]
     inference_lock = threading.Lock()
     state_lock = threading.Lock()
     existing = sorted(store.root.glob("*.jpg"), key=lambda path: path.stat().st_mtime)
@@ -269,7 +335,32 @@ def create_app(
     pending: queue.Queue[Path] = queue.Queue()
     app.config["CLASSIFICATION_QUEUE"] = pending
     app.config["MOTION_SERVICE"] = None
-    app.config["CLEANUP"] = lambda: None
+    app.config["MOTION_SERVICES"] = {}
+    app.config["CLEANUP"] = registry.stop
+
+    def camera_provenance(destination: Path) -> dict[str, Any]:
+        sidecar_path = destination.with_suffix(".json")
+        sidecar: dict[str, Any] = {}
+        try:
+            value = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                sidecar = value
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+        device = sidecar.get("device") if isinstance(sidecar.get("device"), dict) else {}
+        camera = sidecar.get("camera") if isinstance(sidecar.get("camera"), dict) else {}
+        sensor = camera.get("sensor") if isinstance(camera.get("sensor"), dict) else {}
+        return {
+            "model": sidecar.get("camera_model"),
+            "model_source": "capture_sidecar.camera.sensor.model",
+            "sensor_pid": sensor.get("pid"),
+            "sensor_pid_hex": sensor.get("pid_hex"),
+            "camera_id": sidecar.get("camera_id") or device.get("camera_id"),
+            "capture_sidecar": sidecar_path.name,
+            "capture_sidecar_sha256": (
+                hashlib.sha256(sidecar_path.read_bytes()).hexdigest() if sidecar_path.is_file() else None
+            ),
+        }
 
     def failed_record(destination: Path, error: str) -> dict[str, Any]:
         return {
@@ -281,6 +372,7 @@ def create_app(
                 "filename": destination.name,
                 "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
             },
+            "camera_provenance": camera_provenance(destination),
             "error": error,
         }
 
@@ -326,6 +418,7 @@ def create_app(
                         motion["static_roi"]["capture_sidecar_sha256"] = hashlib.sha256(
                             sidecar_path.read_bytes()
                         ).hexdigest()
+                        motion["camera_provenance"] = camera_provenance(destination)
                         store.save_derived_record(destination, "motion", motion)
                     kwargs = {
                         "selected_crop": {key: bounds[key] for key in ("left", "top", "right", "bottom")},
@@ -334,6 +427,7 @@ def create_app(
                 with inference_lock:
                     inference = inference_engine.infer(destination, **kwargs)
                 inference["capture_id"] = destination.stem
+                inference["camera_provenance"] = camera_provenance(destination)
                 classification, error = validate_classification(inference.get("classification"))
             else:
                 classification, error = validate_classification(classify(destination))
@@ -346,6 +440,7 @@ def create_app(
                         "filename": destination.name,
                         "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
                     },
+                    "camera_provenance": camera_provenance(destination),
                     "classification": classification,
                     "error": error,
                 }
@@ -380,37 +475,89 @@ def create_app(
 
     threading.Thread(target=classification_worker, name="classifier", daemon=True).start()
 
-    motion_service = None
-    if start_motion_service:
-        if not camera_url or inference_engine is None:
-            raise ValueError("Pi motion polling requires both camera_url and inference_engine.")
-        def motion_persisted(
-            destination: Path,
-            capture: dict[str, Any],
-            inference: dict[str, Any],
-        ) -> None:
-            classification, _ = validate_classification(inference.get("classification"))
-            with state_lock:
-                latest.update(
-                    path=destination,
-                    received_at=capture.get("received_at"),
-                    classification=classification,
-                    inference=inference,
-                )
+    motion_services: dict[str, Any] = {}
+    motion_management_enabled = (
+        start_motion_service if manage_motion_services is None else manage_motion_services
+    )
 
-        motion_service = motion_service_factory(
-            camera_url,
+    def motion_persisted(
+        destination: Path,
+        capture: dict[str, Any],
+        inference: dict[str, Any],
+    ) -> None:
+        classification, _ = validate_classification(inference.get("classification"))
+        with state_lock:
+            latest.update(
+                path=destination,
+                received_at=capture.get("received_at"),
+                classification=classification,
+                inference=inference,
+            )
+
+    def start_camera_motion(camera: dict[str, Any]) -> Any:
+        existing_service = motion_services.get(camera["id"])
+        if existing_service is not None:
+            expected = getattr(existing_service, "expected_camera_id", camera.get("hardware_camera_id"))
+            if expected == camera.get("hardware_camera_id"):
+                if hasattr(existing_service, "camera_name"):
+                    existing_service.camera_name = camera["name"]
+                return existing_service
+            stop_camera_motion(camera["id"])
+        if inference_engine is None:
+            raise ValueError("Pi motion polling requires both camera_url and inference_engine.")
+        operation_lock = registry.operation_lock(camera["id"])
+        assert operation_lock is not None
+        service = motion_service_factory(
+            camera["url"],
             store,
             inference_engine,
             poll_seconds=motion_poll_seconds,
             timeout_seconds=motion_timeout_seconds,
-            camera_lock=camera_lock,
+            camera_lock=operation_lock,
             inference_lock=inference_lock,
             on_persist=motion_persisted,
+            expected_camera_id=camera.get("hardware_camera_id"),
+            camera_registry_id=camera["id"],
+            camera_name=camera["name"],
         )
-        motion_service.start()
-        app.config["MOTION_SERVICE"] = motion_service
-        app.config["CLEANUP"] = motion_service.stop
+        service.start()
+        motion_services[camera["id"]] = service
+        return service
+
+    def stop_camera_motion(camera_id: str) -> None:
+        service = motion_services.pop(camera_id, None)
+        if service is not None:
+            service.stop()
+
+    def sync_motion_services() -> None:
+        cameras = {camera["id"]: camera for camera in registry.snapshot()}
+        for camera_id in list(motion_services):
+            camera = cameras.get(camera_id)
+            if camera is None or not camera["enabled"]:
+                stop_camera_motion(camera_id)
+        if motion_management_enabled:
+            for camera in cameras.values():
+                if camera["enabled"]:
+                    start_camera_motion(camera)
+        selected = registry.resolve()
+        app.config["MOTION_SERVICE"] = (
+            motion_services.get(selected["id"]) if selected is not None else None
+        )
+        app.config["MOTION_SERVICES"] = motion_services
+
+    def cleanup() -> None:
+        for camera_id in list(motion_services):
+            stop_camera_motion(camera_id)
+        registry.stop()
+
+    if start_motion_service:
+        if not registry.snapshot() or inference_engine is None:
+            raise ValueError("Pi motion polling requires both camera_url and inference_engine.")
+    if motion_management_enabled and inference_engine is None:
+        raise ValueError("Pi motion polling requires both camera_url and inference_engine.")
+    if motion_management_enabled:
+        sync_motion_services()
+    app.config["CLEANUP"] = cleanup
 
     # A process restart must not strand accepted captures whose in-memory queue was lost.
     if inference_engine is not None:
@@ -418,15 +565,28 @@ def create_app(
             if not inference_path(destination).exists():
                 pending.put(destination)
 
-    def camera_proxy(endpoint: str, method: str = "GET", payload: dict[str, Any] | None = None):
-        if not camera_url:
-            return jsonify(error="Camera URL is not configured. Start the server with --camera-url."), 503
+    def camera_proxy(
+        endpoint: str,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+        camera_id: str | None = None,
+    ):
+        camera = registry.resolve(camera_id)
+        if camera is None:
+            if camera_id:
+                return jsonify(error="Camera not found."), 404
+            status = 409 if registry.snapshot() else 503
+            return jsonify(error="No default camera is configured."), status
+        if not camera["enabled"]:
+            return jsonify(error="Camera is disabled."), 503
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = {"Content-Type": "application/json"} if body is not None else {}
         outgoing = Request(
-            f"{camera_url}/{endpoint.lstrip('/')}", data=body, headers=headers, method=method
+            f"{camera['url']}/{endpoint.lstrip('/')}", data=body, headers=headers, method=method
         )
-        if not camera_lock.acquire(blocking=False):
+        operation_lock = registry.operation_lock(camera["id"])
+        assert operation_lock is not None
+        if not operation_lock.acquire(blocking=False):
             return jsonify(error="Camera is busy. Try again after the current request finishes."), 409
         try:
             with urlopen(outgoing, timeout=PROXY_TIMEOUT_SECONDS) as upstream:
@@ -448,12 +608,15 @@ def create_app(
         except (URLError, TimeoutError, OSError, ValueError) as error:
             return jsonify(error=f"Camera request to {outgoing.full_url} failed: {error}"), 502
         finally:
-            camera_lock.release()
+            operation_lock.release()
 
     @app.get("/")
     def dashboard() -> str:
+        selected = registry.resolve()
         return render_template_string(
-            PI_DASHBOARD_HTML, camera_url=camera_url, roi_control_js=ROI_CONTROL_JS
+            PI_DASHBOARD_HTML,
+            camera_url=(selected or {}).get("url", camera_url),
+            roi_control_js=ROI_CONTROL_JS,
         )
 
     @app.get("/camera/capture")
@@ -482,6 +645,94 @@ def create_app(
             return jsonify(error="mode must be either motion or idle"), 422
         return camera_proxy("mode", "POST", payload)
 
+    @app.get("/api/cameras")
+    def cameras() -> Response:
+        values = registry.snapshot()
+        for camera in values:
+            service = motion_services.get(camera["id"])
+            camera["motion_service"] = service.describe() if service is not None else {"running": False}
+        return jsonify(cameras=values)
+
+    @app.post("/api/cameras")
+    def add_camera() -> tuple[Response, int] | Response:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(error="Expected a valid JSON object."), 400
+        try:
+            camera = registry.add(
+                payload.get("name"),
+                normalize_camera_address(payload.get("address", payload.get("url"))),
+                enabled=payload.get("enabled", True),
+                make_default=payload.get("default"),
+            )
+        except ValueError as error:
+            return jsonify(error=str(error)), 422
+        discovered = registry.poll(camera["id"])
+        duplicate_error = ((discovered or {}).get("errors") or {}).get("metadata")
+        if duplicate_error:
+            registry.remove(camera["id"])
+            return jsonify(error=duplicate_error), 409
+        try:
+            sync_motion_services()
+        except ValueError as error:
+            return jsonify(error=str(error), camera=registry.get(camera["id"])), 409
+        return jsonify(camera=registry.get(camera["id"])), 201
+
+    @app.patch("/api/cameras/<camera_id>")
+    def update_camera(camera_id: str) -> tuple[Response, int] | Response:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(error="Expected a valid JSON object."), 400
+        try:
+            camera = registry.update(camera_id, **payload)
+        except ValueError as error:
+            return jsonify(error=str(error)), 422
+        if camera is None:
+            return jsonify(error="Camera not found."), 404
+        sync_motion_services()
+        return jsonify(camera=camera)
+
+    @app.delete("/api/cameras/<camera_id>")
+    def delete_camera(camera_id: str) -> tuple[Response, int] | Response:
+        stop_camera_motion(camera_id)
+        camera = registry.remove(camera_id)
+        if camera is None:
+            return jsonify(error="Camera not found."), 404
+        sync_motion_services()
+        return jsonify(status="removed", camera=camera)
+
+    @app.post("/api/cameras/<camera_id>/poll")
+    def poll_camera(camera_id: str) -> tuple[Response, int] | Response:
+        camera = registry.poll(camera_id)
+        if camera is None:
+            return jsonify(error="Camera not found."), 404
+        sync_motion_services()
+        return jsonify(camera=camera)
+
+    @app.get("/api/cameras/<camera_id>/capture")
+    def camera_capture_scoped(camera_id: str):
+        return camera_proxy("capture", camera_id=camera_id)
+
+    @app.get("/api/cameras/<camera_id>/<endpoint>")
+    def camera_get_scoped(camera_id: str, endpoint: str):
+        if endpoint not in {"status", "config", "metadata", "motion"}:
+            return jsonify(error="Unsupported camera endpoint."), 404
+        return camera_proxy(endpoint, camera_id=camera_id)
+
+    @app.post("/api/cameras/<camera_id>/config")
+    def camera_config_scoped(camera_id: str):
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(error="Expected a valid JSON object."), 400
+        return camera_proxy("config", "POST", payload, camera_id=camera_id)
+
+    @app.post("/api/cameras/<camera_id>/mode")
+    def camera_mode_scoped(camera_id: str):
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or payload.get("mode") not in {"motion", "idle"}:
+            return jsonify(error="mode must be either motion or idle"), 422
+        return camera_proxy("mode", "POST", payload, camera_id=camera_id)
+
     @app.post("/upload")
     def upload() -> tuple[Response, int] | Response:
         image = request.get_data(cache=False)
@@ -491,6 +742,9 @@ def create_app(
             return jsonify(error="Request body is not a complete JPEG image."), 415
 
         camera_metadata, metadata_error = parse_camera_metadata(request.headers.get(METADATA_HEADER))
+        device = (camera_metadata or {}).get("device")
+        hardware_camera_id = device.get("camera_id") if isinstance(device, dict) else None
+        registered = registry.get_by_hardware_id(hardware_camera_id)
         classification: dict[str, Any] | None = None
         classification_error: str | None = None
         # Save first so classification always receives a durable image path.
@@ -499,6 +753,10 @@ def create_app(
             source=(camera_metadata or {}).get("source", "motion"),
             camera_metadata=camera_metadata,
             metadata_error=metadata_error,
+            extra={
+                "camera_registry_id": registered.get("id") if registered else None,
+                "camera_name": registered.get("name") if registered else None,
+            },
         )
         destination = store.root / record["filename"]
         deferred = request.headers.get(CLASSIFICATION_HEADER, "").strip().lower() == "deferred"
@@ -511,7 +769,11 @@ def create_app(
                     inference=None,
                 )
             pending.put(destination)
-            print(f"Saved (classification queued): {destination}", flush=True)
+            print(
+                f"Saved (classification queued, camera={record.get('camera_model') or 'unknown'}): "
+                f"{destination}",
+                flush=True,
+            )
             return (
                 jsonify(
                     status="queued",
@@ -534,7 +796,7 @@ def create_app(
                 inference=inference,
             )
 
-        print(f"Saved: {destination}", flush=True)
+        print(f"Saved (camera={record.get('camera_model') or 'unknown'}): {destination}", flush=True)
         return jsonify(
             status="ok",
             classification=classification,
@@ -572,6 +834,10 @@ def create_app(
             "filename": path.name,
             "received_at": sidecar.get("received_at"),
             "source": sidecar.get("source"),
+            "camera_id": sidecar.get("camera_id"),
+            "camera_registry_id": sidecar.get("camera_registry_id"),
+            "camera_name": sidecar.get("camera_name"),
+            "camera_model": sidecar.get("camera_model"),
             "bytes": path.stat().st_size,
             "sha256": sidecar.get("sha256"),
             "inference_status": (inference or {}).get("status", "pending"),
@@ -591,11 +857,26 @@ def create_app(
     @app.get("/api/captures")
     def captures() -> Response:
         after = request.args.get("after", "")
+        camera_id = request.args.get("camera_id")
+        camera_registry_id = request.args.get("camera_registry_id")
         try:
             limit = max(1, min(200, int(request.args.get("limit", "50"))))
         except ValueError:
             return jsonify(error="limit must be an integer"), 400
         paths = sorted(store.root.glob("capture_*.jpg"), key=lambda item: item.name)
+        if camera_id or camera_registry_id:
+            filtered: list[Path] = []
+            for path in paths:
+                try:
+                    sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if camera_id and sidecar.get("camera_id") != camera_id:
+                    continue
+                if camera_registry_id and sidecar.get("camera_registry_id") != camera_registry_id:
+                    continue
+                filtered.append(path)
+            paths = filtered
         if after:
             paths = [path for path in paths if path.stem > after]
         selected = paths[:limit]
@@ -648,17 +929,22 @@ def create_app(
             received_at = latest["received_at"]
             classification = latest["classification"]
             latest_inference = latest["inference"]
+        services = {camera_id: service.describe() for camera_id, service in motion_services.items()}
+        selected = registry.resolve()
+        selected_service = motion_services.get(selected["id"]) if selected is not None else None
         return jsonify(
             status="ok",
             save_dir=str(store.root),
-            camera_url=camera_url,
-            camera_configured=bool(camera_url),
+            camera_url=(selected or {}).get("url", camera_url),
+            camera_configured=bool(registry.snapshot()),
+            cameras=registry.snapshot(),
             latest_image=path.name if path else None,
             received_at=received_at,
             classification=classification,
             latest_inference=latest_inference,
             classification_queue_depth=pending.unfinished_tasks,
-            motion_service=(motion_service.describe() if motion_service is not None else {"running": False}),
+            motion_service=(selected_service.describe() if selected_service is not None else {"running": False}),
+            motion_services=services,
             models=(inference_engine.describe() if inference_engine is not None else {"ready": False}),
         )
 
@@ -675,6 +961,12 @@ def parse_args() -> argparse.Namespace:
         help="ESP32-CAM HTTP(S) base URL, for example http://192.168.1.84",
     )
     parser.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIR, help="Dataset folder")
+    parser.add_argument(
+        "--registry-file",
+        type=Path,
+        default=DEFAULT_REGISTRY_FILE,
+        help=f"Persistent multi-camera registry (default: {DEFAULT_REGISTRY_FILE})",
+    )
     parser.add_argument(
         "--is-bird-model",
         type=Path,
@@ -757,12 +1049,13 @@ if __name__ == "__main__":
         args.camera_url,
         engine,
         start_motion_service=bool(args.camera_url),
+        manage_motion_services=True,
         motion_poll_seconds=args.motion_poll_seconds,
         motion_timeout_seconds=args.motion_timeout_seconds,
+        registry_file=args.registry_file,
+        start_registry_poller=True,
     )
     try:
         application.run(host=args.host, port=args.port, debug=False, threaded=True)
     finally:
-        motion_service = application.config.get("MOTION_SERVICE")
-        if motion_service is not None:
-            motion_service.stop()
+        application.config["CLEANUP"]()

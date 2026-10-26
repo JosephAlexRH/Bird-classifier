@@ -21,6 +21,7 @@ from server.capture_storage import (
     calibration_type_values,
     parse_calibration_type,
 )
+from server.camera_registry import CameraRegistry
 from server.laptop_test_server import (
     create_app as create_laptop_app,
     local_source_ip,
@@ -36,9 +37,9 @@ from server.raspberry_pi_server import (
 
 
 JPEG = b"\xff\xd8test-jpeg-payload\xff\xd9"
-REGISTER_DUMP = b"OVD1"
+REGISTER_DUMP = b"OV5D"
 CAMERA_METADATA = {
-    "schema_version": 4,
+    "schema_version": 5,
     "source": "preview",
     "device": {
         "boot_id": "86b20b95-393c-4e4a-91ab-224e78401484",
@@ -50,6 +51,12 @@ CAMERA_METADATA = {
         "config": {"file_sha256": "a" * 64},
     },
     "camera": {
+        "sensor": {
+            "model": "OV5640",
+            "manufacturer": "OmniVision",
+            "pid": 0x5640,
+            "pid_hex": "0x5640",
+        },
         "requested": {"capture": {"frame_size": {"name": "VGA", "value": 8}}},
         "observed": {
             "capture": {"width": 640, "height": 480, "framebuffer_bytes": len(JPEG)}
@@ -59,7 +66,7 @@ CAMERA_METADATA = {
             "sha256": hashlib.sha256(REGISTER_DUMP).hexdigest(),
             "payload_included": True,
             "encoding": "base64",
-            "payload_base64": "T1ZEMQ==",
+            "payload_base64": "T1Y1RA==",
         },
     },
 }
@@ -179,6 +186,41 @@ class CaptureStorageTests(unittest.TestCase):
             self.assertEqual(saved["firmware_metadata_schema_version"], 5)
             self.assertEqual(saved["camera"]["requested"]["motion"]["roi"], roi)
 
+    def test_ov2640_identity_and_register_dump_provenance_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CaptureStore(Path(temporary))
+            metadata = json.loads(json.dumps(CAMERA_METADATA))
+            metadata["camera"]["sensor"] = {
+                "model": "OV2640",
+                "manufacturer": "OmniVision",
+                "pid": 0x26,
+                "pid_hex": "0x0026",
+                "version_available": True,
+                "version": 0x42,
+                "version_hex": "0x42",
+                "config_key": "0x2642",
+            }
+            metadata["camera"]["register_dump"] = {
+                "format": "ov2640_banked_register_dump_v1",
+                "sha256": hashlib.sha256(b"OVD1").hexdigest(),
+                "payload_included": True,
+                "encoding": "base64",
+                "payload_base64": "T1ZEMQ==",
+            }
+
+            record = store.save_capture(JPEG, source="test", camera_metadata=metadata)
+            saved = json.loads((store.root / record["sidecar"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(record["camera_model"], "OV2640")
+            self.assertEqual(saved["camera"]["sensor"]["pid"], 0x26)
+            self.assertEqual(saved["camera"]["sensor"]["version"], 0x42)
+            self.assertEqual(saved["camera"]["sensor"]["config_key"], "0x2642")
+            self.assertEqual(
+                saved["camera"]["register_dump"]["format"],
+                "ov2640_banked_register_dump_v1",
+            )
+            self.assertIsNone(record["metadata_error"])
+
     def test_capture_roi_reads_only_the_matching_acquisition_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             image_path = Path(temporary) / "capture_one.jpg"
@@ -281,7 +323,8 @@ class LaptopServerTests(unittest.TestCase):
         )
         record = response.get_json()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(record["firmware_metadata_schema_version"], 4)
+        self.assertEqual(record["firmware_metadata_schema_version"], 5)
+        self.assertEqual(record["camera_model"], "OV5640")
         self.assertEqual(record["camera"]["observed"]["capture"]["width"], 640)
         self.assertEqual(
             record["camera"]["timing"]["register_read_boot_us"], 1002500
@@ -318,7 +361,7 @@ class LaptopServerTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         record = response.get_json()
-        self.assertEqual(record["firmware_metadata_schema_version"], 4)
+        self.assertEqual(record["firmware_metadata_schema_version"], 5)
         self.assertIn("SHA-256 did not match", record["metadata_error"])
 
     def test_upload_rejects_empty_and_incomplete_images(self) -> None:
@@ -429,6 +472,47 @@ class LaptopServerTests(unittest.TestCase):
         self.assertIn("Camera state", dashboard)
         self.assertIn("Capture and save", dashboard)
         self.assertIn("Save camera profile", dashboard)
+
+    @patch("server.laptop_test_server.urlopen")
+    def test_camera_can_be_added_by_ip_and_used_through_scoped_routes(self, mocked_urlopen) -> None:
+        responses = iter([
+            FakeUpstream(b'{"camera_id":"esp32cam-001","camera_sensor_model":"OV2640"}'),
+            FakeUpstream(b'{"motion_enabled":false}'),
+            FakeUpstream(b'{"device":{"camera_id":"esp32cam-001"},"camera":{"sensor":{"model":"OV2640"}}}'),
+            FakeUpstream(b'{"runtime_state":"idle"}'),
+        ])
+        mocked_urlopen.side_effect = lambda *_args, **_kwargs: next(responses)
+        added = self.client.post(
+            "/api/cameras",
+            json={"address": "192.168.1.84", "name": "Side feeder"},
+        )
+        self.assertEqual(added.status_code, 201)
+        camera = added.get_json()["camera"]
+        self.assertEqual(camera["url"], "http://192.168.1.84")
+        self.assertEqual(camera["sensor"]["model"], "OV2640")
+        response = self.client.get(f"/api/cameras/{camera['id']}/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_urlopen.call_args.args[0].full_url, "http://192.168.1.84/status")
+        self.assertIn("Camera fleet", self.client.get("/").get_data(as_text=True))
+
+    @patch("server.laptop_test_server.urlopen")
+    def test_busy_camera_does_not_block_another_registered_camera(self, mocked_urlopen) -> None:
+        registry = CameraRegistry(self.save_dir / "independent-cameras.json")
+        first = registry.add("One", "http://one.local")
+        second = registry.add("Two", "http://two.local")
+        app = create_laptop_app(self.save_dir / "independent", camera_registry=registry)
+        app.testing = True
+        mocked_urlopen.return_value = FakeUpstream(b'{"runtime_state":"idle"}')
+        first_lock = registry.operation_lock(first["id"])
+        assert first_lock is not None
+        first_lock.acquire()
+        try:
+            response = app.test_client().get(f"/api/cameras/{second['id']}/status")
+        finally:
+            first_lock.release()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_urlopen.call_args.args[0].full_url, "http://two.local/status")
+        app.config["CLEANUP"]()
 
     @patch("server.laptop_test_server.urlopen")
     def test_mode_control_proxies_valid_json(self, mocked_urlopen) -> None:
@@ -980,6 +1064,75 @@ class RaspberryPiServerTests(unittest.TestCase):
     def test_pi_motion_service_requires_camera_and_engine(self) -> None:
         with self.assertRaisesRegex(ValueError, "camera_url and inference_engine"):
             create_pi_app(self.save_dir / "bad-motion", start_motion_service=True)
+
+    @patch("server.raspberry_pi_server.urlopen")
+    def test_dynamic_camera_lifecycle_starts_and_stops_one_motion_service(self, mocked_urlopen) -> None:
+        mocked_urlopen.side_effect = [
+            FakeUpstream(b'{"camera_id":"esp32cam-dynamic","camera_sensor_model":"OV5640"}'),
+            FakeUpstream(b'{"motion_enabled":false}'),
+            FakeUpstream(b'{"device":{"camera_id":"esp32cam-dynamic"},"camera":{"sensor":{"model":"OV5640"}}}'),
+        ]
+
+        class FakeEngine:
+            def describe(self):
+                return {"ready": True}
+
+        class FakeMotionService:
+            def __init__(self, *args, **kwargs):
+                self.args, self.kwargs, self.started = args, kwargs, False
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                self.started = False
+
+            def describe(self):
+                return {"running": self.started}
+
+        app = create_pi_app(
+            self.save_dir / "dynamic",
+            inference_engine=FakeEngine(),
+            manage_motion_services=True,
+            motion_service_factory=FakeMotionService,
+        )
+        client = app.test_client()
+        added = client.post("/api/cameras", json={"address": "192.168.1.85", "name": "North"})
+        self.assertEqual(added.status_code, 201)
+        camera = added.get_json()["camera"]
+        service = app.config["MOTION_SERVICES"][camera["id"]]
+        self.assertTrue(service.started)
+        self.assertEqual(service.kwargs["expected_camera_id"], "esp32cam-dynamic")
+        self.assertEqual(service.kwargs["camera_name"], "North")
+        disabled = client.patch(f"/api/cameras/{camera['id']}", json={"enabled": False})
+        self.assertEqual(disabled.status_code, 200)
+        self.assertFalse(service.started)
+        self.assertNotIn(camera["id"], app.config["MOTION_SERVICES"])
+        app.config["CLEANUP"]()
+
+    @patch("server.raspberry_pi_server.classify", return_value={"is_bird": False, "confidence": 0.1})
+    def test_upload_is_attributed_and_capture_listing_filters_by_camera(self, _mocked_classify) -> None:
+        registry = CameraRegistry(self.save_dir / "attributed-registry.json")
+        camera = registry.add("Backyard", "http://camera.local")
+        registry.bind_identity(camera["id"], "esp32cam-attributed", {"model": "OV5640"})
+        app = create_pi_app(self.save_dir / "attributed", camera_registry=registry)
+        metadata = json.loads(json.dumps(CAMERA_METADATA))
+        metadata["device"]["camera_id"] = "esp32cam-attributed"
+        response = app.test_client().post(
+            "/upload",
+            data=JPEG,
+            content_type="image/jpeg",
+            headers={METADATA_HEADER: json.dumps(metadata)},
+        )
+        self.assertEqual(response.status_code, 200)
+        record = response.get_json()
+        self.assertEqual(record["camera_registry_id"], camera["id"])
+        self.assertEqual(record["camera_name"], "Backyard")
+        listing = app.test_client().get(
+            f"/api/captures?camera_registry_id={camera['id']}"
+        ).get_json()
+        self.assertEqual([item["capture_id"] for item in listing["captures"]], [record["capture_id"]])
+        app.config["CLEANUP"]()
 
 
 if __name__ == "__main__":

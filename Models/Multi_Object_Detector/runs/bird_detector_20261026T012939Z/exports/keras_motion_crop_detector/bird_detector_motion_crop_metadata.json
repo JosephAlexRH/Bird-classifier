@@ -1,0 +1,96 @@
+{
+  "schema_version": 2,
+  "model": "bird_detector_motion_crop_uint8.tflite",
+  "model_sha256": "6c303820c4ceb88eaaab1cf3b4955a17acd02dfdfc81686ca44bcf66cb94d926",
+  "class_map": {
+    "0": "bird"
+  },
+  "input": {
+    "name": "serving_default_image:0",
+    "shape": [
+      1,
+      288,
+      288,
+      3
+    ],
+    "dtype": "uint8",
+    "quantization": [
+      1.0000003576278687,
+      0
+    ],
+    "color_order": "RGB",
+    "geometry": "selected_crop_then_letterbox",
+    "geometry_location": "outside the model",
+    "crop_source": "capture_motion_record.selection.final_bounds_px",
+    "crop_coordinate_space": "original_decoded_frame_pixels",
+    "crop_bounds_semantics": "half_open_left_top_right_bottom",
+    "crop_is_final": true,
+    "additional_runtime_margin": 0,
+    "letterbox_padding_value": 114,
+    "resize_method": "bilinear",
+    "resize_antialias": true,
+    "numeric_scaling": "[0,255] to [-1,1] inside the model"
+  },
+  "output": {
+    "name": "StatefulPartitionedCall_1:0",
+    "shape": [
+      1,
+      36,
+      36,
+      3,
+      5
+    ],
+    "dtype": "uint8",
+    "quantization": [
+      0.06661028414964676,
+      206
+    ],
+    "order": [
+      "tx",
+      "ty",
+      "tw",
+      "th",
+      "objectness_logit"
+    ],
+    "anchors_normalized_wh": [
+      [
+        0.30197447538375854,
+        0.30662021040916443
+      ],
+      [
+        0.5027866959571838,
+        0.5528455972671509
+      ],
+      [
+        0.831632673740387,
+        0.6747720241546631
+      ]
+    ],
+    "decode": {
+      "dequantize": "real_value = (quantized_value - zero_point) * scale",
+      "center_x": "(sigmoid(tx) * 3 - 1 + grid_x) / grid_width",
+      "center_y": "(sigmoid(ty) * 3 - 1 + grid_y) / grid_height",
+      "width": "anchor_width * exp(clamp(tw, -4, 4))",
+      "height": "anchor_height * exp(clamp(th, -4, 4))",
+      "score": "sigmoid(objectness_logit)"
+    }
+  },
+  "postprocess": {
+    "candidate_score_threshold": 0.01,
+    "deployment_score_threshold": 0.25,
+    "deployment_threshold_source": "ESP32 validation motion-crop recall-first sweep",
+    "nms_iou": 0.45,
+    "max_detections": 5
+  },
+  "operations": [
+    "ADD",
+    "CONV_2D",
+    "DEPTHWISE_CONV_2D",
+    "MUL",
+    "PACK",
+    "QUANTIZE",
+    "RESHAPE",
+    "SHAPE",
+    "STRIDED_SLICE"
+  ]
+}

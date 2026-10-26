@@ -23,10 +23,13 @@ from server.capture_storage import METADATA_HEADER, CaptureStore
 
 JPEG = b"\xff\xd8environment-frame\xff\xd9"
 METADATA = {
-    "schema_version": 4,
+    "schema_version": 5,
     "source": "preview",
     "device": {"clock": {"device_time_utc": None}},
-    "camera": {"timing": {"frame_boot_us": 1000}},
+    "camera": {
+        "sensor": {"model": "OV5640", "pid": 0x5640},
+        "timing": {"frame_boot_us": 1000},
+    },
 }
 
 
@@ -90,6 +93,7 @@ class CameraCaptureJobTests(unittest.TestCase):
 
             self.assertEqual((store.root / record["filename"]).read_bytes(), JPEG)
             self.assertEqual(record["source"], "environment")
+            self.assertEqual(record["camera_model"], "OV5640")
             self.assertEqual(record["collection"]["purpose"], COLLECTION_PURPOSE)
             self.assertEqual(record["collection"]["review_status"], "unreviewed")
             self.assertEqual(record["collection"]["mode"], "one_shot")

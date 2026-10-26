@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "config_fingerprint": "422d7a7d8c0b253cbf5aca7c72916285a2cdea3029a04b524b56d13c0938fa87",
+  "model": "bird_detector_mobilenetv2_uint8.tflite",
+  "model_sha256": "b0d25bc3eecae5910d26bdbf0e5b8175e178500773c14182bd2719649a5c37e4",
+  "class_map": {
+    "0": "bird"
+  },
+  "input": {
+    "name": "serving_default_image:0",
+    "shape": [
+      1,
+      192,
+      192,
+      3
+    ],
+    "dtype": "uint8",
+    "quantization": [
+      1.000000238418579,
+      0
+    ],
+    "color_order": "RGB",
+    "geometry": "letterbox",
+    "pad_value": 114
+  },
+  "output": {
+    "name": "StatefulPartitionedCall_1:0",
+    "shape": [
+      1,
+      12,
+      12,
+      3,
+      5
+    ],
+    "dtype": "uint8",
+    "quantization": [
+      0.058072615414857864,
+      197
+    ],
+    "order": [
+      "tx",
+      "ty",
+      "tw",
+      "th",
+      "objectness_logit"
+    ],
+    "anchors_normalized_wh": [
+      [
+        0.09843751043081284,
+        0.0859375
+      ],
+      [
+        0.16718751192092896,
+        0.16093750298023224
+      ],
+      [
+        0.5680000185966492,
+        0.5375000238418579
+      ]
+    ],
+    "decode": {
+      "dequantize": "real_value = (quantized_value - zero_point) * scale",
+      "center_x": "(sigmoid(tx) + grid_x) / grid_width",
+      "center_y": "(sigmoid(ty) + grid_y) / grid_height",
+      "width": "anchor_width * exp(clamp(tw, -4, 4))",
+      "height": "anchor_height * exp(clamp(th, -4, 4))",
+      "score": "sigmoid(objectness_logit)"
+    }
+  },
+  "postprocess": {
+    "candidate_score_threshold": 0.01,
+    "deployment_score_threshold": 0.37,
+    "deployment_threshold_source": "ESP32 validation recall-first sweep",
+    "nms_iou": 0.45,
+    "max_detections": 25
+  },
+  "operations": [
+    "ADD",
+    "CONV_2D",
+    "DEPTHWISE_CONV_2D",
+    "MUL",
+    "PACK",
+    "QUANTIZE",
+    "RESHAPE",
+    "SHAPE",
+    "STRIDED_SLICE"
+  ]
+}
