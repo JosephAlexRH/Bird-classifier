@@ -229,13 +229,15 @@ are grouped under `camera.requested.pipeline`. The active normalized motion ROI
 is recorded as `{x,y,width,height}` under `camera.requested.motion.roi` for every
 profile, preview, and motion-capture metadata snapshot.
 
-Crop-aware is-bird models declare `roi_crop_then_letterbox` in their inference
-contract. The receiver then expands the ROI by 20% total (10% per side), clips
-and outward-rounds it to pixels, crops the original decoded frame, and only then
-letterboxes it. Missing or mismatched ROI provenance is an inference error, not
-a full-frame fallback. The species model remains whole-frame letterbox. Captures
-made before metadata schema 5 have no recorded ROI and are excluded by the
-crop-aware training notebook rather than assigned the current camera setting.
+The deployed float detector declares `selected_crop_then_letterbox` in its
+`DetectorContract`. The receiver uses the motion selector's exact
+`final_bounds_px` crop with no additional inference margin, letterboxes it to
+224x224 with TensorFlow-compatible antialiased resize and pad value 114, then
+decodes and maps the top box back to full-frame pixels. Missing or mismatched
+crop provenance is an inference error, not a full-frame fallback. The species
+model remains whole-frame letterbox. Captures made before metadata schema 5 have
+no recorded ROI and are excluded by crop-aware training rather than assigned the
+current camera setting.
 
 `GET /monitor-frame` has the same fresh-frame and metadata behavior as
 `GET /capture`, but labels metadata `source` as `pi_motion_poll`. Metadata's

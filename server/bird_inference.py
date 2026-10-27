@@ -24,9 +24,10 @@ except ImportError:  # Pillow fallback: accurate DCT, so pixels differ slightly 
     _simplejpeg = None
 
 
-INFERENCE_SCHEMA_VERSION = 3
+INFERENCE_SCHEMA_VERSION = 4
 DEFAULT_IMAGE_SIZE = 224
 CONTRACT_FILENAME = "inference_contract.json"
+DETECTOR_CONTRACT_FILENAME = "detector_contract.json"
 LETTERBOX_GEOMETRY = "letterbox"
 ROI_CROP_GEOMETRY = "roi_crop_then_letterbox"
 SELECTED_CROP_GEOMETRY = "selected_crop_then_letterbox"
@@ -179,7 +180,11 @@ def tf_resize_with_pad_geometry(height: int, width: int, size: int) -> tuple[int
     return resized_height, resized_width, pad_top, pad_left
 
 
-def letterbox_array(rgb: np.ndarray, image_size: int = DEFAULT_IMAGE_SIZE) -> np.ndarray:
+def letterbox_array(
+    rgb: np.ndarray,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    padding_value: int | float = 0,
+) -> np.ndarray:
     """Letterbox an RGB array exactly as the training notebooks do.
 
     Equivalent to ``clip(tf.image.resize_with_pad(float32(rgb), size, size,
@@ -190,6 +195,11 @@ def letterbox_array(rgb: np.ndarray, image_size: int = DEFAULT_IMAGE_SIZE) -> np
         raise ValueError("image_size must be positive")
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError(f"Expected an HxWx3 RGB array, got shape {rgb.shape}.")
+    if isinstance(padding_value, bool) or not isinstance(padding_value, numbers.Real):
+        raise ValueError("padding_value must be a finite number between 0 and 255.")
+    padding_value = float(padding_value)
+    if not math.isfinite(padding_value) or not 0.0 <= padding_value <= 255.0:
+        raise ValueError("padding_value must be a finite number between 0 and 255.")
     height, width = int(rgb.shape[0]), int(rgb.shape[1])
     resized_height, resized_width, pad_top, pad_left = tf_resize_with_pad_geometry(
         height, width, image_size
@@ -198,7 +208,7 @@ def letterbox_array(rgb: np.ndarray, image_size: int = DEFAULT_IMAGE_SIZE) -> np
     # TensorFlow resizes height first (into an output_h x input_w buffer), then width.
     resized = _resize_axis0(image, resized_height)
     resized = np.swapaxes(_resize_axis0(np.swapaxes(resized, 0, 1), resized_width), 0, 1)
-    canvas = np.zeros((image_size, image_size, 3), dtype=np.float32)
+    canvas = np.full((image_size, image_size, 3), padding_value, dtype=np.float32)
     canvas[pad_top:pad_top + resized_height, pad_left:pad_left + resized_width] = resized
     return np.clip(canvas, 0.0, 255.0)
 
@@ -416,6 +426,433 @@ class TFLiteModel:
         }
 
 
+class DetectorModel:
+    """Validated, thread-safe wrapper for a fixed-shape multi-output detector."""
+
+    def __init__(
+        self,
+        model_path: Path,
+        *,
+        image_size: int,
+        interpreter_factory: Callable[..., Any] | None = None,
+        num_threads: int | None = None,
+    ) -> None:
+        self.path = Path(model_path).expanduser().resolve()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"Detector TFLite model not found: {self.path}")
+        if interpreter_factory is None:
+            interpreter_factory, self.runtime = _interpreter_class()
+        else:
+            self.runtime = "injected"
+        kwargs = {"model_path": str(self.path)}
+        if num_threads is not None:
+            kwargs["num_threads"] = num_threads
+        self.interpreter = interpreter_factory(**kwargs)
+        self.interpreter.allocate_tensors()
+        inputs = self.interpreter.get_input_details()
+        self.outputs = list(self.interpreter.get_output_details())
+        if len(inputs) != 1 or len(self.outputs) != 2:
+            raise ValueError(f"{self.path.name} must have exactly one input and two output tensors.")
+        self.input = inputs[0]
+        expected_input = (1, image_size, image_size, 3)
+        actual_input = tuple(int(value) for value in self.input["shape"])
+        if actual_input != expected_input:
+            raise ValueError(
+                f"{self.path.name} input shape is {actual_input}; expected {expected_input}."
+            )
+        self.image_size = image_size
+        self.sha256 = _sha256(self.path)
+        self._lock = threading.Lock()
+
+    @property
+    def input_quantization(self) -> tuple[float, int]:
+        scale, zero_point = self.input.get("quantization", (0.0, 0))
+        return float(scale), int(zero_point)
+
+    def predict(self, pixels: np.ndarray) -> list[np.ndarray]:
+        expected = (self.image_size, self.image_size, 3)
+        if pixels.shape != expected:
+            raise ValueError(f"Preprocessed detector image shape is {pixels.shape}; expected {expected}.")
+        tensor = _quantize(
+            pixels[np.newaxis, ...].astype(np.float32),
+            self.input["dtype"],
+            tuple(self.input.get("quantization", (0.0, 0))),
+        )
+        with self._lock:
+            self.interpreter.set_tensor(self.input["index"], tensor)
+            self.interpreter.invoke()
+            raw_outputs = [
+                np.asarray(self.interpreter.get_tensor(detail["index"])) for detail in self.outputs
+            ]
+        values = [
+            _dequantize(raw, tuple(detail.get("quantization", (0.0, 0))))
+            for raw, detail in zip(raw_outputs, self.outputs)
+        ]
+        if any(not np.all(np.isfinite(output)) for output in values):
+            raise ValueError(f"{self.path.name} returned invalid detector output values.")
+        return values
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "filename": self.path.name,
+            "path": str(self.path),
+            "sha256": self.sha256,
+            "runtime": self.runtime,
+            "input_dtype": np.dtype(self.input["dtype"]).name,
+            "input_quantization": list(self.input_quantization),
+            "image_size": self.image_size,
+            "outputs": [
+                {
+                    "name": detail.get("name"),
+                    "shape": [int(value) for value in detail["shape"]],
+                    "dtype": np.dtype(detail["dtype"]).name,
+                    "quantization": [
+                        float(detail.get("quantization", (0.0, 0))[0]),
+                        int(detail.get("quantization", (0.0, 0))[1]),
+                    ],
+                }
+                for detail in self.outputs
+            ],
+        }
+
+
+class DetectorContract:
+    """Float detector metadata validated against model tensors and decoder anchors."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path).expanduser().resolve()
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"{self.path} must contain a JSON object.")
+        self.data = data
+        self.sha256 = _sha256(self.path)
+        problems: list[str] = []
+        input_data = data.get("input")
+        outputs = data.get("outputs")
+        postprocess = data.get("postprocess")
+        decode = data.get("decode")
+        if not isinstance(input_data, dict):
+            problems.append("missing input object")
+            input_data = {}
+        if not isinstance(outputs, dict):
+            problems.append("missing outputs object")
+            outputs = {}
+        if not isinstance(postprocess, dict):
+            problems.append("missing postprocess object")
+            postprocess = {}
+        if not isinstance(decode, dict):
+            problems.append("missing decode object")
+            decode = {}
+
+        required_input = {
+            "dtype": "float32",
+            "color_order": "RGB",
+            "geometry": SELECTED_CROP_GEOMETRY,
+            "geometry_location": "outside the model",
+            "crop_source": SELECTED_CROP_SOURCE,
+            "crop_coordinate_space": "original_decoded_frame_pixels",
+            "crop_bounds_semantics": "half_open_left_top_right_bottom",
+            "crop_is_final": True,
+            "additional_runtime_margin": 0,
+            "letterbox_padding_value": 114,
+            "resize_method": "bilinear",
+            "resize_antialias": True,
+        }
+        for key, expected in required_input.items():
+            if input_data.get(key) != expected:
+                problems.append(f"input.{key}={input_data.get(key)!r} (receiver requires {expected!r})")
+        if "inside the model" not in str(input_data.get("numeric_scaling", "")):
+            problems.append("input.numeric_scaling must state that scaling is inside the model")
+        shape = input_data.get("shape")
+        if not (
+            isinstance(shape, list)
+            and len(shape) == 4
+            and shape[0] == 1
+            and shape[1] == shape[2]
+            and shape[3] == 3
+        ):
+            problems.append(f"input.shape={shape!r} is not [1, size, size, 3]")
+            self.image_size = DEFAULT_IMAGE_SIZE
+        else:
+            self.image_size = int(shape[1])
+
+        expected_decode = {
+            "center_x": "(sigmoid(tx) * 3 - 1 + grid_x) / grid_width",
+            "center_y": "(sigmoid(ty) * 3 - 1 + grid_y) / grid_height",
+            "width": "anchor_width * exp(clamp(tw, -4, 4))",
+            "height": "anchor_height * exp(clamp(th, -4, 4))",
+            "score": "sigmoid(bird_score_logit)",
+        }
+        for key, expected in expected_decode.items():
+            if decode.get(key) != expected:
+                problems.append(f"decode.{key}={decode.get(key)!r} (receiver requires {expected!r})")
+
+        self.geometry = SELECTED_CROP_GEOMETRY
+        self.crop_source = SELECTED_CROP_SOURCE
+        self.padding_value = 114
+        self.threshold = float(postprocess.get("deployment_score_threshold", -1))
+        self.candidate_threshold = float(postprocess.get("candidate_score_threshold", -1))
+        self.nms_iou = float(postprocess.get("nms_iou", -1))
+        self.max_detections = int(postprocess.get("max_detections", -1))
+        if not 0.0 <= self.threshold <= 1.0:
+            problems.append("postprocess.deployment_score_threshold must be between 0 and 1")
+        if not 0.0 <= self.candidate_threshold <= 1.0:
+            problems.append("postprocess.candidate_score_threshold must be between 0 and 1")
+        if not 0.0 <= self.nms_iou <= 1.0:
+            problems.append("postprocess.nms_iou must be between 0 and 1")
+        if self.max_detections != 5:
+            problems.append(f"postprocess.max_detections={self.max_detections!r} (receiver requires 5)")
+
+        tensor_details_file = data.get("tensor_details_file")
+        if not isinstance(tensor_details_file, str) or Path(tensor_details_file).name != tensor_details_file:
+            problems.append("tensor_details_file must be a filename beside the detector metadata")
+            self.tensor_details_path = self.path.with_name("tflite_tensor_details.json")
+        else:
+            self.tensor_details_path = self.path.with_name(tensor_details_file)
+        if not self.tensor_details_path.is_file():
+            problems.append(f"exported tensor metadata not found: {self.tensor_details_path}")
+            float_metadata: Any = {}
+        else:
+            expected_tensor_hash = data.get("tensor_details_sha256")
+            actual_tensor_hash = _sha256(self.tensor_details_path)
+            if actual_tensor_hash != expected_tensor_hash:
+                problems.append(
+                    f"tensor metadata SHA-256 {actual_tensor_hash} != {expected_tensor_hash}"
+                )
+            tensor_metadata = json.loads(self.tensor_details_path.read_text(encoding="utf-8"))
+            float_metadata = tensor_metadata.get("float") if isinstance(tensor_metadata, dict) else None
+            if not isinstance(float_metadata, dict):
+                problems.append("exported tensor metadata lacks a float object")
+                float_metadata = {}
+        if Path(str(float_metadata.get("path", ""))).name != data.get("model_file"):
+            problems.append("exported float metadata model filename does not match model_file")
+        if float_metadata.get("sha256") != data.get("model_sha256"):
+            problems.append("exported float metadata model SHA-256 does not match model_sha256")
+        metadata_inputs = float_metadata.get("inputs")
+        metadata_outputs = float_metadata.get("outputs")
+        if not isinstance(metadata_inputs, list) or len(metadata_inputs) != 1:
+            problems.append("exported float metadata must declare exactly one input")
+        else:
+            metadata_input = metadata_inputs[0]
+            for key in ("name", "shape", "dtype", "quantization"):
+                if metadata_input.get(key) != input_data.get(key):
+                    problems.append(
+                        f"exported float input {key} {metadata_input.get(key)!r} != {input_data.get(key)!r}"
+                    )
+        if not isinstance(metadata_outputs, list) or len(metadata_outputs) != 2:
+            problems.append("exported float metadata must declare exactly two outputs")
+        else:
+            for label, spec in (("box", outputs.get("box", {})), ("score", outputs.get("score", {}))):
+                position = int(spec.get("output_position", -1)) if isinstance(spec, dict) else -1
+                if not 0 <= position < len(metadata_outputs):
+                    problems.append(f"{label} output_position {position} is invalid for exported metadata")
+                    continue
+                metadata_output = metadata_outputs[position]
+                for key in ("name", "shape", "dtype", "quantization"):
+                    if metadata_output.get(key) != spec.get(key):
+                        problems.append(
+                            f"exported float {label} {key} {metadata_output.get(key)!r} != {spec.get(key)!r}"
+                        )
+
+        anchors_file = data.get("anchors_file")
+        if not isinstance(anchors_file, str) or Path(anchors_file).name != anchors_file:
+            problems.append("anchors_file must be a filename beside the detector metadata")
+            self.anchors_path = self.path.with_name("anchors.json")
+        else:
+            self.anchors_path = self.path.with_name(anchors_file)
+        if not self.anchors_path.is_file():
+            problems.append(f"anchors file not found: {self.anchors_path}")
+            anchors_data: Any = {}
+        else:
+            expected_anchor_hash = data.get("anchors_sha256")
+            actual_anchor_hash = _sha256(self.anchors_path)
+            if actual_anchor_hash != expected_anchor_hash:
+                problems.append(f"anchors SHA-256 {actual_anchor_hash} != {expected_anchor_hash}")
+            anchors_data = json.loads(self.anchors_path.read_text(encoding="utf-8"))
+        metadata_anchors = data.get("anchors_normalized_wh")
+        file_anchors = anchors_data.get("anchors") if isinstance(anchors_data, dict) else None
+        try:
+            self.anchors = np.asarray(metadata_anchors, dtype=np.float32)
+        except (TypeError, ValueError):
+            self.anchors = np.empty((0, 2), dtype=np.float32)
+        if self.anchors.shape != (3, 2) or not np.all(np.isfinite(self.anchors)):
+            problems.append(f"anchors_normalized_wh has invalid shape/value: {metadata_anchors!r}")
+        if file_anchors is None or not np.allclose(
+            self.anchors, np.asarray(file_anchors, dtype=np.float32), rtol=1e-6, atol=1e-7
+        ):
+            problems.append("anchors_normalized_wh does not match anchors_file")
+        if isinstance(anchors_data, dict) and anchors_data.get("input_size") != self.image_size:
+            problems.append(
+                f"anchors input_size {anchors_data.get('input_size')!r} != detector input {self.image_size}"
+            )
+
+        self.box_spec = outputs.get("box") if isinstance(outputs.get("box"), dict) else {}
+        self.score_spec = outputs.get("score") if isinstance(outputs.get("score"), dict) else {}
+        if not self.box_spec or not self.score_spec:
+            problems.append("outputs must contain box and score objects")
+        if problems:
+            raise ValueError(f"Unsupported detector contract {self.path}: " + "; ".join(problems))
+
+    @classmethod
+    def beside(cls, model_path: Path) -> "DetectorContract":
+        candidate = Path(model_path).expanduser().resolve().with_name(DETECTOR_CONTRACT_FILENAME)
+        if not candidate.is_file():
+            raise FileNotFoundError(f"Detector contract not found: {candidate}")
+        return cls(candidate)
+
+    def validate_model(self, model: DetectorModel) -> None:
+        problems: list[str] = []
+        named = self.data.get("model_file")
+        if model.path.name != named:
+            problems.append(f"model filename {model.path.name!r} != {named!r}")
+        expected_hash = self.data.get("model_sha256")
+        if model.sha256 != expected_hash:
+            problems.append(f"model SHA-256 {model.sha256} != {expected_hash}")
+        expected_input = [int(value) for value in self.data["input"]["shape"]]
+        actual_input = [int(value) for value in model.input["shape"]]
+        if actual_input != expected_input:
+            problems.append(f"input shape {actual_input} != {expected_input}")
+        actual_input_dtype = np.dtype(model.input["dtype"]).name
+        if actual_input_dtype != self.data["input"]["dtype"]:
+            problems.append(f"input dtype {actual_input_dtype} != {self.data['input']['dtype']}")
+        for label, spec in (("box", self.box_spec), ("score", self.score_spec)):
+            position = int(spec.get("output_position", -1))
+            if not 0 <= position < len(model.outputs):
+                problems.append(f"{label} output_position {position} is invalid")
+                continue
+            detail = model.outputs[position]
+            actual_shape = [int(value) for value in detail["shape"]]
+            expected_shape = [int(value) for value in spec.get("shape", [])]
+            actual_dtype = np.dtype(detail["dtype"]).name
+            if detail.get("name") != spec.get("name"):
+                problems.append(f"{label} output name {detail.get('name')!r} != {spec.get('name')!r}")
+            if actual_shape != expected_shape:
+                problems.append(f"{label} output shape {actual_shape} != {expected_shape}")
+            if actual_dtype != spec.get("dtype"):
+                problems.append(f"{label} output dtype {actual_dtype} != {spec.get('dtype')}")
+        box_shape = self.box_spec.get("shape", [])
+        score_shape = self.score_spec.get("shape", [])
+        if len(box_shape) != 5 or len(score_shape) != 5 or box_shape[1:4] != score_shape[1:4]:
+            problems.append("box and score grid/anchor output dimensions do not match")
+        elif int(box_shape[3]) != len(self.anchors):
+            problems.append(f"output anchor count {box_shape[3]} != {len(self.anchors)} anchors")
+        if problems:
+            raise ValueError(
+                f"{model.path.name} does not match {self.path.name}: " + "; ".join(problems)
+            )
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "sha256": self.sha256,
+            "model_file": self.data.get("model_file"),
+            "model_sha256": self.data.get("model_sha256"),
+            "anchors_file": self.anchors_path.name,
+            "anchors_sha256": self.data.get("anchors_sha256"),
+            "tensor_details_file": self.tensor_details_path.name,
+            "tensor_details_sha256": self.data.get("tensor_details_sha256"),
+            "geometry": self.geometry,
+            "crop_source": self.crop_source,
+            "image_size": self.image_size,
+            "threshold": self.threshold,
+            "candidate_threshold": self.candidate_threshold,
+            "nms_iou": self.nms_iou,
+            "max_detections": self.max_detections,
+        }
+
+
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(values, -30.0, 30.0)))
+
+
+def _box_iou_array(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    intersection = np.maximum(
+        0.0, np.minimum(box[2:], boxes[:, 2:]) - np.maximum(box[:2], boxes[:, :2])
+    ).prod(axis=1)
+    area_a = np.maximum(0.0, box[2:] - box[:2]).prod()
+    area_b = np.maximum(0.0, boxes[:, 2:] - boxes[:, :2]).prod(axis=1)
+    return intersection / np.maximum(area_a + area_b - intersection, 1e-9)
+
+
+def decode_detector_outputs(
+    box_output: np.ndarray,
+    score_output: np.ndarray,
+    contract: DetectorContract,
+    crop_bounds: tuple[int, int, int, int],
+) -> list[dict[str, Any]]:
+    """Decode, unletterbox, NMS, and map detector boxes into full-frame pixels."""
+    expected_box = tuple(int(value) for value in contract.box_spec["shape"])
+    expected_score = tuple(int(value) for value in contract.score_spec["shape"])
+    if tuple(box_output.shape) != expected_box or tuple(score_output.shape) != expected_score:
+        raise ValueError(
+            f"Detector output shapes changed at runtime: {box_output.shape}, {score_output.shape}; "
+            f"expected {expected_box}, {expected_score}."
+        )
+    raw = box_output[0]
+    score_logits = score_output[0, ..., 0]
+    grid_height, grid_width = raw.shape[:2]
+    grid_y, grid_x = np.meshgrid(
+        np.arange(grid_height, dtype=np.float32),
+        np.arange(grid_width, dtype=np.float32),
+        indexing="ij",
+    )
+    center_x = (_sigmoid(raw[..., 0]) * 3.0 - 1.0 + grid_x[..., None]) / grid_width
+    center_y = (_sigmoid(raw[..., 1]) * 3.0 - 1.0 + grid_y[..., None]) / grid_height
+    width = contract.anchors[None, None, :, 0] * np.exp(np.clip(raw[..., 2], -4.0, 4.0))
+    height = contract.anchors[None, None, :, 1] * np.exp(np.clip(raw[..., 3], -4.0, 4.0))
+    scores = _sigmoid(score_logits)
+    selected = scores >= contract.candidate_threshold
+    if not selected.any():
+        return []
+    boxes = np.stack(
+        [center_x - width / 2, center_y - height / 2, center_x + width / 2, center_y + height / 2],
+        axis=-1,
+    )[selected].astype(np.float32)
+    scores = scores[selected].astype(np.float32)
+
+    left, top, right, bottom = crop_bounds
+    crop_width, crop_height = right - left, bottom - top
+    resized_height, resized_width, pad_top, pad_left = tf_resize_with_pad_geometry(
+        crop_height, crop_width, contract.image_size
+    )
+    boxes[:, [0, 2]] = (
+        (boxes[:, [0, 2]] * contract.image_size - pad_left) / resized_width * crop_width
+    )
+    boxes[:, [1, 3]] = (
+        (boxes[:, [1, 3]] * contract.image_size - pad_top) / resized_height * crop_height
+    )
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0.0, float(crop_width))
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0.0, float(crop_height))
+    valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    boxes, scores = boxes[valid], scores[valid]
+    if not len(boxes):
+        return []
+    order = np.argsort(-scores, kind="stable")
+    keep: list[int] = []
+    while len(order) and len(keep) < contract.max_detections:
+        current = int(order[0])
+        keep.append(current)
+        if len(order) == 1:
+            break
+        remaining = order[1:]
+        order = remaining[_box_iou_array(boxes[current], boxes[remaining]) < contract.nms_iou]
+    detections: list[dict[str, Any]] = []
+    for index in keep:
+        box = boxes[index]
+        detections.append(
+            {
+                "score": float(scores[index]),
+                "box": {
+                    "left": float(box[0] + left),
+                    "top": float(box[1] + top),
+                    "right": float(box[2] + left),
+                    "bottom": float(box[3] + top),
+                },
+            }
+        )
+    return detections
+
+
 class InferenceContract:
     """The deployment contract a training notebook writes beside an is-bird model.
 
@@ -573,9 +1010,12 @@ class BirdInferenceEngine:
 
     def __init__(
         self,
-        is_bird_model: Path,
+        is_bird_model: Path | None,
         species_model: Path,
         *,
+        detector_model: Path | None = None,
+        detector_contract_file: Path | None = None,
+        detector_threshold: float | None = None,
         species_labels: Path | None = None,
         threshold_file: Path | None = None,
         contract_file: Path | None = None,
@@ -584,25 +1024,26 @@ class BirdInferenceEngine:
         num_threads: int | None = None,
         interpreter_factory: Callable[..., Any] | None = None,
     ) -> None:
-        is_bird_model = Path(is_bird_model).expanduser().resolve()
+        is_bird_model = (
+            Path(is_bird_model).expanduser().resolve() if is_bird_model is not None else None
+        )
+        detector_model = (
+            Path(detector_model).expanduser().resolve() if detector_model is not None else None
+        )
         species_model = Path(species_model).expanduser().resolve()
         species_labels = (
             Path(species_labels).expanduser().resolve()
             if species_labels is not None
             else species_model.with_name("labels.txt")
         )
-        threshold_file = (
-            Path(threshold_file).expanduser().resolve()
-            if threshold_file is not None
-            else is_bird_model.with_name("threshold.json")
-        )
-        if contract_file is not None:
-            contract_path = Path(contract_file).expanduser().resolve()
-            if not contract_path.is_file():
-                raise FileNotFoundError(f"Inference contract not found: {contract_path}")
-            self.contract: InferenceContract | None = InferenceContract(contract_path)
-        else:
-            self.contract = InferenceContract.beside(is_bird_model)
+        if detector_model is not None and is_bird_model is not None:
+            raise ValueError("Configure either detector_model or is_bird_model, not both.")
+        if detector_model is None and is_bird_model is None:
+            raise ValueError("A detector_model or is_bird_model is required.")
+        self.detector_contract: DetectorContract | None = None
+        self.detector: DetectorModel | None = None
+        self.contract: InferenceContract | None = None
+        self.is_bird: TFLiteModel | None = None
 
         self.labels = [line.strip() for line in species_labels.read_text(encoding="utf-8").splitlines() if line.strip()]
         if not self.labels:
@@ -611,24 +1052,76 @@ class BirdInferenceEngine:
             raise ValueError("top_k must be positive.")
         self.top_k = min(top_k, len(self.labels))
 
-        image_size = self.contract.image_size if self.contract is not None else DEFAULT_IMAGE_SIZE
-        self.is_bird = TFLiteModel(
-            is_bird_model,
-            output_size=1,
-            image_size=image_size,
-            interpreter_factory=interpreter_factory,
-            num_threads=num_threads,
-        )
-        if self.contract is not None:
-            self.contract.validate_model(self.is_bird)
+        if detector_model is not None:
+            if detector_contract_file is not None:
+                detector_contract_path = Path(detector_contract_file).expanduser().resolve()
+                if not detector_contract_path.is_file():
+                    raise FileNotFoundError(f"Detector contract not found: {detector_contract_path}")
+                self.detector_contract = DetectorContract(detector_contract_path)
+            else:
+                self.detector_contract = DetectorContract.beside(detector_model)
+            self.detector = DetectorModel(
+                detector_model,
+                image_size=self.detector_contract.image_size,
+                interpreter_factory=interpreter_factory,
+                num_threads=num_threads,
+            )
+            self.detector_contract.validate_model(self.detector)
+            selected_threshold = (
+                self.detector_contract.threshold
+                if detector_threshold is None
+                else float(detector_threshold)
+            )
+            if not 0.0 <= selected_threshold <= 1.0:
+                raise ValueError("detector_threshold must be between 0 and 1.")
+            self.bird_threshold = selected_threshold
+            self.threshold_source = (
+                str(self.detector_contract.path)
+                if detector_threshold is None
+                else "detector threshold override"
+            )
+            self.raw_output_threshold = None
+            species_image_size = DEFAULT_IMAGE_SIZE
+        else:
+            assert is_bird_model is not None
+            threshold_file = (
+                Path(threshold_file).expanduser().resolve()
+                if threshold_file is not None
+                else is_bird_model.with_name("threshold.json")
+            )
+            if contract_file is not None:
+                contract_path = Path(contract_file).expanduser().resolve()
+                if not contract_path.is_file():
+                    raise FileNotFoundError(f"Inference contract not found: {contract_path}")
+                self.contract = InferenceContract(contract_path)
+            else:
+                self.contract = InferenceContract.beside(is_bird_model)
+            image_size = self.contract.image_size if self.contract is not None else DEFAULT_IMAGE_SIZE
+            self.is_bird = TFLiteModel(
+                is_bird_model,
+                output_size=1,
+                image_size=image_size,
+                interpreter_factory=interpreter_factory,
+                num_threads=num_threads,
+            )
+            if self.contract is not None:
+                self.contract.validate_model(self.is_bird)
+            species_image_size = image_size
         self.species = TFLiteModel(
             species_model,
             output_size=len(self.labels),
-            image_size=image_size,
+            image_size=species_image_size,
             interpreter_factory=interpreter_factory,
             num_threads=num_threads,
         )
 
+        if detector_model is not None:
+            self.species_labels_path = species_labels
+            self.threshold_path = None
+            return
+
+        assert is_bird_model is not None and self.is_bird is not None
+        threshold_file = Path(threshold_file)
         threshold_data: dict[str, Any] = {}
         if threshold_file.is_file():
             loaded = json.loads(threshold_file.read_text(encoding="utf-8"))
@@ -666,6 +1159,8 @@ class BirdInferenceEngine:
 
     @property
     def decision_rule(self) -> str:
+        if self.detector is not None:
+            return f"top detector score >= {self.bird_threshold}"
         if self.raw_output_threshold is not None:
             return f"raw_output >= {self.raw_output_threshold}"
         return f"bird_probability >= {self.bird_threshold}"
@@ -689,6 +1184,133 @@ class BirdInferenceEngine:
         started = time.perf_counter()
         preprocess_started = time.perf_counter()
         rgb = decode_rgb(image_path)
+        if self.detector is not None:
+            assert self.detector_contract is not None
+            if selected_crop is None:
+                raise ValueError("selected_crop is required by detector selected_crop_then_letterbox inference.")
+            if crop_source != self.detector_contract.crop_source:
+                raise ValueError(
+                    f"crop_source={crop_source!r} does not match detector contract "
+                    f"crop_source={self.detector_contract.crop_source!r}."
+                )
+            left, crop_top, right, bottom = validate_selected_crop(
+                selected_crop, int(rgb.shape[1]), int(rgb.shape[0])
+            )
+            detector_rgb = rgb[crop_top:bottom, left:right]
+            detector_pixels = letterbox_array(
+                detector_rgb,
+                self.detector.image_size,
+                padding_value=self.detector_contract.padding_value,
+            )
+            species_pixels = letterbox_array(rgb, self.species.image_size)
+            preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
+
+            detector_started = time.perf_counter()
+            outputs = self.detector.predict(detector_pixels)
+            box_position = int(self.detector_contract.box_spec["output_position"])
+            score_position = int(self.detector_contract.score_spec["output_position"])
+            detections = decode_detector_outputs(
+                outputs[box_position],
+                outputs[score_position],
+                self.detector_contract,
+                (left, crop_top, right, bottom),
+            )
+            detector_ms = (time.perf_counter() - detector_started) * 1000
+            top_detection = detections[0] if detections else None
+            bird_probability = float(top_detection["score"]) if top_detection is not None else 0.0
+            is_bird = bird_probability >= self.bird_threshold
+
+            species_started = time.perf_counter()
+            species_scores = self.species.predict_pixels(species_pixels)
+            species_ms = (time.perf_counter() - species_started) * 1000
+            order = np.argsort(-species_scores, kind="stable")[: self.top_k]
+            species_top = [
+                {"label": self.labels[int(index)], "probability": float(species_scores[int(index)])}
+                for index in order
+            ]
+            crop_provenance = {
+                "crop_source": crop_source,
+                "crop_coordinate_space": "original_decoded_frame_pixels",
+                "crop_bounds_semantics": "half_open_left_top_right_bottom",
+                "crop_is_final": True,
+                "additional_runtime_margin": 0,
+                "pixel_bounds": {
+                    "left": left,
+                    "top": crop_top,
+                    "right": right,
+                    "bottom": bottom,
+                    "width": right - left,
+                    "height": bottom - crop_top,
+                },
+                "original_frame": {"width": int(rgb.shape[1]), "height": int(rgb.shape[0])},
+            }
+            result = {
+                "schema_version": INFERENCE_SCHEMA_VERSION,
+                "status": "complete",
+                "completed_at": _utc_now(),
+                "image": {"filename": image_path.name, "sha256": _sha256(image_path)},
+                "is_bird": bool(is_bird),
+                "bird_probability": bird_probability,
+                "bird_threshold": self.bird_threshold,
+                "bird_decision": {
+                    "rule": self.decision_rule,
+                    "threshold_source": self.threshold_source,
+                },
+                "detector": {
+                    "model_sha256": self.detector.sha256,
+                    "threshold": self.bird_threshold,
+                    "top_score": bird_probability,
+                    "box": top_detection["box"] if top_detection is not None else None,
+                    "decision": bool(is_bird),
+                    "detections": detections,
+                },
+                "guess": species_top[0]["label"],
+                "species_probability": species_top[0]["probability"],
+                "species_top_k": species_top,
+                "models": {
+                    "detector": self.detector.describe(),
+                    "is_bird": None,
+                    "species": self.species.describe(),
+                },
+                "contract": None,
+                "detector_contract": self.detector_contract.describe(),
+                "preprocessing": {
+                    "method": SELECTED_CROP_GEOMETRY,
+                    "implementation": "TensorFlow resize_with_pad semantics, antialiased bilinear",
+                    "size": self.detector.image_size,
+                    "color": "RGB",
+                    "padding": self.detector_contract.padding_value,
+                    "exif_orientation": "ignored (as tf.io.decode_jpeg)",
+                    "jpeg_decoder": jpeg_decoder_name(),
+                    "input_range": "float 0-255; model performs scaling",
+                    "crop": crop_provenance,
+                    "detector": {
+                        "method": SELECTED_CROP_GEOMETRY,
+                        "size": self.detector.image_size,
+                        "padding_value": self.detector_contract.padding_value,
+                        "crop": crop_provenance,
+                    },
+                    "species": {
+                        "method": LETTERBOX_GEOMETRY,
+                        "size": self.species.image_size,
+                        "crop": None,
+                        "source": "whole_original_frame",
+                    },
+                },
+                "timing_ms": {
+                    "preprocess": preprocess_ms,
+                    "detector": detector_ms,
+                    "species": species_ms,
+                    "total": (time.perf_counter() - started) * 1000,
+                },
+            }
+            result["classification"] = {
+                "is_bird": result["is_bird"],
+                "confidence": bird_probability,
+                "label": result["guess"],
+            }
+            return result
+
         geometry = self.contract.geometry if self.contract is not None else LETTERBOX_GEOMETRY
         crop_provenance: dict[str, Any] | None = None
         if geometry == ROI_CROP_GEOMETRY:
@@ -852,8 +1474,24 @@ class BirdInferenceEngine:
             "species_count": len(self.labels),
             "jpeg_decoder": jpeg_decoder_name(),
             "contract": self.contract.describe() if self.contract is not None else None,
-            "is_bird": self.is_bird.describe(),
+            "detector_contract": (
+                self.detector_contract.describe() if self.detector_contract is not None else None
+            ),
+            "detector": self.detector.describe() if self.detector is not None else None,
+            "is_bird": self.is_bird.describe() if self.is_bird is not None else None,
             "species": self.species.describe(),
+        }
+
+    def detector_record(self, *, top_score: float | None = None, box: Any = None, decision: Any = None) -> dict[str, Any] | None:
+        """Return stable detector audit fields for complete or failed inference records."""
+        if self.detector is None:
+            return None
+        return {
+            "model_sha256": self.detector.sha256,
+            "threshold": self.bird_threshold,
+            "top_score": top_score,
+            "box": box,
+            "decision": decision,
         }
 
 

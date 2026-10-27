@@ -129,7 +129,9 @@ class MotionService:
 
     @property
     def geometry(self) -> str:
-        contract = getattr(self.engine, "contract", None)
+        contract = getattr(self.engine, "detector_contract", None) or getattr(
+            self.engine, "contract", None
+        )
         return getattr(contract, "geometry", LETTERBOX_GEOMETRY)
 
     def _infer(self, path: Path, static_roi: Any, motion: dict[str, Any]) -> dict[str, Any]:
@@ -213,6 +215,9 @@ class MotionService:
                     },
                     "error": str(error),
                 }
+                detector_record = getattr(self.engine, "detector_record", lambda: None)()
+                if detector_record is not None:
+                    inference["detector"] = detector_record
             threshold = float(getattr(self.engine, "bird_threshold", inference.get("bird_threshold", 0.5)))
             now = self.monotonic()
             admitted = should_admit_background(inference, threshold=threshold) and self.background.admit(gray, now=now)

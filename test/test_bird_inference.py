@@ -14,7 +14,9 @@ from PIL import Image
 
 from server.bird_inference import (
     BirdInferenceEngine,
+    DetectorContract,
     TFLiteModel,
+    decode_detector_outputs,
     letterbox_array,
     letterbox_rgb,
     roi_crop_geometry,
@@ -229,6 +231,287 @@ class ContractTests(unittest.TestCase):
                 self.assertEqual(result["bird_decision"]["raw_output"], raw)
                 self.assertAlmostEqual(result["bird_probability"], raw / 256)
                 self.assertEqual(result["classification"]["confidence"], result["bird_probability"])
+
+
+class DetectorInferenceTests(unittest.TestCase):
+    MODEL_NAME = "detector_float.tflite"
+
+    def write_bundle(self, root: Path) -> tuple[Path, Path, Path]:
+        detector = root / self.MODEL_NAME
+        species = root / "species.tflite"
+        anchors_path = root / "anchors.json"
+        detector.write_bytes(b"float detector")
+        species.write_bytes(b"species")
+        (root / "labels.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+        anchors = [
+            [0.30197447538375854, 0.30662021040916443],
+            [0.5027866959571838, 0.5528455972671509],
+            [0.831632673740387, 0.6747719645500183],
+        ]
+        anchors_path.write_text(
+            json.dumps({"input_size": 224, "anchors": anchors}), encoding="utf-8"
+        )
+        tensor_details_path = root / "tflite_tensor_details.json"
+        tensor_details_path.write_text(json.dumps({
+            "float": {
+                "path": str(detector),
+                "sha256": hashlib.sha256(detector.read_bytes()).hexdigest(),
+                "inputs": [{
+                    "name": "serving_default_image:0",
+                    "shape": [1, 224, 224, 3],
+                    "dtype": "float32",
+                    "quantization": [0.0, 0],
+                }],
+                "outputs": [
+                    {
+                        "name": "StatefulPartitionedCall_1:0",
+                        "shape": [1, 14, 14, 3, 4],
+                        "dtype": "float32",
+                        "quantization": [0.0, 0],
+                    },
+                    {
+                        "name": "StatefulPartitionedCall_1:1",
+                        "shape": [1, 14, 14, 3, 1],
+                        "dtype": "float32",
+                        "quantization": [0.0, 0],
+                    },
+                ],
+            }
+        }), encoding="utf-8")
+        contract = {
+            "model_file": detector.name,
+            "model_sha256": hashlib.sha256(detector.read_bytes()).hexdigest(),
+            "anchors_file": anchors_path.name,
+            "anchors_sha256": hashlib.sha256(anchors_path.read_bytes()).hexdigest(),
+            "tensor_details_file": tensor_details_path.name,
+            "tensor_details_sha256": hashlib.sha256(tensor_details_path.read_bytes()).hexdigest(),
+            "input": {
+                "name": "serving_default_image:0",
+                "shape": [1, 224, 224, 3],
+                "dtype": "float32",
+                "quantization": [0.0, 0],
+                "color_order": "RGB",
+                "geometry": "selected_crop_then_letterbox",
+                "geometry_location": "outside the model",
+                "crop_source": "capture_motion_record.selection.final_bounds_px",
+                "crop_coordinate_space": "original_decoded_frame_pixels",
+                "crop_bounds_semantics": "half_open_left_top_right_bottom",
+                "crop_is_final": True,
+                "additional_runtime_margin": 0,
+                "letterbox_padding_value": 114,
+                "resize_method": "bilinear",
+                "resize_antialias": True,
+                "numeric_scaling": "[0,255] to [-1,1] inside the model",
+            },
+            "outputs": {
+                "box": {
+                    "name": "StatefulPartitionedCall_1:0",
+                    "shape": [1, 14, 14, 3, 4],
+                    "dtype": "float32",
+                    "quantization": [0.0, 0],
+                    "output_position": 0,
+                },
+                "score": {
+                    "name": "StatefulPartitionedCall_1:1",
+                    "shape": [1, 14, 14, 3, 1],
+                    "dtype": "float32",
+                    "quantization": [0.0, 0],
+                    "output_position": 1,
+                },
+            },
+            "anchors_normalized_wh": anchors,
+            "decode": {
+                "center_x": "(sigmoid(tx) * 3 - 1 + grid_x) / grid_width",
+                "center_y": "(sigmoid(ty) * 3 - 1 + grid_y) / grid_height",
+                "width": "anchor_width * exp(clamp(tw, -4, 4))",
+                "height": "anchor_height * exp(clamp(th, -4, 4))",
+                "score": "sigmoid(bird_score_logit)",
+            },
+            "postprocess": {
+                "candidate_score_threshold": 0.01,
+                "deployment_score_threshold": 0.5,
+                "nms_iou": 0.45,
+                "max_detections": 5,
+            },
+        }
+        contract_path = root / "detector_contract.json"
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
+        return detector, species, contract_path
+
+    @staticmethod
+    def fake_interpreter(*, wrong_input=False, wrong_score_shape=False):
+        class SplitHeadFake:
+            instances = {}
+            box_output = np.zeros((1, 14, 14, 3, 4), dtype=np.float32)
+            score_output = np.full((1, 14, 14, 3, 1), -30.0, dtype=np.float32)
+
+            def __init__(self, model_path: str, **_kwargs) -> None:
+                self.model_path = model_path
+                self.tensor = None
+                self.instances[Path(model_path).name] = self
+
+            def allocate_tensors(self) -> None:
+                pass
+
+            def get_input_details(self):
+                size = 288 if wrong_input and Path(self.model_path).name != "species.tflite" else 224
+                return [{
+                    "index": 0,
+                    "name": "serving_default_image:0",
+                    "shape": np.array([1, size, size, 3]),
+                    "dtype": np.float32,
+                    "quantization": (0.0, 0),
+                }]
+
+            def get_output_details(self):
+                if Path(self.model_path).name == "species.tflite":
+                    return [{
+                        "index": 3,
+                        "name": "species",
+                        "shape": np.array([1, 3]),
+                        "dtype": np.float32,
+                        "quantization": (0.0, 0),
+                    }]
+                score_shape = [1, 7, 7, 3, 1] if wrong_score_shape else [1, 14, 14, 3, 1]
+                return [
+                    {
+                        "index": 1,
+                        "name": "StatefulPartitionedCall_1:0",
+                        "shape": np.array([1, 14, 14, 3, 4]),
+                        "dtype": np.float32,
+                        "quantization": (0.0, 0),
+                    },
+                    {
+                        "index": 2,
+                        "name": "StatefulPartitionedCall_1:1",
+                        "shape": np.array(score_shape),
+                        "dtype": np.float32,
+                        "quantization": (0.0, 0),
+                    },
+                ]
+
+            def set_tensor(self, _index: int, tensor: np.ndarray) -> None:
+                self.tensor = tensor
+
+            def invoke(self) -> None:
+                if self.tensor is None:
+                    raise AssertionError("input was not set")
+
+            def get_tensor(self, index: int) -> np.ndarray:
+                if Path(self.model_path).name == "species.tflite":
+                    return np.array([[0.2, 0.7, 0.1]], dtype=np.float32)
+                return self.box_output.copy() if index == 1 else self.score_output.copy()
+
+        return SplitHeadFake
+
+    def test_detector_contract_fails_startup_on_hash_input_output_and_anchor_mismatch(self) -> None:
+        cases = ("hash", "input", "output", "anchors", "metadata")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                detector, species, contract_path = self.write_bundle(root)
+                fake = self.fake_interpreter(
+                    wrong_input=case == "input", wrong_score_shape=case == "output"
+                )
+                if case == "hash":
+                    detector.write_bytes(b"different model")
+                if case == "anchors":
+                    (root / "anchors.json").write_text("{}", encoding="utf-8")
+                if case == "metadata":
+                    (root / "tflite_tensor_details.json").write_text("{}", encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    BirdInferenceEngine(
+                        None,
+                        species,
+                        detector_model=detector,
+                        detector_contract_file=contract_path,
+                        interpreter_factory=fake,
+                    )
+
+    def test_decode_uses_span_three_formula_full_frame_offsets_and_five_box_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, _, contract_path = self.write_bundle(root)
+            contract = DetectorContract(contract_path)
+            boxes = np.zeros((1, 14, 14, 3, 4), dtype=np.float32)
+            scores = np.full((1, 14, 14, 3, 1), -30.0, dtype=np.float32)
+            boxes[0, 5, 4, 0, 0] = np.log(3.0)
+            boxes[0, 5, 4, 0, 1] = -np.log(3.0)
+            scores[0, 5, 4, 0, 0] = 6.0
+            decoded = decode_detector_outputs(boxes, scores, contract, (20, 10, 160, 150))
+            expected_center_x = 20 + ((0.75 * 3 - 1 + 4) / 14) * 140
+            expected_center_y = 10 + ((0.25 * 3 - 1 + 5) / 14) * 140
+            self.assertAlmostEqual(
+                (decoded[0]["box"]["left"] + decoded[0]["box"]["right"]) / 2,
+                expected_center_x,
+                places=4,
+            )
+            self.assertAlmostEqual(
+                (decoded[0]["box"]["top"] + decoded[0]["box"]["bottom"]) / 2,
+                expected_center_y,
+                places=4,
+            )
+
+            boxes.fill(0)
+            scores.fill(-30)
+            for rank, (y, x) in enumerate(((1, 1), (1, 5), (1, 9), (6, 1), (6, 5), (6, 9))):
+                scores[0, y, x, 0, 0] = 8.0 - rank * 0.1
+            capped = decode_detector_outputs(boxes, scores, contract, (0, 0, 224, 224))
+            self.assertEqual(len(capped), 5)
+
+    def test_engine_uses_final_crop_pad_114_threshold_point_five_and_whole_frame_species(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            detector, species, contract_path = self.write_bundle(root)
+            fake = self.fake_interpreter()
+            fake.score_output[0, 7, 7, 0, 0] = 0.0
+            image = np.zeros((100, 200, 3), dtype=np.uint8)
+            image[:, :] = (0, 0, 250)
+            image[20:80, 40:160] = (250, 0, 0)
+            Image.fromarray(image).save(root / "capture.png")
+            engine = BirdInferenceEngine(
+                None,
+                species,
+                detector_model=detector,
+                detector_contract_file=contract_path,
+                interpreter_factory=fake,
+            )
+            result = engine.infer(
+                root / "capture.png",
+                selected_crop={"left": 40, "top": 20, "right": 160, "bottom": 80},
+                crop_source="capture_motion_record.selection.final_bounds_px",
+            )
+        detector_tensor = fake.instances[self.MODEL_NAME].tensor[0]
+        species_tensor = fake.instances["species.tflite"].tensor[0]
+        self.assertTrue(np.all(detector_tensor[:56] == 114))
+        self.assertGreater(float(detector_tensor[112, :, 0].mean()), 200)
+        self.assertGreater(float(species_tensor[112, 20, 2]), 200)
+        self.assertTrue(result["is_bird"])
+        self.assertAlmostEqual(result["detector"]["top_score"], 0.5)
+        self.assertEqual(result["detector"]["threshold"], 0.5)
+        self.assertTrue(result["detector"]["decision"])
+        self.assertEqual(result["detector"]["model_sha256"], hashlib.sha256(b"float detector").hexdigest())
+        self.assertGreaterEqual(result["detector"]["box"]["left"], 40)
+        self.assertGreaterEqual(result["detector"]["box"]["top"], 20)
+        self.assertEqual(result["preprocessing"]["crop"]["additional_runtime_margin"], 0)
+
+
+class ContractCompatibilityTests(unittest.TestCase):
+    def build(self, root: Path, raw_output: int, contract=UINT8_CONTRACT, **kwargs):
+        binary = root / "binary.tflite"
+        species = root / "species.tflite"
+        binary.write_bytes(b"binary")
+        species.write_bytes(b"species")
+        (root / "labels.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+        (root / "inference_contract.json").write_text(json.dumps(contract), encoding="utf-8")
+        return BirdInferenceEngine(
+            binary, species, interpreter_factory=quantized_fake(raw_output), **kwargs
+        )
+
+    def infer(self, engine: BirdInferenceEngine, root: Path) -> dict:
+        image = root / "capture.jpg"
+        image.write_bytes(jpeg_bytes(size=(64, 48)))
+        return engine.infer(image)
 
     def test_override_uses_probability_rule(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

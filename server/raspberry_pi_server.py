@@ -56,13 +56,11 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
 
 DEFAULT_SAVE_DIR = Path.home() / "bird_images"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# Full-integer model: decision uses the exact uint8 rule from its inference_contract.json.
-DEFAULT_IS_BIRD_MODEL = (
+DEFAULT_DETECTOR_MODEL = (
     PROJECT_ROOT
     / "Models"
-    / "runs"
-    / "isbird_manifests_letterbox_224_20261020_004327"
-    / "model_uint8.tflite"
+    / "pi_detector_float_stride16_224"
+    / "bird_detector_motion_crop_stride16_float32.tflite"
 )
 DEFAULT_SPECIES_MODEL = (
     PROJECT_ROOT / "Models" / "runs" / "letterbox_224_20261009_131631" / "model_float32.tflite"
@@ -363,8 +361,8 @@ def create_app(
         }
 
     def failed_record(destination: Path, error: str) -> dict[str, Any]:
-        return {
-            "schema_version": 1,
+        record = {
+            "schema_version": INFERENCE_SCHEMA_VERSION,
             "status": "error",
             "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "capture_id": destination.stem,
@@ -375,6 +373,11 @@ def create_app(
             "camera_provenance": camera_provenance(destination),
             "error": error,
         }
+        if inference_engine is not None:
+            detector_record = getattr(inference_engine, "detector_record", lambda: None)()
+            if detector_record is not None:
+                record["detector"] = detector_record
+        return record
 
     def run_classifier(
         destination: Path,
@@ -383,7 +386,10 @@ def create_app(
             if inference_engine is not None:
                 roi, roi_source = capture_roi(destination)
                 kwargs: dict[str, Any] = {"roi": roi, "roi_source": roi_source}
-                geometry = getattr(getattr(inference_engine, "contract", None), "geometry", None)
+                crop_contract = getattr(inference_engine, "detector_contract", None) or getattr(
+                    inference_engine, "contract", None
+                )
+                geometry = getattr(crop_contract, "geometry", None)
                 if geometry == SELECTED_CROP_GEOMETRY:
                     rgb = decode_rgb(destination)
                     motion_path = destination.with_suffix(".motion.json")
@@ -968,10 +974,25 @@ def parse_args() -> argparse.Namespace:
         help=f"Persistent multi-camera registry (default: {DEFAULT_REGISTRY_FILE})",
     )
     parser.add_argument(
+        "--detector-model",
+        type=Path,
+        default=DEFAULT_DETECTOR_MODEL,
+        help="Float motion-crop detector TFLite model",
+    )
+    parser.add_argument(
+        "--detector-contract-file",
+        type=Path,
+        help="detector_contract.json (default: beside the detector model)",
+    )
+    parser.add_argument(
+        "--detector-threshold",
+        type=float,
+        help="Override detector top-box score threshold (default: contract value 0.5)",
+    )
+    parser.add_argument(
         "--is-bird-model",
         type=Path,
-        default=DEFAULT_IS_BIRD_MODEL,
-        help="Binary bird/not-bird TFLite model",
+        help="Legacy binary bird/not-bird TFLite model (disables the default detector)",
     )
     parser.add_argument(
         "--species-model",
@@ -1020,9 +1041,13 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     try:
+        detector_model = None if args.is_bird_model is not None else args.detector_model
         engine = BirdInferenceEngine(
             args.is_bird_model,
             args.species_model,
+            detector_model=detector_model,
+            detector_contract_file=args.detector_contract_file,
+            detector_threshold=args.detector_threshold,
             species_labels=args.species_labels,
             threshold_file=args.threshold_file,
             contract_file=args.contract_file,
@@ -1034,7 +1059,7 @@ if __name__ == "__main__":
         raise SystemExit(f"Model startup error: {error}") from error
     print(f"Models ready: {json.dumps(engine.describe(), sort_keys=True)}", flush=True)
     print(f"Bird decision: {engine.decision_rule} (from {engine.threshold_source})", flush=True)
-    if engine.contract is None:
+    if engine.contract is None and engine.detector_contract is None:
         print("WARNING: no inference_contract.json beside the is-bird model; using legacy threshold.", flush=True)
     if not jpeg_decoder_name().startswith("simplejpeg"):
         print(

@@ -335,47 +335,54 @@ only the platform-specific inference runtime is installed separately.
 
 ### Models
 
-The default is-bird model is the full-integer
-`Models/runs/isbird_manifests_letterbox_224_20261020_004327/model_uint8.tflite`
-(trained by `Models/train_isbird_tflite_manifests.ipynb`). Copy the whole run
-directory, or at least `model_uint8.tflite`, `inference_contract.json`, and
-`threshold.json` together. The species model is still the float32
-`letterbox_224_20261009_131631/model_float32.tflite`, with `labels.txt` beside it.
+The default bird-presence model is the float32 split-head detector in
+`Models/pi_detector_float_stride16_224`. Copy that whole directory so
+`bird_detector_motion_crop_stride16_float32.tflite`, `detector_contract.json`,
+`anchors.json`, and `tflite_tensor_details.json` remain together. The deployed
+export is 224x224 (the exact model in
+`keras_motion_crop_detector_stride16_split_heads_224`), not 288x288. The species
+model is still the float32 `letterbox_224_20261009_131631/model_float32.tflite`,
+with `labels.txt` beside it.
 
 ```bash
 python3 server/raspberry_pi_server.py \
   --camera-url http://192.168.1.84 \
-  --is-bird-model /opt/bird-models/is-bird/model_uint8.tflite \
+  --detector-model /opt/bird-models/detector/bird_detector_motion_crop_stride16_float32.tflite \
   --species-model /opt/bird-models/species/model_float32.tflite
 ```
 
-`inference_contract.json` beside the is-bird model is the authority for
-deployment. At startup the receiver checks it against what it implements
-(RGB, letterbox, antialiased bilinear, scaling inside the model) and against the
-loaded model's tensors (shape, uint8 dtypes, quantization scale/zero point); a
-mismatched model/contract pair stops the server instead of mis-scoring images.
-Use `--contract-file` if the contract lives elsewhere.
+`detector_contract.json` beside the detector is the authority for deployment.
+At startup the receiver verifies the exact exported tensor-details file and its
+SHA-256, model SHA-256, float32 input signature, both split output signatures,
+anchor-file SHA-256, and anchor values. It also rejects unsupported geometry or
+decode formulas. A mismatched model, metadata, or anchor file stops the server
+instead of quietly mis-scoring birds. Use `--detector-contract-file` if the
+contract lives elsewhere.
 
-Preprocessing reproduces the notebook's `tf.io.decode_jpeg` +
+Detector preprocessing takes the Pi motion record's exact
+`selection.final_bounds_px` half-open crop, adds no runtime margin, then uses the
+existing `letterbox_array` implementation with pad value 114. It reproduces the
+notebook's `tf.io.decode_jpeg` +
 `tf.image.resize_with_pad(..., antialias=True)` exactly, without TensorFlow:
 JPEGs are decoded with `simplejpeg` using TensorFlow's default fast integer
 IDCT, EXIF orientation is ignored (as TensorFlow does), and the resize repeats
-TensorFlow's float32 geometry and accumulation order. Receiver pixels and
-quantized model outputs are bit-identical to the notebook's. If `simplejpeg`
-is missing the receiver falls back to Pillow and prints a warning: Pillow's
-accurate IDCT shifts pixels by about one level, which moved the uint8 output by
-up to 22 steps on borderline test images. Both models share these pixels (the
-species notebook used the same letterbox).
+TensorFlow's float32 geometry and accumulation order. Receiver pixels and model
+inputs match the notebook's geometry. If `simplejpeg` is missing the receiver
+falls back to Pillow and prints a warning: Pillow's accurate IDCT shifts pixels
+by about one level, which moved the uint8 output by up to 22 steps on borderline
+test images. The species model still receives a separate black-padded letterbox
+of the whole original frame.
 
-The bird decision is the contract's exact integer rule,
-`raw_output >= uint8_output_threshold` (`242`), which is the rule the threshold
-was selected with on the uint8 model. Each inference record keeps the raw
-output, the dequantized `bird_probability` (`raw / 256`), and the rule under
-`bird_decision`; `classification.confidence` sent to the ESP32 is the
-probability. `--bird-threshold` overrides this with a probability rule.
-Older runs without a contract still work from their `threshold.json`.
+The receiver decodes centres with `sigmoid(t) * 3 - 1`, applies the contract's
+anchor/size formulas, runs NMS at IoU 0.45 with at most five boxes, and maps the
+surviving boxes back to full-frame pixels. The crop score is the top box score;
+the float deployment decision is `top_score >= 0.5`. Use
+`--detector-threshold` only for an intentional runtime override. Every completed
+`.inference.json` records the detector model SHA-256, threshold, top score,
+full-frame top box, and decision. Detector failures retain the hash and threshold
+with null result fields.
 
-For this baseline, both models run for every accepted JPEG. The species result
+Both detector and species models run for every accepted JPEG. The species result
 is therefore an advisory guess even when `is_bird` is false.
 
 > **Accuracy warning:** this is not yet a reliable detector. The threshold was
@@ -417,7 +424,7 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/opt/esp32-classifier
-ExecStart=/opt/esp32-classifier/.venv/bin/python server/raspberry_pi_server.py --host 0.0.0.0 --port 5000 --camera-url http://192.168.1.84 --save-dir /home/pi/bird_images --is-bird-model /opt/bird-models/is-bird/model_uint8.tflite --species-model /opt/bird-models/species/model_float32.tflite
+ExecStart=/opt/esp32-classifier/.venv/bin/python server/raspberry_pi_server.py --host 0.0.0.0 --port 5000 --camera-url http://192.168.1.84 --save-dir /home/pi/bird_images --detector-model /opt/bird-models/detector/bird_detector_motion_crop_stride16_float32.tflite --species-model /opt/bird-models/species/model_float32.tflite --num-threads 1
 Restart=on-failure
 RestartSec=5
 
