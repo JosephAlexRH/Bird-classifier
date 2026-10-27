@@ -67,6 +67,18 @@ constexpr int kMaxMotionSettleFrames = 20;
 extern Config cfg;
 extern bool sdReady;
 
+bool initializeConfigMutex();
+
+class ConfigMutexGuard {
+ public:
+  ConfigMutexGuard();
+  ~ConfigMutexGuard();
+  bool locked() const;
+
+ private:
+  bool locked_;
+};
+
 const char *motionOwnerName(MotionOwner owner);
 bool isFirmwareMotionOwner();
 const CameraSensorProfile *getCameraSensorProfile(uint16_t sensorKey);

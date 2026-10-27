@@ -2,11 +2,12 @@
 
 Firmware and local-network receiver tools for a bird-feeder monitoring system. The ESP32-CAM watches for motion using low-resolution luminance samples decoded from JPEG frames, captures a full-resolution JPEG when something moves, and pushes it to the included laptop or Raspberry Pi receiver.
 
-Motion ownership defaults to the Raspberry Pi. In this mode the Pi polls fresh
-JPEGs from the ESP32 and owns motion decisions; the ESP32 remains a manual,
-exclusive camera endpoint and does not run its local detector or flush legacy
-buffered motion uploads. Set `motion_owner` to `firmware` only as an explicit
-fallback to the on-device detector.
+Motion ownership defaults to the laptop/Raspberry Pi receiver. Set
+`onboard_motion_detection` to `false` so host-side workers poll fresh JPEGs and
+own motion decisions; the ESP32 remains a manual, exclusive camera endpoint and
+does not run its local detector or flush legacy buffered motion uploads. Set it
+to `true` only as an explicit fallback to the on-device detector. The legacy
+`motion_owner` key remains accepted for compatibility.
 
 The Pi keeps a per-camera running median of confident not-bird grayscale frames.
 It removes global brightness shift, thresholds the full-resolution residual,
@@ -124,8 +125,9 @@ running clock.
 | `motion_threshold` | int | Minimum global-light-normalized block luminance residual (0-255) required before a block counts as changed |
 | `motion_sensitivity` | float | Lower fraction of valid changed blocks required to trigger a motion event |
 | `motion_check_ms` | int | Milliseconds between motion checks |
-| `motion_enabled` | bool | Arms the local detector only when `motion_owner` is `firmware`; must be `false` under Pi ownership |
-| `motion_owner` | string | `pi` (default) gives polling/detection ownership to the Pi; `firmware` explicitly enables the legacy on-device fallback |
+| `motion_enabled` | bool | Arms the local detector only when `onboard_motion_detection` is `true`; keep it `false` for laptop/Pi-owned detection |
+| `onboard_motion_detection` | bool | `false` (default) gives motion ownership to laptop/Pi workers; `true` selects the ESP32 detector |
+| `motion_owner` | string | Legacy alias: `pi` maps to `onboard_motion_detection: false`, and `firmware` maps to `true` |
 | `motion_roi` | object | Normalized `{x,y,width,height}` rectangle used for motion analysis; defaults to the full frame and must rasterize to at least 16×12 pixels in the 80×60 analysis image |
 | `motion_exposure_settle_frames` | int | Consecutive stable exposure/gain product samples required before the detector arms (2-20) |
 | `motion_exposure_settle_tolerance` | float | Maximum `(window max / window min) - 1` allowed while exposure is settling (0-1) |
@@ -345,10 +347,13 @@ This firmware has no authentication and is meant for a trusted home LAN only. Do
 ### Run multiple cameras through the laptop or Pi server
 
 Start either server normally, open its dashboard, and add cameras in the
-**Camera fleet** section using each camera's IP address. Definitions persist in
-`~/.esp32-cameras/cameras.json` unless `--registry-file` specifies another
-location. The existing `--camera-url` argument remains a shortcut that creates
-the initial default camera.
+**Camera fleet** section using each camera's IP address. Every camera receives
+its own tab with camera-scoped preview, capture, status, configuration, mode,
+ROI, and saved-result controls; changing the legacy default is not required.
+Definitions persist in `~/.esp32-cameras/cameras.json` unless `--registry-file`
+specifies another location. The existing `--camera-url` argument remains a
+shortcut that creates the first registry entry; its default flag is used only
+by backward-compatible unscoped API routes.
 
 The servers discover the stable `esp32cam-...` hardware ID and sensor model
 from the firmware. Per-camera locks allow different ESP32 cameras—including a

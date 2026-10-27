@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
 
 try:
+    from .camera_dashboard_templates import LAPTOP_TABBED_DASHBOARD_HTML
     from .camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
     from .capture_storage import (
         METADATA_HEADER,
@@ -28,6 +29,7 @@ try:
     )
     from .roi_control import ROI_CONTROL_JS
 except ImportError:  # Direct execution: python server/laptop_test_server.py
+    from camera_dashboard_templates import LAPTOP_TABBED_DASHBOARD_HTML
     from camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
     from capture_storage import (
         METADATA_HEADER,
@@ -810,7 +812,7 @@ def create_app(
 
     @app.get("/")
     def dashboard() -> str:
-        return render_template_string(DASHBOARD_HTML, roi_control_js=ROI_CONTROL_JS)
+        return render_template_string(LAPTOP_TABBED_DASHBOARD_HTML)
 
     @app.post("/upload")
     def upload() -> tuple[Response, int] | Response:
@@ -918,6 +920,28 @@ def create_app(
         if path is None or not path.exists():
             return jsonify(error="No image has been saved yet."), 404
         return send_file(path, mimetype="image/jpeg", max_age=0)
+
+    def latest_camera_capture(camera_id: str) -> tuple[Path, dict[str, Any]] | None:
+        if registry.get(camera_id) is None:
+            return None
+        paths = sorted(store.root.glob("*.jpg"), key=lambda item: item.stat().st_mtime, reverse=True)
+        for path in paths:
+            try:
+                sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if isinstance(sidecar, dict) and sidecar.get("camera_registry_id") == camera_id:
+                return path, sidecar
+        return None
+
+    @app.get("/api/cameras/<camera_id>/latest.jpg")
+    def registered_latest_image(camera_id: str) -> Response | tuple[Response, int]:
+        if registry.get(camera_id) is None:
+            return jsonify(error="Camera not found."), 404
+        capture = latest_camera_capture(camera_id)
+        if capture is None:
+            return jsonify(error="No image has been saved for this camera yet."), 404
+        return send_file(capture[0], mimetype="image/jpeg", max_age=0)
 
     @app.get("/api/info")
     def server_info() -> Response:

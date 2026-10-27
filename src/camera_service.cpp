@@ -5,6 +5,8 @@
 #include <esp_arduino_version.h>
 #include <esp_camera.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/sha256.h>
 #include <memory>
@@ -35,8 +37,10 @@ constexpr int kVsyncPin = 25;
 constexpr int kHrefPin = 23;
 constexpr int kPclkPin = 22;
 constexpr uint8_t kMaxExposureConsistencyAttempts = 3;
-constexpr int kFrameBufferCount = 1;
-constexpr camera_grab_mode_t kGrabMode = CAMERA_GRAB_WHEN_EMPTY;
+constexpr int kOv2640FrameBufferCount = 1;
+constexpr camera_grab_mode_t kOv2640GrabMode = CAMERA_GRAB_WHEN_EMPTY;
+constexpr int kOv5640FrameBufferCount = 2;
+constexpr camera_grab_mode_t kOv5640GrabMode = CAMERA_GRAB_LATEST;
 constexpr int kProbeXclkHz = 20000000;
 constexpr uint32_t kOv2640AecDriverLimitLines = 1200;
 constexpr size_t kOv2640RegisterCountPerBank = 255;
@@ -61,12 +65,40 @@ bool settingsChangeTimeValid = false;
 uint32_t persistentSettingsRevision = 1;
 int initializedFramesize = static_cast<int>(FRAMESIZE_VGA);
 int initializedXclkHz = kProbeXclkHz;
+int initializedFrameBufferCount = kOv2640FrameBufferCount;
+camera_grab_mode_t initializedGrabMode = kOv2640GrabMode;
 bool registerDumpPending = true;
 bool registerDumpCacheValid = false;
 uint8_t registerDumpCache[kMaximumRegisterDumpBytes];
 size_t registerDumpCacheBytes = 0;
 String registerDumpSha256;
 String registerDumpPayloadBase64;
+StaticSemaphore_t cameraMutexStorage;
+SemaphoreHandle_t cameraMutex = nullptr;
+
+bool lockCamera() {
+  if (cameraMutex == nullptr) {
+    cameraMutex = xSemaphoreCreateRecursiveMutexStatic(&cameraMutexStorage);
+  }
+  return cameraMutex != nullptr &&
+         xSemaphoreTakeRecursive(cameraMutex, portMAX_DELAY) == pdTRUE;
+}
+
+void unlockCamera() {
+  if (cameraMutex != nullptr) xSemaphoreGiveRecursive(cameraMutex);
+}
+
+class CameraMutexGuard {
+ public:
+  CameraMutexGuard() : locked_(lockCamera()) {}
+  ~CameraMutexGuard() {
+    if (locked_) unlockCamera();
+  }
+  bool locked() const { return locked_; }
+
+ private:
+  bool locked_;
+};
 
 String bytesToHex(const uint8_t *bytes, size_t length) {
   static const char digits[] = "0123456789abcdef";
@@ -203,7 +235,16 @@ void noteSettingsChange() {
   settingsChangeTimeValid = true;
 }
 
-camera_config_t cameraConfigFor(framesize_t framesize, int jpegQuality, int xclkHz) {
+int frameBufferCountForSensor(uint16_t sensorKey) {
+  return sensorKey == kOv5640SensorKey ? kOv5640FrameBufferCount : kOv2640FrameBufferCount;
+}
+
+camera_grab_mode_t grabModeForSensor(uint16_t sensorKey) {
+  return sensorKey == kOv5640SensorKey ? kOv5640GrabMode : kOv2640GrabMode;
+}
+
+camera_config_t cameraConfigFor(framesize_t framesize, int jpegQuality, int xclkHz,
+                                uint16_t sensorKey = 0) {
   camera_config_t config = {};
   config.pin_pwdn = kPowerDownPin;
   config.pin_reset = kResetPin;
@@ -227,16 +268,18 @@ camera_config_t cameraConfigFor(framesize_t framesize, int jpegQuality, int xclk
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = framesize;
   config.jpeg_quality = jpegQuality;
-  config.fb_count = kFrameBufferCount;
-  config.grab_mode = kGrabMode;
+  config.fb_count = frameBufferCountForSensor(sensorKey);
+  config.grab_mode = grabModeForSensor(sensorKey);
   return config;
 }
 
 bool reinitializeCameraForProfile(uint16_t expectedSensorKey,
                                   const CameraSensorProfile &profile) {
+  CameraMutexGuard cameraLock;
+  if (!cameraLock.locked()) return false;
   camera_config_t cameraConfig =
       cameraConfigFor(static_cast<framesize_t>(profile.framesize), profile.jpegQuality,
-                      profile.xclkHz);
+                      profile.xclkHz, expectedSensorKey);
   esp_camera_deinit();
   delay(50);
   const esp_err_t error = esp_camera_init(&cameraConfig);
@@ -255,6 +298,8 @@ bool reinitializeCameraForProfile(uint16_t expectedSensorKey,
 
   initializedFramesize = profile.framesize;
   initializedXclkHz = profile.xclkHz;
+  initializedFrameBufferCount = cameraConfig.fb_count;
+  initializedGrabMode = cameraConfig.grab_mode;
   noteSettingsChange();
   return true;
 }
@@ -427,6 +472,8 @@ const char *cameraSensorModelName(uint16_t pid, uint8_t version) {
 }
 
 bool initializeCamera() {
+  CameraMutexGuard cameraLock;
+  if (!cameraLock.locked()) return false;
   camera_config_t cameraConfig = cameraConfigFor(FRAMESIZE_VGA, 10, kProbeXclkHz);
 
   esp_err_t error = esp_camera_init(&cameraConfig);
@@ -462,6 +509,10 @@ bool initializeCamera() {
 
   if (!reinitializeCameraForProfile(sensorKey, *profile)) return false;
   sensor = esp_camera_sensor_get();
+  if (sensor == nullptr) {
+    Serial.println("Camera sensor unavailable after profile initialization");
+    return false;
+  }
 
   Serial.printf("Camera ready: %s (PID 0x%04x, VER 0x%02x, config %s, SCCB 0x%02x, XCLK %d Hz)\n",
                 cameraSensorModelName(sensor->id.PID, sensor->id.VER),
@@ -472,6 +523,8 @@ bool initializeCamera() {
 }
 
 bool applyCameraProfile() {
+  CameraMutexGuard cameraLock;
+  if (!cameraLock.locked()) return false;
   const uint16_t sensorKey = getActiveCameraSensorKey();
   const CameraSensorProfile *profile = getCameraSensorProfile(sensorKey);
   sensor_t *sensor = esp_camera_sensor_get();
@@ -505,12 +558,27 @@ bool applyCameraProfile() {
   return false;
 }
 
+bool reinitializeActiveCamera() {
+  const uint16_t sensorKey = getActiveCameraSensorKey();
+  if (getCameraSensorProfile(sensorKey) == nullptr) return false;
+  const CameraSensorProfile runtimeProfile = {
+      initializedFramesize,
+      cfg.jpegQuality,
+      initializedXclkHz,
+  };
+  const bool recovered = reinitializeCameraForProfile(sensorKey, runtimeProfile);
+  if (recovered) markRegisterDumpPending();
+  return recovered;
+}
+
 bool isCameraRestartRequired() {
   const CameraSensorProfile *profile = getCameraSensorProfile(getActiveCameraSensorKey());
   return profile != nullptr && profile->xclkHz != initializedXclkHz;
 }
 
 void applyCameraSettings() {
+  CameraMutexGuard cameraLock;
+  if (!cameraLock.locked()) return;
   sensor_t *sensor = esp_camera_sensor_get();
   bool changed = false;
   if (sensor == nullptr || !setConfiguredJpegMode(sensor, changed)) {
@@ -527,7 +595,7 @@ bool drainCameraBuffer() {
   delay(120);
   camera_fb_t *staleFrame = acquireCameraFrame();
   if (staleFrame == nullptr) return false;
-  esp_camera_fb_return(staleFrame);
+  releaseCameraFrame(staleFrame);
   delay(30);
   return true;
 }
@@ -539,11 +607,19 @@ bool discardQueuedCameraFrame() {
   // old. Returning it makes the next fb_get block for a frame exposed from now.
   camera_fb_t *staleFrame = acquireCameraFrame();
   if (staleFrame == nullptr) return false;
-  esp_camera_fb_return(staleFrame);
+  releaseCameraFrame(staleFrame);
   return true;
 }
 
+int getCameraFrameBufferCount() { return initializedFrameBufferCount; }
+
+camera_grab_mode_t getCameraGrabMode() { return initializedGrabMode; }
+
+bool cameraUsesLatestFrameGrab() { return initializedGrabMode == CAMERA_GRAB_LATEST; }
+
 bool prepareJpegCapture(bool drainQueuedFrame) {
+  CameraMutexGuard cameraLock;
+  if (!cameraLock.locked()) return false;
   sensor_t *sensor = esp_camera_sensor_get();
   if (sensor == nullptr) return false;
 
@@ -554,6 +630,11 @@ bool prepareJpegCapture(bool drainQueuedFrame) {
 }
 
 bool configureMotionCapture(bool &changed) {
+  CameraMutexGuard cameraLock;
+  if (!cameraLock.locked()) {
+    changed = false;
+    return false;
+  }
   sensor_t *sensor = esp_camera_sensor_get();
   if (sensor == nullptr) {
     changed = false;
@@ -575,18 +656,41 @@ bool configureMotionCapture(bool &changed) {
 }
 
 camera_fb_t *acquireCameraFrame() {
+  if (!lockCamera()) return nullptr;
   camera_fb_t *frameBuffer = esp_camera_fb_get();
-  if (frameBuffer != nullptr) ++framesSinceBoot;
+  if (frameBuffer != nullptr) {
+    ++framesSinceBoot;
+  } else {
+    unlockCamera();
+  }
   return frameBuffer;
 }
 
+void releaseCameraFrame(camera_fb_t *frameBuffer) {
+  if (frameBuffer == nullptr) return;
+  esp_camera_fb_return(frameBuffer);
+  unlockCamera();
+}
+
+bool getCameraSensorIdentity(uint16_t &pid, uint8_t &version) {
+  CameraMutexGuard cameraLock;
+  if (!cameraLock.locked()) return false;
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == nullptr) return false;
+  pid = sensor->id.PID;
+  version = sensor->id.VER;
+  return true;
+}
+
 bool captureJpeg(CapturedJpeg &capture, bool drainQueuedFrame) {
+  CameraMutexGuard cameraLock;
+  if (!cameraLock.locked()) return false;
   capture = {};
   if (!prepareJpegCapture(drainQueuedFrame)) return false;
 
   camera_fb_t *frameBuffer = acquireCameraFrame();
   if (!isCompleteJpeg(frameBuffer)) {
-    if (frameBuffer != nullptr) esp_camera_fb_return(frameBuffer);
+    if (frameBuffer != nullptr) releaseCameraFrame(frameBuffer);
     return false;
   }
 
@@ -604,7 +708,9 @@ bool isCompleteJpeg(const camera_fb_t *frameBuffer) {
 }
 
 CameraMetadataSnapshot sampleCameraMetadata(const camera_fb_t *frameBuffer) {
+  CameraMutexGuard cameraLock;
   CameraMetadataSnapshot snapshot = {};
+  if (!cameraLock.locked()) return snapshot;
   snapshot.requestedFramesize = cfg.framesize;
   snapshot.requestedJpegQuality = cfg.jpegQuality;
   snapshot.requestedMotionEnabled = cfg.motionEnabled;
@@ -620,8 +726,8 @@ CameraMetadataSnapshot sampleCameraMetadata(const camera_fb_t *frameBuffer) {
   snapshot.requestedBirdConfidenceThreshold = cfg.birdConfidenceThreshold;
   snapshot.settingsRevision = settingsRevision;
   snapshot.persistentSettingsRevision = persistentSettingsRevision;
-  snapshot.frameBufferCount = kFrameBufferCount;
-  snapshot.grabMode = kGrabMode;
+  snapshot.frameBufferCount = initializedFrameBufferCount;
+  snapshot.grabMode = initializedGrabMode;
 
   sensor_t *sensor = esp_camera_sensor_get();
   if (sensor != nullptr) {
@@ -663,7 +769,9 @@ CameraMetadataSnapshot sampleCameraMetadata(const camera_fb_t *frameBuffer) {
 }
 
 ExposureGainSample sampleExposureGain() {
+  CameraMutexGuard cameraLock;
   ExposureGainSample sample = {};
+  if (!cameraLock.locked()) return sample;
   sensor_t *sensor = esp_camera_sensor_get();
   if (sensor == nullptr) return sample;
 

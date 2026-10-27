@@ -6,6 +6,8 @@
 #include <SD_MMC.h>
 #include <SPIFFS.h>
 #include <esp_camera.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <mbedtls/sha256.h>
 
 #if __has_include("secrets.h")
@@ -24,6 +26,17 @@ const char *configStorageName = "none";
 String configFileSha256;
 bool configFileHashValid = false;
 uint16_t activeCameraSensorKey = 0;
+StaticSemaphore_t configMutexStorage;
+SemaphoreHandle_t configMutex = nullptr;
+
+bool lockConfig() {
+  return configMutex != nullptr &&
+         xSemaphoreTakeRecursive(configMutex, portMAX_DELAY) == pdTRUE;
+}
+
+void unlockConfig() {
+  if (configMutex != nullptr) xSemaphoreGiveRecursive(configMutex);
+}
 
 bool loadSensorProfile(JsonVariantConst value, CameraSensorProfile &profile, uint16_t sensorKey) {
   const char *key = cameraSensorKeyName(sensorKey);
@@ -170,6 +183,21 @@ void sanitizeMotionConfig() {
 }
 
 }  // namespace
+
+bool initializeConfigMutex() {
+  if (configMutex == nullptr) {
+    configMutex = xSemaphoreCreateRecursiveMutexStatic(&configMutexStorage);
+  }
+  return configMutex != nullptr;
+}
+
+ConfigMutexGuard::ConfigMutexGuard() : locked_(lockConfig()) {}
+
+ConfigMutexGuard::~ConfigMutexGuard() {
+  if (locked_) unlockConfig();
+}
+
+bool ConfigMutexGuard::locked() const { return locked_; }
 
 Config cfg = {
     "",    // loaded from config.json, or include/secrets.h when present
@@ -366,7 +394,11 @@ void loadConfig() {
 
   hashConfigFile();
 
-  if (document.containsKey("motion_owner")) {
+  if (document.containsKey("onboard_motion_detection")) {
+    cfg.motionOwner = document["onboard_motion_detection"].as<bool>()
+                          ? MotionOwner::Firmware
+                          : MotionOwner::Pi;
+  } else if (document.containsKey("motion_owner")) {
     const char *owner = document["motion_owner"] | "";
     if (strcmp(owner, "firmware") == 0) {
       cfg.motionOwner = MotionOwner::Firmware;
@@ -531,6 +563,7 @@ void loadConfig() {
   Serial.printf("  wifi_ssid:          %s\n", cfg.wifiSsid[0] == '\0' ? "(not configured)" : cfg.wifiSsid);
   Serial.printf("  wifi_password:      %s\n", cfg.wifiPassword[0] == '\0' ? "(not set)" : "(set)");
   Serial.printf("  motion_enabled:     %s\n", cfg.motionEnabled ? "true" : "false");
+  Serial.printf("  onboard_motion:     %s\n", isFirmwareMotionOwner() ? "true" : "false");
   Serial.printf("  motion_owner:       %s\n", motionOwnerName(cfg.motionOwner));
   Serial.printf("  motion_threshold:   %d\n", cfg.motionThreshold);
   Serial.printf("  motion_sensitivity: %.2f\n", cfg.motionSensitivity);
@@ -576,6 +609,7 @@ void saveConfig() {
   document["motion_sensitivity"] = cfg.motionSensitivity;
   document["motion_check_ms"] = cfg.motionCheckMs;
   document["motion_enabled"] = cfg.motionEnabled;
+  document["onboard_motion_detection"] = isFirmwareMotionOwner();
   document["motion_owner"] = motionOwnerName(cfg.motionOwner);
   JsonObject sensors = document["sensors"].to<JsonObject>();
   writeSensorProfile(sensors["0x2642"].to<JsonObject>(), cfg.ov2640);

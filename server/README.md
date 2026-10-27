@@ -12,6 +12,13 @@ ESP32-CAM by IP address, for example `192.168.1.84`. A complete base URL such as
 `http://192.168.1.84` is also accepted. The optional name is used in the
 dashboard and capture sidecars.
 
+Each registered camera is shown as its own dashboard tab. Preview/stream,
+manual capture, status, metadata, configuration, mode, ROI, profile, and latest
+saved-result actions are sent with that tab's registry ID, so no **Set default**
+step is required. Tab-local stream, ROI, editor, and result state is preserved
+when switching cameras. The default flag remains only for the legacy unscoped
+`/camera/...` routes and `--camera-url` compatibility.
+
 The registry stores each camera's URL, enabled/default state, stable ESP32
 hardware `camera_id`, and detected sensor identity. OV2640 and OV5640 cameras
 can run together without sharing camera locks or Pi motion backgrounds. Each
@@ -37,8 +44,16 @@ Camera management API:
 | `POST` | `/api/cameras/<id>/mode` | Set selected camera to `motion` or `idle` |
 
 The laptop also exposes `/api/cameras/<id>/stream`,
-`/api/cameras/<id>/captures`, and `/api/cameras/<id>/profiles`. Existing
-unscoped `/camera/...` routes target the configured default or sole camera.
+`/api/cameras/<id>/captures`, `/api/cameras/<id>/profiles`, and
+`/api/cameras/<id>/latest.jpg`. The Pi exposes
+`/api/cameras/<id>/latest` and `/api/cameras/<id>/latest.jpg`. Existing unscoped
+`/camera/...` routes target the configured default or sole camera.
+
+Set `onboard_motion_detection` in each ESP32's `config.json` or camera config
+editor. Use `false` for laptop/Pi-owned motion detection across multiple cameras
+and `true` for the ESP32's local detector. `motion_enabled` separately arms that
+local detector, so it should normally remain `false` when the boolean is false.
+The older `motion_owner` value remains accepted as a compatibility alias.
 
 On the Pi, every enabled camera gets its own `MotionService` and running-median
 background. TFLite inference remains serialized through a shared lock. Capture
@@ -385,14 +400,6 @@ with null result fields.
 Both detector and species models run for every accepted JPEG. The species result
 is therefore an advisory guess even when `is_bird` is false.
 
-> **Accuracy warning:** this is not yet a reliable detector. The threshold was
-> chosen to keep validation false positives at or below 5%, and at that
-> operating point the run recorded 5.8% bird recall on ESP32 validation
-> (26/445, balanced accuracy 0.51) and 5.4% on the held-out ESP32 test day
-> (132/2,463, 1 false positive). Most bird captures will come back
-> `is_bird: false`. Keep the raw outputs, collect field results, and
-> retrain or recalibrate before relying on the boolean decision.
-
 Set `server_ip` in the ESP32's `config.json` to the Raspberry Pi's LAN address
 when moving from laptop testing to hardware deployment. Images are saved under
 `~/bird_images` by default. Each completed inference is written separately as
@@ -498,4 +505,4 @@ Latest received motion image:
 
 ```text
 http://SERVER_IP:5000/latest.jpg
-```
+```

@@ -5,6 +5,7 @@
   "motion_sensitivity": 0.05,
   "motion_check_ms": 200,
   "motion_enabled": false,
+  "onboard_motion_detection": false,
   "motion_owner": "pi",
   "sensors": {
     "0x2642": {

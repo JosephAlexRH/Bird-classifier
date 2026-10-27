@@ -93,7 +93,7 @@ void sendCapturedJpeg(WiFiClient &client, const char *source, const char *failur
   client.print(metadata);
   client.print("\r\n\r\n");
   const bool sent = writeAll(client, frameBuffer->buf, frameBuffer->len);
-  esp_camera_fb_return(frameBuffer);
+  releaseCameraFrame(frameBuffer);
   if (sent) {
     acknowledgeRegisterDumpDelivery(capture.metadata);
     clearCameraRuntimeError();
@@ -121,7 +121,7 @@ void streamJpegs(WiFiClient &client) {
   while (client.connected()) {
     camera_fb_t *frameBuffer = acquireCameraFrame();
     if (!isCompleteJpeg(frameBuffer)) {
-      if (frameBuffer != nullptr) esp_camera_fb_return(frameBuffer);
+      if (frameBuffer != nullptr) releaseCameraFrame(frameBuffer);
       setCameraRuntimeError("JPEG stream frame capture failed");
       break;
     }
@@ -137,7 +137,7 @@ void streamJpegs(WiFiClient &client) {
                       writeAll(client, reinterpret_cast<const uint8_t *>(partHeader), headerLength) &&
                       writeAll(client, frameBuffer->buf, frameBuffer->len) &&
                       writeAll(client, reinterpret_cast<const uint8_t *>("\r\n"), 2);
-    esp_camera_fb_return(frameBuffer);
+    releaseCameraFrame(frameBuffer);
     if (!sent) break;
     delay(1);
   }
@@ -224,6 +224,7 @@ String configJson() {
   document["motion_sensitivity"] = cfg.motionSensitivity;
   document["motion_check_ms"] = cfg.motionCheckMs;
   document["motion_enabled"] = cfg.motionEnabled;
+  document["onboard_motion_detection"] = isFirmwareMotionOwner();
   document["motion_owner"] = motionOwnerName(cfg.motionOwner);
   JsonObject sensors = document["sensors"].to<JsonObject>();
   JsonObject ov2640 = sensors["0x2642"].to<JsonObject>();
@@ -319,20 +320,31 @@ bool validSensorProfile(JsonVariantConst value, uint16_t sensorKey, String &erro
 
 bool validConfig(const JsonDocument &document, String &error) {
   MotionOwner requestedOwner = cfg.motionOwner;
+  if (document.containsKey("onboard_motion_detection")) {
+    if (!document["onboard_motion_detection"].is<bool>()) {
+      error = "onboard_motion_detection must be true or false";
+      return false;
+    }
+    requestedOwner = document["onboard_motion_detection"].as<bool>()
+                         ? MotionOwner::Firmware
+                         : MotionOwner::Pi;
+  }
   if (document.containsKey("motion_owner")) {
     if (!document["motion_owner"].is<const char *>()) {
       error = "motion_owner must be pi or firmware";
       return false;
     }
     const char *owner = document["motion_owner"];
+    MotionOwner legacyOwner;
     if (strcmp(owner, "pi") == 0) {
-      requestedOwner = MotionOwner::Pi;
+      legacyOwner = MotionOwner::Pi;
     } else if (strcmp(owner, "firmware") == 0) {
-      requestedOwner = MotionOwner::Firmware;
+      legacyOwner = MotionOwner::Firmware;
     } else {
       error = "motion_owner must be pi or firmware";
       return false;
     }
+    if (!document.containsKey("onboard_motion_detection")) requestedOwner = legacyOwner;
   }
   if (document.containsKey("motion_enabled") && !document["motion_enabled"].is<bool>()) {
     error = "motion_enabled must be true or false";
@@ -342,7 +354,8 @@ bool validConfig(const JsonDocument &document, String &error) {
                                           ? document["motion_enabled"].as<bool>()
                                           : (requestedOwner == MotionOwner::Pi ? false
                                                                               : cfg.motionEnabled);
-  if (requestedOwner == MotionOwner::Pi && requestedMotionEnabled) {
+  if (requestedOwner == MotionOwner::Pi && requestedMotionEnabled &&
+      !document.containsKey("onboard_motion_detection")) {
     error = "motion_enabled cannot be true while motion_owner is pi";
     return false;
   }
@@ -408,10 +421,7 @@ bool validConfig(const JsonDocument &document, String &error) {
   }
   if (document.containsKey("framesize")) {
     const int value = document["framesize"];
-    sensor_t *sensor = esp_camera_sensor_get();
-    camera_sensor_info_t *sensorInfo = sensor == nullptr ? nullptr : esp_camera_sensor_get_info(&sensor->id);
-    const int maximum = sensorInfo == nullptr ? static_cast<int>(FRAMESIZE_QSXGA)
-                                              : static_cast<int>(sensorInfo->max_size);
+    const int maximum = cameraSensorMaximumFramesize(getActiveCameraSensorKey());
     if (value < static_cast<int>(FRAMESIZE_QQVGA) || value > maximum) {
       error = "framesize is unsupported by the detected camera sensor";
       return false;
@@ -590,6 +600,11 @@ void applyConfig(const JsonDocument &document) {
                           ? MotionOwner::Firmware
                           : MotionOwner::Pi;
   }
+  if (document.containsKey("onboard_motion_detection")) {
+    cfg.motionOwner = document["onboard_motion_detection"].as<bool>()
+                          ? MotionOwner::Firmware
+                          : MotionOwner::Pi;
+  }
   if (!isFirmwareMotionOwner()) cfg.motionEnabled = false;
   if (document.containsKey("sensors")) {
     JsonObjectConst sensors = document["sensors"].as<JsonObjectConst>();
@@ -713,6 +728,13 @@ void handleClient(WiFiClient client) {
     if (error || !document.is<JsonObject>()) {
       sendJson(client, 400, "Bad Request", "{\"error\":\"Expected a JSON object\"}");
     } else {
+      ConfigMutexGuard configLock;
+      if (!configLock.locked()) {
+        sendJson(client, 503, "Service Unavailable",
+                 "{\"error\":\"Configuration lock unavailable\"}");
+        client.stop();
+        return;
+      }
       String validationError;
       if (!validConfig(document, validationError)) {
         sendJson(client, 422, "Unprocessable Content",
@@ -769,6 +791,13 @@ void handleClient(WiFiClient client) {
       sendJson(client, 422, "Unprocessable Content",
                "{\"error\":\"mode must be either motion or idle\"}");
     } else {
+      ConfigMutexGuard configLock;
+      if (!configLock.locked()) {
+        sendJson(client, 503, "Service Unavailable",
+                 "{\"error\":\"Configuration lock unavailable\"}");
+        client.stop();
+        return;
+      }
       const bool rejectedMotionArm = strcmp(mode, "motion") == 0 && !isFirmwareMotionOwner();
       if (rejectedMotionArm) {
         sendJson(client, 409, "Conflict",
@@ -795,23 +824,27 @@ void handleClient(WiFiClient client) {
     document["stream_active"] = isCameraStreamActive();
     document["boot_id"] = getBootId();
     document["camera_id"] = getCameraId();
-    sensor_t *statusSensor = esp_camera_sensor_get();
-    document["camera_model"] = statusSensor == nullptr
-                                   ? "unknown"
-                                   : cameraSensorModelName(statusSensor->id.PID, statusSensor->id.VER);
-    document["camera_sensor_pid"] = statusSensor == nullptr ? 0 : statusSensor->id.PID;
+    uint16_t statusSensorPid = 0;
+    uint8_t statusSensorVersion = 0;
+    const bool statusSensorAvailable =
+        getCameraSensorIdentity(statusSensorPid, statusSensorVersion);
+    document["camera_model"] = statusSensorAvailable
+                                   ? cameraSensorModelName(statusSensorPid, statusSensorVersion)
+                                   : "unknown";
+    document["camera_sensor_pid"] = statusSensorAvailable ? statusSensorPid : 0;
     document["camera_sensor_version_available"] =
-        statusSensor != nullptr && statusSensor->id.PID == OV2640_PID;
-    if (statusSensor != nullptr && statusSensor->id.PID == OV2640_PID) {
-      document["camera_sensor_version"] = statusSensor->id.VER;
+        statusSensorAvailable && statusSensorPid == OV2640_PID;
+    if (statusSensorAvailable && statusSensorPid == OV2640_PID) {
+      document["camera_sensor_version"] = statusSensorVersion;
     } else {
       document["camera_sensor_version"] = nullptr;
     }
-    document["camera_sensor_config_key"] = statusSensor == nullptr
+    document["camera_sensor_config_key"] = !statusSensorAvailable
                                                ? nullptr
                                                : cameraSensorKeyName(cameraSensorConfigKey(
-                                                     statusSensor->id.PID, statusSensor->id.VER));
+                                                     statusSensorPid, statusSensorVersion));
     document["camera_restart_required"] = isCameraRestartRequired();
+    document["onboard_motion_detection"] = isFirmwareMotionOwner();
     document["motion_owner"] = motionOwnerName(cfg.motionOwner);
     const DeviceTelemetrySnapshot device = sampleDeviceTelemetry();
     document["time_sync_status"] = device.timeSynchronized ? "synchronized" : "unsynchronized";
@@ -876,6 +909,18 @@ void handleClient(WiFiClient client) {
     roi["height"] = roiHeight;
     document["last_motion_capture_succeeded"] = wasLastMotionCaptureSuccessful();
     document["last_motion_upload_succeeded"] = wasLastMotionUploadSuccessful();
+    document["motion_capture_backoff_active"] = isMotionCaptureBackoffActive();
+    document["motion_capture_failure_count"] = getMotionCaptureFailureCount();
+    document["consecutive_motion_capture_failures"] = getConsecutiveMotionCaptureFailures();
+    document["motion_camera_recovery_attempts"] = getMotionCameraRecoveryAttempts();
+    document["motion_camera_recovery_successes"] = getMotionCameraRecoverySuccesses();
+    document["last_motion_capture_duration_ms"] = getLastMotionCaptureDurationMs();
+    document["last_successful_motion_capture_ms"] = getLastSuccessfulMotionCaptureMs();
+    document["last_motion_capture_operation"] = getLastMotionCaptureOperation();
+    document["camera_framebuffer_count"] = getCameraFrameBufferCount();
+    document["camera_grab_mode"] =
+        getCameraGrabMode() == CAMERA_GRAB_LATEST ? "CAMERA_GRAB_LATEST"
+                                                  : "CAMERA_GRAB_WHEN_EMPTY";
     document["upload_cooldown_active"] = isMotionUploadCoolingDown();
     document["buffered_upload_count"] = getBufferedUploadCount();
     document["consecutive_motion_triggers"] = getConsecutiveMotionTriggers();

@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <driver/periph_ctrl.h>
 
 #include "app_config.h"
 #include "camera_service.h"
@@ -11,14 +14,14 @@
 
 namespace {
 
-  constexpr unsigned long kConfigPollMs = 10000;
   constexpr unsigned long kWifiReconnectMs = 10000;
   constexpr unsigned long kBufferFlushMs = 2000;
+  constexpr uint32_t kMotionTaskStackBytes = 8192;
+  constexpr UBaseType_t kMotionTaskPriority = 1;
 
-  unsigned long lastMotionCheck = 0;
-  unsigned long lastConfigCheck = 0;
   unsigned long lastWifiReconnectAttempt = 0;
-  unsigned long lastBufferFlush = 0;
+  volatile bool cameraReady = false;
+  TaskHandle_t motionTaskHandle = nullptr;
 
   void connectToWifi() {
     if (cfg.wifiSsid[0] == '\0') {
@@ -31,6 +34,9 @@ namespace {
     WiFi.setAutoReconnect(true);
     WiFi.persistent(false);
     WiFi.begin(cfg.wifiSsid, cfg.wifiPassword);
+    // DIAGNOSTIC: cap transmit power to cut the current spikes from Wi-Fi TX.
+    // If the crashes stop with this, the board's power supply is the problem.
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
     while (WiFi.status() != WL_CONNECTED) {
       Serial.print(".");
@@ -53,12 +59,88 @@ namespace {
     WiFi.reconnect();
   }
 
+  void motionTask(void *parameter) {
+    (void)parameter;
+    while (!cameraReady) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    bool stackWatermarkLogged = false;
+    unsigned long lastBufferFlush = 0;
+    while (cameraReady) {
+      int delayMs = 100;
+      {
+        ConfigMutexGuard configLock;
+        if (configLock.locked()) {
+          const bool wifiUp = WiFi.status() == WL_CONNECTED;
+          if ((wifiUp || (cfg.bufferUploadsToSd && sdReady)) && isFirmwareMotionOwner() &&
+              getCameraOperatingMode() == CameraOperatingMode::Motion &&
+              !isCameraStreamActive()) {
+            checkMotion();
+          }
+
+          const unsigned long now = millis();
+          if (isFirmwareMotionOwner() && wifiUp && !isCameraStreamActive() &&
+              now - lastBufferFlush >= kBufferFlushMs) {
+            lastBufferFlush = now;
+            flushOneBufferedUpload();
+          }
+
+          if (!stackWatermarkLogged) {
+            const UBaseType_t remainingStackBytes = uxTaskGetStackHighWaterMark(nullptr);
+            Serial.printf("Motion task running on core %d with %u-byte stack; "
+                          "minimum free stack after first loop: %u bytes\n",
+                          xPortGetCoreID(), static_cast<unsigned int>(kMotionTaskStackBytes),
+                          static_cast<unsigned int>(remainingStackBytes));
+            stackWatermarkLogged = true;
+          }
+
+          delayMs = constrain(cfg.motionCheckMs, 100, 60000);
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(delayMs));
+    }
+
+    motionTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+  }
+
+  bool startMotionTask() {
+    if (motionTaskHandle != nullptr) return true;
+    const BaseType_t result =
+        xTaskCreatePinnedToCore(motionTask, "motion", kMotionTaskStackBytes, nullptr,
+                                kMotionTaskPriority, &motionTaskHandle, ARDUINO_RUNNING_CORE);
+    if (result == pdPASS) return true;
+
+    motionTaskHandle = nullptr;
+    Serial.printf("Failed to create motion task: %ld\n", static_cast<long>(result));
+    return false;
+  }
+
 }  // namespace
 
 void setup() {
+  // A panic reboot (rst:0xc SW_CPU_RESET) only resets the CPUs, timers, SPI
+  // and UART. The camera's I2S0 DMA and the LEDC XCLK keep running from the
+  // previous boot and can keep writing frames into RAM the new boot has
+  // already handed to the Wi-Fi driver. Power the sensor down and reset both
+  // peripherals as early as possible.
+  pinMode(32, OUTPUT);  // camera PWDN (kPowerDownPin); HIGH = powered down
+  digitalWrite(32, HIGH);
+  periph_module_reset(PERIPH_I2S0_MODULE);
+  periph_module_reset(PERIPH_LEDC_MODULE);
+
   Serial.begin(115200);
+  Serial.printf("Reset reason: %d\n", static_cast<int>(esp_reset_reason()));
+
+  if (!initializeConfigMutex()) {
+    Serial.println("Could not initialize configuration mutex");
+    while (true) delay(1000);
+  }
 
   mountStorage();
+  // Persistent configuration is read once at boot. HTTP updates mutate cfg in
+  // RAM and saveConfig() persists that snapshot without a background reload.
   loadConfig();
   initializeUploadBuffer();
   initializeCameraRuntime(cfg.motionEnabled);
@@ -72,6 +154,10 @@ void setup() {
   }
 
   startWebServer();
+  cameraReady = true;
+  if (!startMotionTask()) {
+    setCameraRuntimeError("Could not start motion task");
+  }
 }
 
 void loop() {
@@ -79,87 +165,4 @@ void loop() {
 
   const unsigned long now = millis();
   maintainWifi(now);
-
-  // With the SD buffer available, motion capture keeps running through Wi-Fi drops.
-  const bool wifiUp = WiFi.status() == WL_CONNECTED;
-  if ((wifiUp || (cfg.bufferUploadsToSd && sdReady)) &&
-      isFirmwareMotionOwner() && getCameraOperatingMode() == CameraOperatingMode::Motion &&
-      !isCameraStreamActive() &&
-      now - lastMotionCheck >= static_cast<unsigned long>(cfg.motionCheckMs)) {
-    lastMotionCheck = now;
-    checkMotion();
-  }
-
-  // One buffered frame per pass so motion checks run between deliveries.
-  if (isFirmwareMotionOwner() && wifiUp && !isCameraStreamActive() &&
-      now - lastBufferFlush >= kBufferFlushMs) {
-    lastBufferFlush = now;
-    flushOneBufferedUpload();
-  }
-
-  if (isConfigStorageReady() && now - lastConfigCheck >= kConfigPollMs) {
-    lastConfigCheck = now;
-    const Config previousConfig = cfg;
-    loadConfig();
-    const bool framesizeChanged = cfg.framesize != previousConfig.framesize;
-    if (framesizeChanged && !applyCameraProfile()) {
-      Serial.println("Could not apply reloaded camera frame size; restoring previous config");
-      cfg = previousConfig;
-      selectCameraSensorProfile(getActiveCameraSensorKey());
-      invalidateConfigFileHash();
-    }
-    const bool wifiSettingsChanged = strcmp(cfg.wifiSsid, previousConfig.wifiSsid) != 0 ||
-                                     strcmp(cfg.wifiPassword, previousConfig.wifiPassword) != 0;
-    if (wifiSettingsChanged) {
-      Serial.println("Wi-Fi configuration changed; reconnecting");
-      WiFi.disconnect();
-      connectToWifi();
-    }
-    if (cfg.motionOwner != previousConfig.motionOwner ||
-        cfg.motionEnabled != previousConfig.motionEnabled) {
-      if (cfg.motionEnabled) {
-        armMotionDetection();
-      } else {
-        disarmMotionDetection();
-      }
-    } else if (getCameraOperatingMode() == CameraOperatingMode::Motion &&
-               (cfg.motionThreshold != previousConfig.motionThreshold ||
-                cfg.motionSensitivity != previousConfig.motionSensitivity ||
-                cfg.motionCheckMs != previousConfig.motionCheckMs ||
-                cfg.jpegQuality != previousConfig.jpegQuality ||
-                 cfg.framesize != previousConfig.framesize ||
-                 cfg.motionRoiX != previousConfig.motionRoiX ||
-                 cfg.motionRoiY != previousConfig.motionRoiY ||
-                 cfg.motionRoiWidth != previousConfig.motionRoiWidth ||
-                 cfg.motionRoiHeight != previousConfig.motionRoiHeight ||
-                 cfg.motionExposureSettleFrames != previousConfig.motionExposureSettleFrames ||
-                 cfg.motionExposureSettleTolerance != previousConfig.motionExposureSettleTolerance ||
-                 cfg.motionExposureShiftTolerance != previousConfig.motionExposureShiftTolerance ||
-                 cfg.motionBlockColumns != previousConfig.motionBlockColumns ||
-                 cfg.motionBlockRows != previousConfig.motionBlockRows ||
-                 cfg.motionRatioThreshold != previousConfig.motionRatioThreshold ||
-                 cfg.motionClipLow != previousConfig.motionClipLow ||
-                 cfg.motionClipHigh != previousConfig.motionClipHigh ||
-                 cfg.motionMaxClippedFraction != previousConfig.motionMaxClippedFraction ||
-                 cfg.motionMinValidBlocks != previousConfig.motionMinValidBlocks ||
-                 cfg.motionMaxChangedFraction != previousConfig.motionMaxChangedFraction)) {
-      resetMotionReference();
-    }
-    const bool captureSettingsChanged =
-        cfg.jpegQuality != previousConfig.jpegQuality || cfg.framesize != previousConfig.framesize;
-    const CameraSensorProfile *activeProfile = getCameraSensorProfile(getActiveCameraSensorKey());
-    const CameraSensorProfile *previousActiveProfile =
-        getActiveCameraSensorKey() == kOv2640SensorKey ? &previousConfig.ov2640
-                                                      : &previousConfig.ov5640;
-    if (activeProfile != nullptr && previousActiveProfile != nullptr &&
-        activeProfile->xclkHz != previousActiveProfile->xclkHz) {
-      Serial.println("Camera XCLK configuration changed; restart required to apply it");
-    }
-    if (captureSettingsChanged) {
-      markRegisterDumpPending();
-      if (!framesizeChanged && getCameraOperatingMode() == CameraOperatingMode::Idle) {
-        applyCameraSettings();
-      }
-    }
-  }
 }

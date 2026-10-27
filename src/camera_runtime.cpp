@@ -1,20 +1,53 @@
 #include "camera_runtime.h"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
 namespace {
 
 CameraOperatingMode selectedMode = CameraOperatingMode::Idle;
 CameraRuntimeState runtimeState = CameraRuntimeState::Idle;
 String lastError;
+StaticSemaphore_t runtimeMutexStorage;
+SemaphoreHandle_t runtimeMutex = nullptr;
+
+bool lockRuntime() {
+  if (runtimeMutex == nullptr) {
+    runtimeMutex = xSemaphoreCreateRecursiveMutexStatic(&runtimeMutexStorage);
+  }
+  return runtimeMutex != nullptr &&
+         xSemaphoreTakeRecursive(runtimeMutex, portMAX_DELAY) == pdTRUE;
+}
+
+void unlockRuntime() {
+  if (runtimeMutex != nullptr) xSemaphoreGiveRecursive(runtimeMutex);
+}
+
+class RuntimeMutexGuard {
+ public:
+  RuntimeMutexGuard() : locked_(lockRuntime()) {}
+  ~RuntimeMutexGuard() {
+    if (locked_) unlockRuntime();
+  }
+  bool locked() const { return locked_; }
+
+ private:
+  bool locked_;
+};
 
 }  // namespace
 
 void initializeCameraRuntime(bool motionEnabled) {
+  RuntimeMutexGuard runtimeLock;
+  if (!runtimeLock.locked()) return;
   selectedMode = motionEnabled ? CameraOperatingMode::Motion : CameraOperatingMode::Idle;
   runtimeState = motionEnabled ? CameraRuntimeState::MotionArming : CameraRuntimeState::Idle;
   lastError = "";
 }
 
 void selectCameraOperatingMode(CameraOperatingMode mode) {
+  RuntimeMutexGuard runtimeLock;
+  if (!runtimeLock.locked()) return;
   selectedMode = mode;
   if (runtimeState != CameraRuntimeState::Streaming) {
     runtimeState = mode == CameraOperatingMode::Motion ? CameraRuntimeState::MotionArming
@@ -22,7 +55,10 @@ void selectCameraOperatingMode(CameraOperatingMode mode) {
   }
 }
 
-CameraOperatingMode getCameraOperatingMode() { return selectedMode; }
+CameraOperatingMode getCameraOperatingMode() {
+  RuntimeMutexGuard runtimeLock;
+  return runtimeLock.locked() ? selectedMode : CameraOperatingMode::Idle;
+}
 
 const char *cameraOperatingModeName(CameraOperatingMode mode) {
   switch (mode) {
@@ -32,9 +68,15 @@ const char *cameraOperatingModeName(CameraOperatingMode mode) {
   return "idle";
 }
 
-void setCameraRuntimeState(CameraRuntimeState state) { runtimeState = state; }
+void setCameraRuntimeState(CameraRuntimeState state) {
+  RuntimeMutexGuard runtimeLock;
+  if (runtimeLock.locked()) runtimeState = state;
+}
 
-CameraRuntimeState getCameraRuntimeState() { return runtimeState; }
+CameraRuntimeState getCameraRuntimeState() {
+  RuntimeMutexGuard runtimeLock;
+  return runtimeLock.locked() ? runtimeState : CameraRuntimeState::Error;
+}
 
 const char *cameraRuntimeStateName(CameraRuntimeState state) {
   switch (state) {
@@ -51,13 +93,24 @@ const char *cameraRuntimeStateName(CameraRuntimeState state) {
   return "error";
 }
 
-bool isCameraStreamActive() { return runtimeState == CameraRuntimeState::Streaming; }
+bool isCameraStreamActive() {
+  RuntimeMutexGuard runtimeLock;
+  return runtimeLock.locked() && runtimeState == CameraRuntimeState::Streaming;
+}
 
 void setCameraRuntimeError(const String &message) {
+  RuntimeMutexGuard runtimeLock;
+  if (!runtimeLock.locked()) return;
   lastError = message;
   runtimeState = CameraRuntimeState::Error;
 }
 
-void clearCameraRuntimeError() { lastError = ""; }
+void clearCameraRuntimeError() {
+  RuntimeMutexGuard runtimeLock;
+  if (runtimeLock.locked()) lastError = "";
+}
 
-const String &getCameraRuntimeError() { return lastError; }
+String getCameraRuntimeError() {
+  RuntimeMutexGuard runtimeLock;
+  return runtimeLock.locked() ? lastError : String("runtime mutex unavailable");
+}

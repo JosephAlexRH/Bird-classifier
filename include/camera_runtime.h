@@ -31,4 +31,4 @@ bool isCameraStreamActive();
 
 void setCameraRuntimeError(const String &message);
 void clearCameraRuntimeError();
-const String &getCameraRuntimeError();
+String getCameraRuntimeError();

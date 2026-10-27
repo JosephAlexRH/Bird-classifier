@@ -29,6 +29,7 @@ try:
         write_inference_record,
     )
     from .camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
+    from .camera_dashboard_templates import PI_TABBED_DASHBOARD_HTML
     from .capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from .laptop_test_server import camera_url_argument, normalize_camera_url
     from .pi_motion import MotionService
@@ -47,6 +48,7 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
         write_inference_record,
     )
     from camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
+    from camera_dashboard_templates import PI_TABBED_DASHBOARD_HTML
     from capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from laptop_test_server import camera_url_argument, normalize_camera_url
     from pi_motion import MotionService
@@ -618,12 +620,7 @@ def create_app(
 
     @app.get("/")
     def dashboard() -> str:
-        selected = registry.resolve()
-        return render_template_string(
-            PI_DASHBOARD_HTML,
-            camera_url=(selected or {}).get("url", camera_url),
-            roi_control_js=ROI_CONTROL_JS,
-        )
+        return render_template_string(PI_TABBED_DASHBOARD_HTML)
 
     @app.get("/camera/capture")
     def camera_capture():
@@ -859,6 +856,37 @@ def create_app(
             return None
         path = store.root / f"{capture_id}.jpg"
         return path if path.is_file() else None
+
+    def latest_camera_capture(camera_id: str) -> Path | None:
+        if registry.get(camera_id) is None:
+            return None
+        paths = sorted(store.root.glob("capture_*.jpg"), key=lambda item: item.name, reverse=True)
+        for path in paths:
+            try:
+                sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if isinstance(sidecar, dict) and sidecar.get("camera_registry_id") == camera_id:
+                return path
+        return None
+
+    @app.get("/api/cameras/<camera_id>/latest")
+    def latest_camera_detail(camera_id: str):
+        if registry.get(camera_id) is None:
+            return jsonify(error="Camera not found."), 404
+        path = latest_camera_capture(camera_id)
+        if path is None:
+            return jsonify(error="No capture has been saved for this camera yet."), 404
+        return jsonify(capture_summary(path))
+
+    @app.get("/api/cameras/<camera_id>/latest.jpg")
+    def latest_camera_image(camera_id: str):
+        if registry.get(camera_id) is None:
+            return jsonify(error="Camera not found."), 404
+        path = latest_camera_capture(camera_id)
+        if path is None:
+            return jsonify(error="No image has been saved for this camera yet."), 404
+        return send_file(path, mimetype="image/jpeg", max_age=0)
 
     @app.get("/api/captures")
     def captures() -> Response:

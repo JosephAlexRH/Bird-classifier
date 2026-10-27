@@ -5,6 +5,7 @@
 #include <HTTPClient.h>
 #include <esp_camera.h>
 #include <img_converters.h>
+#include <esp_heap_caps.h>
 
 #include "app_config.h"
 #include "camera_runtime.h"
@@ -21,6 +22,8 @@ constexpr int kMotionHeight = 60;
 constexpr int kMotionPixels = kMotionWidth * kMotionHeight;
 constexpr int kMotionRgb565Bytes = kMotionPixels * 2;
 constexpr unsigned long kUploadFailureCooldownMs = 15000;
+constexpr unsigned long kCaptureFailureBackoffMs = 1500;
+constexpr uint32_t kCameraRecoveryFailureThreshold = 3;
 
 volatile bool motionFlag = false;
 uint8_t referenceFrame[kMotionPixels];
@@ -33,6 +36,14 @@ unsigned long lastMotionMs = 0;
 float lastChangedFraction = 0.0f;
 bool lastMotionCaptureSuccessful = false;
 bool lastMotionUploadSuccessful = false;
+unsigned long lastCaptureFailureMs = 0;
+unsigned long lastCaptureDurationMs = 0;
+unsigned long lastSuccessfulCaptureMs = 0;
+uint32_t captureFailureCount = 0;
+uint32_t consecutiveCaptureFailures = 0;
+uint32_t cameraRecoveryAttempts = 0;
+uint32_t cameraRecoverySuccesses = 0;
+const char *lastCaptureOperation = "not_started";
 int consecutiveTriggers = 0;
 bool exposureSettled = false;
 int exposureSettleCount = 0;
@@ -51,6 +62,28 @@ const char *lastDecision = "not_started";
 float blockRatios[kMaxMotionBlocks];
 float blockReferenceMeans[kMaxMotionBlocks];
 float blockCurrentMeans[kMaxMotionBlocks];
+
+void noteCaptureFailure(const char *operation, const String &message, unsigned long startedMs) {
+  lastMotionCaptureSuccessful = false;
+  lastCaptureFailureMs = millis();
+  lastCaptureDurationMs = lastCaptureFailureMs - startedMs;
+  ++captureFailureCount;
+  ++consecutiveCaptureFailures;
+  lastCaptureOperation = operation;
+  lastDecision = operation;
+  setCameraRuntimeError(message);
+  Serial.printf("Motion capture failure during %s after %lu ms (%lu consecutive): %s\n",
+                operation, lastCaptureDurationMs,
+                static_cast<unsigned long>(consecutiveCaptureFailures), message.c_str());
+}
+
+void noteCaptureSuccess(const char *operation, unsigned long startedMs) {
+  const unsigned long now = millis();
+  lastCaptureDurationMs = now - startedMs;
+  lastSuccessfulCaptureMs = now;
+  consecutiveCaptureFailures = 0;
+  lastCaptureOperation = operation;
+}
 
 bool postFrame(const CapturedJpeg &capture) {
   camera_fb_t *frameBuffer = capture.frameBuffer;
@@ -224,7 +257,61 @@ bool isSupportedMotionFrame(const camera_fb_t *frameBuffer) {
          (frameBuffer->width == 640 && frameBuffer->height == 480);
 }
 
+// Reads the width and height from the JPEG's own SOF header. jpg2rgb565 sizes
+// its output from this header, not from frameBuffer->width/height.
+bool readJpegDimensions(const uint8_t *data, size_t length, uint16_t &width, uint16_t &height) {
+  if (length < 4 || data[0] != 0xff || data[1] != 0xd8) return false;
+  size_t index = 2;
+  while (index + 9 < length) {
+    if (data[index] != 0xff) return false;
+    const uint8_t marker = data[index + 1];
+    if (marker == 0xff) {
+      ++index;
+      continue;
+    }
+    if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd8)) {
+      index += 2;
+      continue;
+    }
+    if (marker == 0xda || marker == 0xd9) return false;  // scan data before any SOF
+    const size_t segmentLength = (static_cast<size_t>(data[index + 2]) << 8) | data[index + 3];
+    if (segmentLength < 2) return false;
+    if (marker >= 0xc0 && marker <= 0xcf && marker != 0xc4 && marker != 0xc8 &&
+        marker != 0xcc) {
+      height = (static_cast<uint16_t>(data[index + 5]) << 8) | data[index + 6];
+      width = (static_cast<uint16_t>(data[index + 7]) << 8) | data[index + 8];
+      return true;
+    }
+    index += 2 + segmentLength;
+  }
+  return false;
+}
+
+void checkInternalHeap(const char *where) {
+  if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true)) {
+    Serial.printf("HEAP CORRUPTION detected after %s\n", where);
+  }
+}
+
+uint32_t rejectedMotionJpegCount = 0;
+
 bool decodeMotionFrame(const camera_fb_t *frameBuffer) {
+  // decodedMotionFrame holds exactly 80x60 RGB565. If the JPEG header is larger
+  // than the size the driver labelled the buffer with (a stale frame after a
+  // size change, or a corrupted header), jpg2rgb565 would write past the end of
+  // this static array into neighbouring RAM. Refuse instead.
+  uint16_t jpegWidth = 0;
+  uint16_t jpegHeight = 0;
+  if (!readJpegDimensions(frameBuffer->buf, frameBuffer->len, jpegWidth, jpegHeight) ||
+      jpegWidth != frameBuffer->width || jpegHeight != frameBuffer->height) {
+    ++rejectedMotionJpegCount;
+    Serial.printf("Rejected motion JPEG #%lu: header %ux%u, buffer labelled %ux%u, %u bytes\n",
+                  static_cast<unsigned long>(rejectedMotionJpegCount), jpegWidth, jpegHeight,
+                  static_cast<unsigned int>(frameBuffer->width),
+                  static_cast<unsigned int>(frameBuffer->height),
+                  static_cast<unsigned int>(frameBuffer->len));
+    return false;
+  }
   if (frameBuffer->width == 160 && frameBuffer->height == 120) {
     return jpg2rgb565(frameBuffer->buf, frameBuffer->len, decodedMotionFrame, JPG_SCALE_2X);
   }
@@ -331,16 +418,42 @@ void checkMotion() {
       isCameraStreamActive()) {
     return;
   }
+  if (isMotionCaptureBackoffActive()) return;
+
+  const unsigned long analysisStartedMs = millis();
+  if (consecutiveCaptureFailures >= kCameraRecoveryFailureThreshold) {
+    ++cameraRecoveryAttempts;
+    lastCaptureOperation = "camera_reinitialize";
+    Serial.printf("Reinitializing camera after %lu consecutive capture failures\n",
+                  static_cast<unsigned long>(consecutiveCaptureFailures));
+    if (!reinitializeActiveCamera()) {
+      noteCaptureFailure("camera_reinitialize", "Camera reinitialization failed",
+                         analysisStartedMs);
+      return;
+    }
+
+    ++cameraRecoverySuccesses;
+    consecutiveCaptureFailures = 0;
+    lastCaptureDurationMs = millis() - analysisStartedMs;
+    lastCaptureOperation = "camera_reinitialized";
+    resetMotionReference();
+    clearCameraRuntimeError();
+    setCameraRuntimeState(CameraRuntimeState::MotionArming);
+    Serial.printf("Camera reinitialized in %lu ms; motion reference will be relearned\n",
+                  lastCaptureDurationMs);
+    return;
+  }
 
   bool modeChanged = false;
   if (!configureMotionCapture(modeChanged)) {
-    setCameraRuntimeError("Could not configure motion capture mode");
+    noteCaptureFailure("configure", "Could not configure motion capture mode", analysisStartedMs);
     return;
   }
   if (modeChanged) {
     // A buffer already in flight can still use the previous JPEG mode.
     if (!drainCameraBuffer()) {
-      setCameraRuntimeError("Could not drain stale motion frame");
+      noteCaptureFailure("mode_change_drain", "Could not drain stale motion frame",
+                         analysisStartedMs);
       return;
     }
     // A frame-size transition restarts AEC/AGC convergence. Keep an existing
@@ -350,29 +463,32 @@ void checkMotion() {
 
   // The queued frame was grabbed just after the previous check and is a whole
   // check interval old. A mode change has already drained it.
-  if (!modeChanged && !discardQueuedCameraFrame()) {
-    setCameraRuntimeError("Could not discard stale motion frame");
+  if (!modeChanged && !cameraUsesLatestFrameGrab() && !discardQueuedCameraFrame()) {
+    noteCaptureFailure("analysis_discard", "Could not discard stale motion frame",
+                       analysisStartedMs);
     return;
   }
 
   camera_fb_t *frameBuffer = acquireCameraFrame();
   if (!isCompleteJpeg(frameBuffer) || !isSupportedMotionFrame(frameBuffer)) {
     if (frameBuffer != nullptr) {
-      esp_camera_fb_return(frameBuffer);
+      releaseCameraFrame(frameBuffer);
     }
-    setCameraRuntimeError("Motion JPEG frame capture failed");
+    noteCaptureFailure("analysis_capture", "Motion JPEG frame capture failed", analysisStartedMs);
     return;
   }
 
   if (!decodeMotionFrame(frameBuffer)) {
-    esp_camera_fb_return(frameBuffer);
-    setCameraRuntimeError("Motion JPEG decode failed");
+    releaseCameraFrame(frameBuffer);
+    noteCaptureFailure("analysis_decode", "Motion JPEG decode failed", analysisStartedMs);
     return;
   }
   // Read AEC/AGC while this exact framebuffer is retained. This is a post-frame,
   // non-atomic sensor observation, so several consecutive products must agree.
   const ExposureGainSample exposure = sampleExposureGain();
-  esp_camera_fb_return(frameBuffer);
+  releaseCameraFrame(frameBuffer);
+  checkInternalHeap("motion decode");  // DIAGNOSTIC
+  noteCaptureSuccess("analysis", analysisStartedMs);
 
   if (!exposureSettled && !updateExposureSettling(exposure)) {
     clearCameraRuntimeError();
@@ -460,15 +576,17 @@ void checkMotion() {
   }
   if (!offline) uploadCoolingDown = false;
 
-  // One framebuffer means the burst is capture -> upload -> capture; the sensor
-  // stays in the full-resolution mode for every frame after the first.
+  // The OV5640 uses a latest-frame queue. Copy each JPEG to owned PSRAM and
+  // return the driver framebuffer before network or SD I/O so capture can continue.
   const int burstCount = constrain(cfg.burstCount, 1, kMaxBurstCount);
   for (int shot = 0; shot < burstCount; ++shot) {
+    const unsigned long burstStartedMs = millis();
     if (shot > 0) {
       delay(constrain(cfg.burstIntervalMs, 0, kMaxBurstIntervalMs));
-      // Drop the frame queued while the previous one was uploading.
-      if (!discardQueuedCameraFrame()) {
-        setCameraRuntimeError("Could not discard stale burst frame");
+      // One-buffer OV2640 mode can contain the frame queued during upload.
+      if (!cameraUsesLatestFrameGrab() && !discardQueuedCameraFrame()) {
+        noteCaptureFailure("burst_discard", "Could not discard stale burst frame",
+                           burstStartedMs);
         break;
       }
     }
@@ -476,13 +594,28 @@ void checkMotion() {
     CapturedJpeg capture;
     setCameraRuntimeState(CameraRuntimeState::Capturing);
     if (!captureJpeg(capture)) {
-      setCameraRuntimeError("Motion JPEG capture failed");
+      noteCaptureFailure("burst_capture", "Motion JPEG capture failed", burstStartedMs);
       break;
     }
+
+    camera_fb_t ownedFrame = *capture.frameBuffer;
+    ownedFrame.buf = static_cast<uint8_t *>(psramFound() ? ps_malloc(ownedFrame.len)
+                                                         : malloc(ownedFrame.len));
+    if (ownedFrame.buf == nullptr) {
+      releaseCameraFrame(capture.frameBuffer);
+      noteCaptureFailure("burst_copy", "Not enough memory to retain motion JPEG",
+                         burstStartedMs);
+      break;
+    }
+    memcpy(ownedFrame.buf, capture.frameBuffer->buf, ownedFrame.len);
+    releaseCameraFrame(capture.frameBuffer);
+    capture.frameBuffer = &ownedFrame;
+    noteCaptureSuccess("burst_capture", burstStartedMs);
     lastMotionCaptureSuccessful = true;
     bool delivered = false;
     if (!offline) {
       delivered = postFrame(capture);
+      checkInternalHeap("burst upload");  // DIAGNOSTIC
       if (!delivered) {
         noteMotionUploadFailure();
         offline = true;  // The rest of this burst goes straight to SD.
@@ -490,7 +623,7 @@ void checkMotion() {
     }
     const bool buffered =
         !delivered && bufferUpload(capture.frameBuffer, buildCameraMetadata(capture.metadata, "motion"));
-    esp_camera_fb_return(capture.frameBuffer);
+    free(ownedFrame.buf);
     if (!delivered && !buffered) break;
     clearCameraRuntimeError();
     Serial.printf("Burst frame %d/%d %s\n", shot + 1, burstCount,
@@ -512,6 +645,8 @@ void checkMotion() {
 }
 
 void armMotionDetection() {
+  ConfigMutexGuard configLock;
+  if (!configLock.locked()) return;
   if (!isFirmwareMotionOwner()) {
     cfg.motionEnabled = false;
     selectCameraOperatingMode(CameraOperatingMode::Idle);
@@ -528,6 +663,8 @@ void armMotionDetection() {
 }
 
 void disarmMotionDetection() {
+  ConfigMutexGuard configLock;
+  if (!configLock.locked()) return;
   cfg.motionEnabled = false;
   selectCameraOperatingMode(CameraOperatingMode::Idle);
   resetMotionReference();
@@ -579,6 +716,25 @@ float getLastChangedFraction() { return lastChangedFraction; }
 bool wasLastMotionCaptureSuccessful() { return lastMotionCaptureSuccessful; }
 
 bool wasLastMotionUploadSuccessful() { return lastMotionUploadSuccessful; }
+
+bool isMotionCaptureBackoffActive() {
+  return consecutiveCaptureFailures > 0 &&
+         millis() - lastCaptureFailureMs < kCaptureFailureBackoffMs;
+}
+
+uint32_t getMotionCaptureFailureCount() { return captureFailureCount; }
+
+uint32_t getConsecutiveMotionCaptureFailures() { return consecutiveCaptureFailures; }
+
+uint32_t getMotionCameraRecoveryAttempts() { return cameraRecoveryAttempts; }
+
+uint32_t getMotionCameraRecoverySuccesses() { return cameraRecoverySuccesses; }
+
+unsigned long getLastMotionCaptureDurationMs() { return lastCaptureDurationMs; }
+
+unsigned long getLastSuccessfulMotionCaptureMs() { return lastSuccessfulCaptureMs; }
+
+const char *getLastMotionCaptureOperation() { return lastCaptureOperation; }
 
 void noteMotionUploadFailure() {
   lastUploadFailure = millis();

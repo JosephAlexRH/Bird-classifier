@@ -573,6 +573,10 @@ class LaptopServerTests(unittest.TestCase):
 
     def test_dashboard_has_mouse_touch_roi_editor(self) -> None:
         dashboard = self.client.get("/").get_data(as_text=True)
+        self.assertIn('id="camera-tabs"', dashboard)
+        self.assertIn('role="tablist"', dashboard)
+        self.assertIn("/api/cameras/${encodeURIComponent(activeCameraId)}", dashboard)
+        self.assertIn("onboard_motion_detection", dashboard)
         self.assertIn('id="roi-overlay"', dashboard)
         self.assertIn("pointerdown", dashboard)
         self.assertIn("Load current ROI", dashboard)
@@ -601,6 +605,51 @@ class LaptopServerTests(unittest.TestCase):
             response = self.client.post("/api/profiles")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["schema_version"], 3)
+
+    @patch("server.laptop_test_server.urlopen")
+    def test_scoped_camera_tabs_do_not_require_changing_the_default(self, mocked_urlopen) -> None:
+        registry = self.app.config["CAMERA_REGISTRY"]
+        first = registry.resolve()
+        second = registry.add("Side yard", "http://camera-two.local", make_default=False)
+        mocked_urlopen.return_value = FakeUpstream(b'{"camera_id":"two"}')
+
+        response = self.client.get(f"/api/cameras/{second['id']}/status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mocked_urlopen.call_args.args[0].full_url, "http://camera-two.local/status")
+        self.assertEqual(registry.resolve()["id"], first["id"])
+
+    @patch("server.laptop_test_server.urlopen")
+    def test_scoped_latest_image_is_isolated_per_camera_tab(self, mocked_urlopen) -> None:
+        registry = self.app.config["CAMERA_REGISTRY"]
+        first = registry.resolve()
+        second = registry.add("Side yard", "http://camera-two.local", make_default=False)
+        second_jpeg = b"\xff\xd8second-camera\xff\xd9"
+
+        def respond(outgoing, timeout):
+            del timeout
+            if outgoing.full_url.startswith("http://camera-two.local"):
+                return FakeUpstream(second_jpeg, "image/jpeg")
+            return FakeUpstream(JPEG, "image/jpeg")
+
+        mocked_urlopen.side_effect = respond
+        self.assertEqual(
+            self.client.post(f"/api/cameras/{first['id']}/captures", json={}).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post(f"/api/cameras/{second['id']}/captures", json={}).status_code,
+            200,
+        )
+
+        first_image = self.client.get(f"/api/cameras/{first['id']}/latest.jpg")
+        second_image = self.client.get(f"/api/cameras/{second['id']}/latest.jpg")
+        try:
+            self.assertEqual(first_image.data, JPEG)
+            self.assertEqual(second_image.data, second_jpeg)
+        finally:
+            first_image.close()
+            second_image.close()
 
 
 class LaptopStartupDiagnosticsTests(unittest.TestCase):
@@ -780,6 +829,9 @@ class RaspberryPiServerTests(unittest.TestCase):
 
     def test_dashboard_has_roi_controls_and_unconfigured_proxy_is_503(self) -> None:
         dashboard = self.client.get("/").get_data(as_text=True)
+        self.assertIn('id="camera-tabs"', dashboard)
+        self.assertIn('role="tablist"', dashboard)
+        self.assertIn("onboard_motion_detection", dashboard)
         self.assertIn('id="roi-overlay"', dashboard)
         self.assertIn("pointerdown", dashboard)
         self.assertIn("Load current ROI", dashboard)
@@ -1132,6 +1184,14 @@ class RaspberryPiServerTests(unittest.TestCase):
             f"/api/captures?camera_registry_id={camera['id']}"
         ).get_json()
         self.assertEqual([item["capture_id"] for item in listing["captures"]], [record["capture_id"]])
+        latest = app.test_client().get(f"/api/cameras/{camera['id']}/latest")
+        self.assertEqual(latest.status_code, 200)
+        self.assertEqual(latest.get_json()["capture_id"], record["capture_id"])
+        latest_image = app.test_client().get(f"/api/cameras/{camera['id']}/latest.jpg")
+        try:
+            self.assertEqual(latest_image.data, JPEG)
+        finally:
+            latest_image.close()
         app.config["CLEANUP"]()
 
 
