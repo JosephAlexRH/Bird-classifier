@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import socket
 import threading
@@ -17,7 +18,10 @@ from flask import Flask, Response, jsonify, render_template_string, request, sen
 
 try:
     from .camera_dashboard_templates import LAPTOP_TABBED_DASHBOARD_HTML
-    from .camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
+    from .camera_registry import (
+        CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address,
+        sync_registry_from_heartbeat,
+    )
     from .capture_storage import (
         METADATA_HEADER,
         CalibrationType,
@@ -27,10 +31,16 @@ try:
         parse_calibration_type,
         parse_camera_metadata,
     )
+    from .fleet_monitor import FleetMonitor, register_fleet_routes
+    from .hub_clock import HubClock, step_system_clock
+    from .run_log import HubStatusLogger, RunLog
     from .roi_control import ROI_CONTROL_JS
 except ImportError:  # Direct execution: python server/laptop_test_server.py
     from camera_dashboard_templates import LAPTOP_TABBED_DASHBOARD_HTML
-    from camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
+    from camera_registry import (
+        CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address,
+        sync_registry_from_heartbeat,
+    )
     from capture_storage import (
         METADATA_HEADER,
         CalibrationType,
@@ -40,6 +50,9 @@ except ImportError:  # Direct execution: python server/laptop_test_server.py
         parse_calibration_type,
         parse_camera_metadata,
     )
+    from fleet_monitor import FleetMonitor, register_fleet_routes
+    from hub_clock import HubClock, step_system_clock
+    from run_log import HubStatusLogger, RunLog
     from roi_control import ROI_CONTROL_JS
 
 
@@ -153,6 +166,7 @@ def print_startup_targets(host: str, port: int, camera_url: str | None) -> str |
     print(f"Local dashboard: http://127.0.0.1:{port}", flush=True)
     if source_ip:
         print(f"LAN dashboard: http://{source_ip}:{port}", flush=True)
+        print(f"Previous dashboard: http://{source_ip}:{port}/legacy", flush=True)
         print(f"ESP32 upload target: http://{source_ip}:{port}/upload", flush=True)
     else:
         print(f"LAN dashboard: unavailable (server bind: {host}:{port})", flush=True)
@@ -518,6 +532,9 @@ def create_app(
     registry_file: Path | None = None,
     camera_registry: CameraRegistry | None = None,
     start_registry_poller: bool = False,
+    auto_register_cameras: bool = True,
+    manage_system_clock: bool = False,
+    start_hub_status: bool = False,
 ) -> Flask:
     """Create the Flask application. Parameters are injectable for tests."""
     app = Flask(__name__)
@@ -538,6 +555,43 @@ def create_app(
     if start_registry_poller:
         registry.start()
     app.config["CAMERA_REGISTRY"] = registry
+    # Permanent run log + hub time keeping for unattended deployments.
+    run_log = RunLog(store.root / "runlog")
+    hub_clock = HubClock(
+        store.root / "hub_clock.json",
+        set_system_time=step_system_clock if manage_system_clock else None,
+        journal=run_log.write,
+    )
+    run_log.context = lambda: {"hub_boot": hub_clock.boot_id, "clock": hub_clock.state()["source"]}
+    hub_status_logger = HubStatusLogger(run_log, store.root, hub_clock)
+    app.config["RUN_LOG"], app.config["HUB_CLOCK"] = run_log, hub_clock
+    app.config["HUB_STATUS_LOGGER"] = hub_status_logger
+    if start_hub_status:
+        run_log.write("hub_start", pid=os.getpid(), save_dir=str(store.root), clock_state=hub_clock.state())
+        hub_status_logger.start()
+
+    def registry_log(message: str) -> None:
+        print(message, flush=True)
+        run_log.write("registry", message=message)
+    fleet = FleetMonitor(
+        store.root / "fleet.json",
+        name_lookup=lambda hardware_id: (registry.get_by_hardware_id(hardware_id) or {}).get("name"),
+    )
+    app.config["FLEET_MONITOR"] = fleet
+
+    def heartbeat_seen(payload: dict[str, Any], remote_addr: str | None) -> None:
+        # Cameras announce themselves: new ones are added, moved ones re-addressed.
+        sync_registry_from_heartbeat(registry, payload, remote_addr, log=registry_log)
+
+    register_fleet_routes(
+        app,
+        fleet,
+        capture_dir=store.root,
+        dashboard_paths=("/", "/fleet"),
+        on_heartbeat=heartbeat_seen if auto_register_cameras else None,
+        run_log=run_log,
+        hub_clock=hub_clock,
+    )
     app.config["CLEANUP"] = registry.stop
     state_lock = threading.Lock()
     camera_state: dict[str, Any] = {
@@ -810,7 +864,7 @@ def create_app(
             latest["path"] = store.root / record["filename"]
             latest["record"] = record
 
-    @app.get("/")
+    @app.get("/legacy")
     def dashboard() -> str:
         return render_template_string(LAPTOP_TABBED_DASHBOARD_HTML)
 
@@ -1190,6 +1244,21 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_REGISTRY_FILE,
         help=f"Persistent multi-camera registry (default: {DEFAULT_REGISTRY_FILE})",
     )
+    parser.add_argument(
+        "--hub-name",
+        default="birdhub",
+        help="Name cameras look this server up by, as <name>.local (default: birdhub)",
+    )
+    parser.add_argument(
+        "--no-advertise",
+        action="store_true",
+        help="Do not answer for <hub-name>.local; cameras then need server_ip",
+    )
+    parser.add_argument(
+        "--no-auto-register",
+        action="store_true",
+        help="Do not add or re-address cameras from their heartbeats; manage the registry by hand",
+    )
     return parser.parse_args()
 
 
@@ -1206,8 +1275,21 @@ if __name__ == "__main__":
         probe_camera=True,
         registry_file=args.registry_file,
         start_registry_poller=True,
+        auto_register_cameras=not args.no_auto_register,
+        manage_system_clock=True,
+        start_hub_status=True,
+    )
+    try:
+        from .hub_advertiser import start_hub_advertiser
+    except ImportError:
+        from hub_advertiser import start_hub_advertiser
+    advertiser = (
+        None if args.no_advertise else start_hub_advertiser(args.hub_name, args.port, bind_host=args.host)
     )
     try:
         application.run(host=args.host, port=args.port, debug=False, threaded=True)
     finally:
+        if advertiser is not None:
+            advertiser.stop()
+        application.config["HUB_STATUS_LOGGER"].stop()
         application.config["CLEANUP"]()

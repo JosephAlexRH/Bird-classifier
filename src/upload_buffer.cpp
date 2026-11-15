@@ -9,6 +9,7 @@
 #include "app_config.h"
 #include "camera_runtime.h"
 #include "camera_service.h"
+#include "hub_locator.h"
 #include "motion_detector.h"
 
 namespace {
@@ -164,7 +165,7 @@ void flushOneBufferedUpload() {
 
   HTTPClient http;
   char url[64];
-  snprintf(url, sizeof(url), "http://%s:%d/upload", cfg.serverIp, cfg.serverPort);
+  formatHubUrl(url, sizeof(url), "/upload");
   http.begin(url);
   http.addHeader("Content-Type", "image/jpeg");
   if (metadata.length() > 0) http.addHeader("X-ESP32-Camera-Metadata", metadata);

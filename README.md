@@ -96,7 +96,9 @@ copied into the draft, preventing them from biasing a blind review. Cyan boxes
 are saved or newly drawn human-review boxes. Drag empty image space to add a
 box, drag inside a box to select/move it, and drag a selected corner to resize
 it. Shift-drag to add a box overlapping an existing box. The Delete key removes
-only the selected box. Run
+only the selected box. **Delete Picture + JSON** (or Shift+Delete) immediately
+deletes the current image and its same-stem JSON sidecar without a confirmation
+dialog, then advances to the next available image. Run
 `python .\bbox_viewer.py --help` for all options and shortcuts.
 
 Quote paths containing spaces. In PowerShell, a backtick (`` ` ``), not a
@@ -142,7 +144,8 @@ running clock.
 | `sensors.<key>.frame_size` | string or int | Capture size from `QQVGA` through the sensor maximum, such as `VGA`; numeric `framesize_t` values remain accepted for migration |
 | `sensors.<key>.jpeg_quality` | int | Sensor-specific JPEG quality (0 = best, 63 = worst) |
 | `sensors.<key>.xclk_hz` | int | Sensor-specific boot clock in Hz: 6-24 MHz for OV2640 and 6-27 MHz for OV5640; changing it requires a restart |
-| `server_ip` | string | IP address of the receiving server |
+| `server_host` | string | Name of the receiving server, looked up on the local network (default `birdhub.local`); see `server/README.md` |
+| `server_ip` | string | IP address of the receiving server; fallback when `server_host` cannot be found |
 | `server_port` | int | Port the receiving server listens on |
 | `save_birds_to_sd` | bool | Save classifier-confirmed bird JPEGs under `/birds` on the physical SD card |
 | `pipeline.bird_confidence_threshold` | float | Minimum classifier confidence (0-1) required for an SD save |

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import shutil
@@ -51,6 +52,15 @@ class CopyConfirmedTests(unittest.TestCase):
         sidecar_path.write_text(json.dumps(data), encoding="utf-8")
         return image_path, sidecar_path
 
+    def write_annotations(self, rows: list[dict[str, str]]) -> Path:
+        path = self.root / "bird_annotations.csv"
+        fields = ["sample_id", "review_state", "image_path", "relative_path"]
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        return path
+
     def test_discovers_both_bird_and_no_bird_labels_recursively(self) -> None:
         bird_image, bird_sidecar = self.write_capture(
             self.source / "day-one", "bird", bird_present=True
@@ -95,6 +105,145 @@ class CopyConfirmedTests(unittest.TestCase):
         result = copy_confirmed.discover_confirmed(self.source.parent, self.destination)
 
         self.assertEqual([capture.image_path for capture in result.captures], [source_image])
+
+    def test_discovers_csv_confirmations_and_deduplicates_multiple_boxes(self) -> None:
+        bird_image, bird_sidecar = self.write_capture(
+            self.source / "nested", "bird", bird_present=None
+        )
+        empty_image, empty_sidecar = self.write_capture(
+            self.source, "empty", bird_present=None
+        )
+        ignored_image, _ = self.write_capture(
+            self.source, "ignored", bird_present=None
+        )
+        annotations = self.write_annotations([
+            {
+                "sample_id": "bird",
+                "review_state": "boxed",
+                "image_path": str(bird_image),
+                "relative_path": "nested/bird.jpg",
+            },
+            {
+                "sample_id": "bird",
+                "review_state": "boxed",
+                "image_path": str(bird_image),
+                "relative_path": "nested/bird.jpg",
+            },
+            {
+                "sample_id": "empty",
+                "review_state": "no_bird",
+                "image_path": str(empty_image),
+                "relative_path": "empty.jpg",
+            },
+            {
+                "sample_id": "ignored",
+                "review_state": "skipped",
+                "image_path": str(ignored_image),
+                "relative_path": "ignored.jpg",
+            },
+        ])
+
+        result = copy_confirmed.discover_confirmed_from_annotations(
+            annotations, self.source
+        )
+
+        self.assertEqual(
+            {(item.image_path, item.sidecar_path) for item in result.captures},
+            {(bird_image, bird_sidecar), (empty_image, empty_sidecar)},
+        )
+        self.assertEqual(result.annotation_rows, 4)
+        self.assertEqual(result.duplicate_annotation_rows, 1)
+        self.assertEqual(result.ignored_annotation_rows, 1)
+        self.assertEqual(result.sidecars_scanned, 2)
+        self.assertEqual(result.missing_images, [])
+        self.assertEqual(result.missing_sidecars, [])
+
+    def test_csv_discovery_reports_missing_image_and_sidecar(self) -> None:
+        image = self.source / "no-sidecar.jpg"
+        image.write_bytes(b"image without metadata")
+        annotations = self.write_annotations([
+            {
+                "sample_id": "missing-image",
+                "review_state": "boxed",
+                "image_path": str(self.source / "missing-image.jpg"),
+                "relative_path": "missing-image.jpg",
+            },
+            {
+                "sample_id": "no-sidecar",
+                "review_state": "no_bird",
+                "image_path": str(image),
+                "relative_path": image.name,
+            },
+        ])
+
+        result = copy_confirmed.discover_confirmed_from_annotations(
+            annotations, self.source
+        )
+
+        self.assertEqual(result.captures, [])
+        self.assertEqual(result.missing_images, [self.source / "missing-image.jpg"])
+        self.assertEqual(result.missing_sidecars, [image.with_suffix(".json")])
+
+    def test_csv_discovery_rejects_inconsistent_duplicate_sample_paths(self) -> None:
+        first, _ = self.write_capture(self.source, "first", bird_present=None)
+        second, _ = self.write_capture(self.source, "second", bird_present=None)
+        annotations = self.write_annotations([
+            {
+                "sample_id": "same-id",
+                "review_state": "boxed",
+                "image_path": str(first),
+                "relative_path": first.name,
+            },
+            {
+                "sample_id": "same-id",
+                "review_state": "boxed",
+                "image_path": str(second),
+                "relative_path": second.name,
+            },
+        ])
+
+        with self.assertRaisesRegex(ValueError, "inconsistent paths"):
+            copy_confirmed.discover_confirmed_from_annotations(
+                annotations, self.source
+            )
+
+    @mock.patch("copy_confirmed.subprocess.run")
+    def test_csv_cli_dry_run_move_queues_image_and_sidecar(
+        self, run: mock.Mock
+    ) -> None:
+        image, sidecar = self.write_capture(
+            self.source, "capture", bird_present=None
+        )
+        annotations = self.write_annotations([
+            {
+                "sample_id": "capture",
+                "review_state": "boxed",
+                "image_path": str(image),
+                "relative_path": image.name,
+            },
+        ])
+        run.return_value = subprocess.CompletedProcess([], 1)
+
+        with mock.patch(
+            "copy_confirmed.sys.argv",
+            [
+                "copy_confirmed.py",
+                str(self.source),
+                str(self.destination),
+                "--annotations",
+                str(annotations),
+                "--move",
+                "--dry-run",
+            ],
+        ):
+            copy_confirmed.main()
+
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertIn(image.name, command)
+        self.assertIn(sidecar.name, command)
+        self.assertIn("/L", command)
+        self.assertIn("/MOV", command)
 
     @mock.patch("copy_confirmed.subprocess.run")
     def test_dry_run_queues_image_and_sidecar_without_creating_manifest(

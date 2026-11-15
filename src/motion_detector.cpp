@@ -10,6 +10,8 @@
 #include "app_config.h"
 #include "camera_runtime.h"
 #include "camera_service.h"
+#include "device_health.h"
+#include "hub_locator.h"
 #include "image_storage.h"
 #include "upload_buffer.h"
 
@@ -72,9 +74,9 @@ void noteCaptureFailure(const char *operation, const String &message, unsigned l
   lastCaptureOperation = operation;
   lastDecision = operation;
   setCameraRuntimeError(message);
-  Serial.printf("Motion capture failure during %s after %lu ms (%lu consecutive): %s\n",
-                operation, lastCaptureDurationMs,
-                static_cast<unsigned long>(consecutiveCaptureFailures), message.c_str());
+  logEvent("motion: %s failed after %lu ms (%lu in a row): %s", operation,
+           lastCaptureDurationMs, static_cast<unsigned long>(consecutiveCaptureFailures),
+           message.c_str());
 }
 
 void noteCaptureSuccess(const char *operation, unsigned long startedMs) {
@@ -91,7 +93,7 @@ bool postFrame(const CapturedJpeg &capture) {
   lastMotionUploadSuccessful = false;
   HTTPClient http;
   char url[64];
-  snprintf(url, sizeof(url), "http://%s:%d/upload", cfg.serverIp, cfg.serverPort);
+  formatHubUrl(url, sizeof(url), "/upload");
 
   http.begin(url);
   http.addHeader("Content-Type", "image/jpeg");
@@ -107,7 +109,7 @@ bool postFrame(const CapturedJpeg &capture) {
 
   const int httpCode = http.POST(frameBuffer->buf, frameBuffer->len);
   if (httpCode <= 0) {
-    Serial.printf("POST failed: %s\n", http.errorToString(httpCode).c_str());
+    logEvent("upload: POST failed: %s", http.errorToString(httpCode).c_str());
     recordClassificationResult(false, false, 0.0f);
     http.end();
     return false;
@@ -289,7 +291,7 @@ bool readJpegDimensions(const uint8_t *data, size_t length, uint16_t &width, uin
 
 void checkInternalHeap(const char *where) {
   if (!heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true)) {
-    Serial.printf("HEAP CORRUPTION detected after %s\n", where);
+    logEvent("HEAP CORRUPTION detected after %s", where);
   }
 }
 
@@ -305,7 +307,7 @@ bool decodeMotionFrame(const camera_fb_t *frameBuffer) {
   if (!readJpegDimensions(frameBuffer->buf, frameBuffer->len, jpegWidth, jpegHeight) ||
       jpegWidth != frameBuffer->width || jpegHeight != frameBuffer->height) {
     ++rejectedMotionJpegCount;
-    Serial.printf("Rejected motion JPEG #%lu: header %ux%u, buffer labelled %ux%u, %u bytes\n",
+    logEvent("motion: rejected JPEG #%lu: header %ux%u, labelled %ux%u, %u bytes",
                   static_cast<unsigned long>(rejectedMotionJpegCount), jpegWidth, jpegHeight,
                   static_cast<unsigned int>(frameBuffer->width),
                   static_cast<unsigned int>(frameBuffer->height),
@@ -424,8 +426,8 @@ void checkMotion() {
   if (consecutiveCaptureFailures >= kCameraRecoveryFailureThreshold) {
     ++cameraRecoveryAttempts;
     lastCaptureOperation = "camera_reinitialize";
-    Serial.printf("Reinitializing camera after %lu consecutive capture failures\n",
-                  static_cast<unsigned long>(consecutiveCaptureFailures));
+    logEvent("camera: reinitializing after %lu capture failures in a row",
+             static_cast<unsigned long>(consecutiveCaptureFailures));
     if (!reinitializeActiveCamera()) {
       noteCaptureFailure("camera_reinitialize", "Camera reinitialization failed",
                          analysisStartedMs);
@@ -564,8 +566,8 @@ void checkMotion() {
   lastMotionCaptureSuccessful = false;
   lastMotionUploadSuccessful = false;
   setCameraRuntimeState(CameraRuntimeState::MotionTriggered);
-  Serial.printf("Motion detected: %d/%d blocks changed (%.1f%%), global ratio %.3f\n",
-                lastChangedBlocks, lastValidBlocks, changedFraction * 100, lastGlobalRatio);
+  logEvent("motion: detected, %d/%d blocks changed (%.1f%%)", lastChangedBlocks,
+           lastValidBlocks, changedFraction * 100);
 
   const bool canBuffer = cfg.bufferUploadsToSd && sdReady;
   bool offline = WiFi.status() != WL_CONNECTED || isMotionUploadCoolingDown();
@@ -656,6 +658,8 @@ void armMotionDetection() {
     return;
   }
   cfg.motionEnabled = true;
+  logEvent("motion: armed");
+  wakeCamera();
   selectCameraOperatingMode(CameraOperatingMode::Motion);
   resetMotionReference();
   clearCameraRuntimeError();
@@ -666,6 +670,7 @@ void disarmMotionDetection() {
   ConfigMutexGuard configLock;
   if (!configLock.locked()) return;
   cfg.motionEnabled = false;
+  logEvent("motion: disarmed");
   selectCameraOperatingMode(CameraOperatingMode::Idle);
   resetMotionReference();
   clearCameraRuntimeError();

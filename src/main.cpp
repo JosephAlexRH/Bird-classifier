@@ -7,6 +7,7 @@
 #include "app_config.h"
 #include "camera_service.h"
 #include "camera_runtime.h"
+#include "device_health.h"
 #include "device_telemetry.h"
 #include "motion_detector.h"
 #include "upload_buffer.h"
@@ -34,13 +35,22 @@ namespace {
     WiFi.setAutoReconnect(true);
     WiFi.persistent(false);
     WiFi.begin(cfg.wifiSsid, cfg.wifiPassword);
-    // DIAGNOSTIC: cap transmit power to cut the current spikes from Wi-Fi TX.
-    // If the crashes stop with this, the board's power supply is the problem.
-    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    // Capped below the 19.5 dBm default to soften Wi-Fi TX current spikes.
+    // 8.5 dBm was too weak to associate at range; 15 dBm is a middle ground.
+    WiFi.setTxPower(WIFI_POWER_15dBm);
 
-    while (WiFi.status() != WL_CONNECTED) {
+    // Don't hang boot forever: give up after 20 s and let auto-reconnect keep
+    // trying in the background while the camera and web server start.
+    const unsigned long started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
       Serial.print(".");
       delay(100);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println();
+      logEvent("wifi: not connected after 20 s (status %d); continuing, driver keeps retrying",
+               static_cast<int>(WiFi.status()));
+      return;
     }
 
     Serial.println("\nConnected");
@@ -54,9 +64,11 @@ namespace {
       return;
     }
 
+    // setAutoReconnect(true) already retries in the driver. Calling reconnect()
+    // on top of it only produces "sta is connecting, return error", so just log.
     lastWifiReconnectAttempt = now;
-    Serial.println("Wi-Fi disconnected; reconnecting...");
-    WiFi.reconnect();
+    Serial.printf("Wi-Fi disconnected (status %d); driver is retrying\n",
+                  static_cast<int>(WiFi.status()));  // reasons go to the event log
   }
 
   void motionTask(void *parameter) {
@@ -130,8 +142,10 @@ void setup() {
   periph_module_reset(PERIPH_I2S0_MODULE);
   periph_module_reset(PERIPH_LEDC_MODULE);
 
+  // 160 MHz is plenty for motion checks and uploads and runs cooler than 240.
+  setCpuFrequencyMhz(160);
   Serial.begin(115200);
-  Serial.printf("Reset reason: %d\n", static_cast<int>(esp_reset_reason()));
+  initializeDeviceHealth();
 
   if (!initializeConfigMutex()) {
     Serial.println("Could not initialize configuration mutex");
@@ -148,20 +162,32 @@ void setup() {
   initializeDeviceTelemetry();
 
   if (!initializeCamera()) {
-    while (true) {
-      delay(1000);
+    // Stay reachable long enough to report the failure, then retry from scratch.
+    logEvent("camera: initialization failed; rebooting in 60 s");
+    setCameraRuntimeError("Camera initialization failed");
+    startWebServer();
+    startDeviceHealthMonitor();
+    const unsigned long failedAt = millis();
+    while (millis() - failedAt < 60000) {
+      handleWebClient();
+      delay(10);
     }
+    rebootDevice("camera initialization failed");
   }
 
   startWebServer();
   cameraReady = true;
   if (!startMotionTask()) {
+    logEvent("motion: could not start motion task");
     setCameraRuntimeError("Could not start motion task");
   }
+  startDeviceHealthMonitor();
 }
 
 void loop() {
   handleWebClient();
+  maintainCameraPower(getCameraOperatingMode() == CameraOperatingMode::Idle &&
+                      !isCameraStreamActive());
 
   const unsigned long now = millis();
   maintainWifi(now);

@@ -78,6 +78,20 @@ class ManifestLoaderTests(unittest.TestCase):
             writer.writerows(rows)
         return path
 
+    def test_image_directory_can_limit_discovery_to_top_level_files(self) -> None:
+        from PIL import Image
+
+        Image.new("RGB", (20, 10)).save(self.directory / "capture.jpg")
+        generated = self.directory / "manifests" / "crops"
+        generated.mkdir(parents=True)
+        Image.new("RGB", (5, 5)).save(generated / "old_crop.jpg")
+
+        recursive, _ = bbox_data.load_image_directory(self.directory)
+        top_level, _ = bbox_data.load_image_directory(self.directory, recursive=False)
+
+        self.assertEqual([item.relative_path for item in recursive], ["capture.jpg", "manifests/crops/old_crop.jpg"])
+        self.assertEqual([item.relative_path for item in top_level], ["capture.jpg"])
+
     def test_generated_inaturalist_csv_retains_only_compact_metadata(self) -> None:
         path = self.write_csv(
             "inat.csv",
@@ -330,8 +344,13 @@ class GroundTruthPersistenceTests(unittest.TestCase):
             self.assertEqual(bbox_data.load_ground_truth(path), {})
             record = self.record("boxed")
             bbox_data.save_ground_truth(path, [record])
-            text = path.read_text(encoding="utf-8").replace(",100,80\n", ",,80\n")
-            path.write_text(text, encoding="utf-8")
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            rows[0]["bbox_width"] = ""
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=bbox_data.GROUND_TRUTH_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
             with self.assertRaisesRegex(ValueError, "incomplete bounding box"):
                 bbox_data.load_ground_truth(path)
 
@@ -343,6 +362,77 @@ class GroundTruthPersistenceTests(unittest.TestCase):
             image, "boxed", bbox_data.BBox(1, 2, 30, 40)
         )
         self.assertEqual((review.source_width, review.source_height), (100, 80))
+
+
+class DetectorManifestEditingTests(unittest.TestCase):
+    def test_image_directory_creates_detector_manifest_with_count_and_shared_species(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Image.new("RGB", (100, 80)).save(root / "blue_tits.jpg")
+            dataset, reviews = bbox_data.load_image_directory(root)
+            record = dataset[0]
+            reviews[record.source_id] = bbox_data.GroundTruthRecord.from_image_record(
+                record,
+                "boxed",
+                bboxes=[bbox_data.BBox(1, 2, 30, 20), bbox_data.BBox(50, 10, 25, 35)],
+                species="Blue Tit",
+                is_bird=True,
+                bird_count=2,
+                context_percent=35,
+            )
+            manifest = root / "bird_annotations.csv"
+
+            bbox_data.save_detector_manifest(manifest, dataset, reviews)
+            loaded_dataset, loaded_reviews = bbox_data.load_detector_manifest(manifest, image_root=root)
+
+            loaded = loaded_reviews[record.source_id]
+            self.assertEqual(len(loaded_dataset), 1)
+            self.assertTrue(loaded.is_bird)
+            self.assertFalse(loaded.mixed_species)
+            self.assertEqual(loaded.species, "Blue Tit")
+            self.assertEqual(loaded.bird_count, 2)
+            self.assertEqual(len(loaded.bboxes), 2)
+            self.assertEqual(loaded.context_percent, 35)
+            with manifest.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["context_percent"], "35.0")
+            self.assertEqual(rows[0]["context_xmin"], "0.0")
+            self.assertEqual(rows[0]["context_ymin"], "0.0")
+            self.assertEqual(rows[0]["context_xmax"], "40.5")
+            self.assertEqual(rows[0]["context_ymax"], "27.0")
+
+    def test_mixed_species_round_trip_uses_one_species_per_box(self) -> None:
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Image.new("RGB", (120, 90)).save(root / "mixed.jpg")
+            dataset, _ = bbox_data.load_image_directory(root)
+            record = dataset[0]
+            review = bbox_data.GroundTruthRecord.from_image_record(
+                record,
+                "boxed",
+                bboxes=[bbox_data.BBox(2, 3, 20, 30), bbox_data.BBox(60, 10, 40, 50)],
+                mixed_species=True,
+                box_species=["Blue Tit", "Robin"],
+                is_bird=True,
+            )
+            manifest = root / "bird_annotations.csv"
+
+            bbox_data.save_detector_manifest(manifest, dataset, {record.source_id: review})
+            _loaded_dataset, loaded_reviews = bbox_data.load_detector_manifest(manifest, image_root=root)
+            loaded = loaded_reviews[record.source_id]
+
+            self.assertTrue(loaded.mixed_species)
+            self.assertEqual(loaded.box_species, ["Blue Tit", "Robin"])
+            self.assertEqual(loaded.bird_count, 2)
+            with manifest.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([row["species_name"] for row in rows], ["Blue Tit", "Robin"])
+            self.assertTrue(all(row["is_Bird"] == "True" for row in rows))
+            self.assertTrue(all(row["bird_count"] == "2" for row in rows))
 
 
 class RealDataSmokeTests(unittest.TestCase):

@@ -157,6 +157,13 @@ bool configureMotionCapture(bool &changed);
 camera_fb_t *acquireCameraFrame();
 void releaseCameraFrame(camera_fb_t *frameBuffer);
 bool getCameraSensorIdentity(uint16_t &pid, uint8_t &version);
+// Real idle. The camera powers down after 30 s unused while idle; anything that
+// needs a frame or the sensor (capture, stream, motion, settings) wakes it,
+// which takes ~1.5 s including auto-exposure settling.
+bool isCameraPowered();
+bool wakeCamera();
+bool suspendCamera();
+void maintainCameraPower(bool idleAllowed);
 bool captureJpeg(CapturedJpeg &capture, bool drainQueuedFrame = false);
 bool isCompleteJpeg(const camera_fb_t *frameBuffer);
 CameraMetadataSnapshot sampleCameraMetadata(const camera_fb_t *frameBuffer = nullptr);

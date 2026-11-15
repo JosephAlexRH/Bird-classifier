@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import os
 import threading
@@ -108,6 +109,63 @@ def camera_identity_from_values(
     return hardware_id, {"model": model, "pid": pid, "pid_hex": pid_hex}
 
 
+def heartbeat_address(payload: dict[str, Any], remote_addr: str | None) -> str | None:
+    """Pick the address a heartbeating camera can be reached on.
+
+    The camera reports its own IP; the socket peer address is the fallback.
+    Only literal IP addresses are accepted, so a heartbeat can never point the
+    hub at an arbitrary hostname.
+    """
+    for candidate in (payload.get("ip"), remote_addr):
+        if not isinstance(candidate, str):
+            continue
+        try:
+            address = ipaddress.ip_address(candidate.strip())
+        except ValueError:
+            continue
+        if address.is_unspecified or address.is_loopback or address.is_multicast:
+            continue
+        return f"[{address}]" if address.version == 6 else str(address)
+    return None
+
+
+def sync_registry_from_heartbeat(
+    registry: "CameraRegistry",
+    payload: dict[str, Any],
+    remote_addr: str | None,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Add or re-address a registry camera from its own heartbeat.
+
+    Returns (camera, change); change is one of "added", "moved", "bound",
+    "unchanged", "conflict" or "ignored".
+    """
+    log = log or (lambda message: print(message, flush=True))
+    address = heartbeat_address(payload, remote_addr)
+    if address is None:
+        return None, "ignored"
+    try:
+        camera, change = registry.observe_heartbeat(
+            payload.get("camera_id"), address, model=payload.get("camera_model")
+        )
+    except ValueError:
+        return None, "ignored"
+    if change == "conflict":
+        if registry.note_conflict(str(payload.get("camera_id")), address):
+            log(
+                f"Camera registry: {payload.get('camera_id')} is heartbeating from {address}, "
+                "but that address belongs to another registered camera that has not checked in. "
+                "Remove the old camera from the dashboard if it has been retired."
+            )
+    elif change != "unchanged" and camera is not None:
+        log(
+            f"Camera registry: {change} {camera['name']} "
+            f"[{camera['hardware_camera_id']}] at {camera['url']}"
+        )
+    return camera, change
+
+
 class CameraRegistry:
     """Persist definitions while maintaining per-camera runtime state and locks."""
 
@@ -131,6 +189,7 @@ class CameraRegistry:
         self._poll_locks: dict[str, threading.Lock] = {}
         self._operation_locks: dict[str, threading.Lock] = {}
         self._cameras: dict[str, dict[str, Any]] = {}
+        self._reported_conflicts: set[tuple[str, str]] = set()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._load()
@@ -156,7 +215,7 @@ class CameraRegistry:
             key: copy.deepcopy(camera.get(key))
             for key in (
                 "id", "name", "url", "enabled", "default", "hardware_camera_id",
-                "sensor", "added_at",
+                "sensor", "added_at", "needs_name",
             )
         }
 
@@ -201,6 +260,7 @@ class CameraRegistry:
                 "hardware_camera_id": hardware_id,
                 "sensor": copy.deepcopy(item.get("sensor")) if isinstance(item.get("sensor"), dict) else None,
                 "added_at": item.get("added_at") if isinstance(item.get("added_at"), str) else None,
+                "needs_name": item.get("needs_name", False) is True,
                 **self._runtime_state(),
             }
         defaults = [camera for camera in loaded.values() if camera["default"]]
@@ -294,6 +354,7 @@ class CameraRegistry:
                 "hardware_camera_id": None,
                 "sensor": None,
                 "added_at": utc_now(),
+                "needs_name": False,
                 **self._runtime_state(),
             }
             self._cameras[camera_id] = camera
@@ -309,6 +370,7 @@ class CameraRegistry:
                 return None
             if "name" in changes:
                 camera["name"] = normalize_camera_name(changes["name"])
+                camera["needs_name"] = False
             if "enabled" in changes:
                 if not isinstance(changes["enabled"], bool):
                     raise ValueError("enabled must be true or false.")
@@ -318,6 +380,89 @@ class CameraRegistry:
                     item["default"] = item["id"] == camera_id
             self._persist_locked()
             return self._copy_camera(camera)
+
+    def note_conflict(self, hardware_camera_id: str, address: str) -> bool:
+        """Return True the first time a given address conflict is seen."""
+        key = (hardware_camera_id, address)
+        with self._lock:
+            if key in self._reported_conflicts:
+                return False
+            self._reported_conflicts.add(key)
+            return True
+
+    def observe_heartbeat(
+        self,
+        hardware_camera_id: Any,
+        address: Any,
+        *,
+        model: Any = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Keep the registry in step with a camera's own heartbeat.
+
+        The heartbeat is ground truth for "hardware X is at address Y right
+        now", so nobody has to type an IP address:
+
+        * known hardware ID, same address          -> "unchanged"
+        * known hardware ID, new address           -> "moved" (URL rewritten)
+        * unknown ID, address of an unbound entry  -> "bound" (identity attached)
+        * unknown ID, free address                 -> "added" (needs_name=True)
+        * unknown ID, address held by another ID   -> "conflict" (nothing changes)
+
+        When a camera moves onto an address another entry still claims, that
+        entry's URL is stale by definition; the two URLs are swapped so URLs
+        stay unique and a router that shuffles leases sorts itself out as each
+        camera checks in.
+        """
+        if not isinstance(hardware_camera_id, str) or not hardware_camera_id.strip():
+            raise ValueError("Heartbeat did not include a camera_id.")
+        hardware_camera_id = hardware_camera_id.strip()
+        url = normalize_camera_address(address)
+        sensor = (
+            {"model": model.strip(), "pid": None, "pid_hex": None}
+            if isinstance(model, str) and model.strip()
+            else None
+        )
+        with self._lock:
+            known = next(
+                (item for item in self._cameras.values() if item["hardware_camera_id"] == hardware_camera_id),
+                None,
+            )
+            holder = next((item for item in self._cameras.values() if item["url"] == url), None)
+            if known is not None:
+                if holder is known:
+                    return self._copy_camera(known), "unchanged"
+                if holder is not None:
+                    holder["url"] = known["url"]
+                known["url"] = url
+                self._persist_locked()
+                return self._copy_camera(known), "moved"
+            if holder is not None:
+                if holder["hardware_camera_id"] is not None:
+                    return None, "conflict"
+                holder["hardware_camera_id"] = hardware_camera_id
+                if holder["sensor"] is None and sensor is not None:
+                    holder["sensor"] = sensor
+                self._persist_locked()
+                return self._copy_camera(holder), "bound"
+            suffix = "".join(character for character in hardware_camera_id if character.isalnum())[-4:]
+            camera_id = uuid.uuid4().hex
+            camera = {
+                "id": camera_id,
+                "name": normalize_camera_name(f"New camera {suffix}".strip()),
+                "url": url,
+                "enabled": True,
+                "default": not self._cameras,
+                "hardware_camera_id": hardware_camera_id,
+                "sensor": sensor,
+                "added_at": utc_now(),
+                "needs_name": True,
+                **self._runtime_state(),
+            }
+            self._cameras[camera_id] = camera
+            self._poll_locks[camera_id] = threading.Lock()
+            self._operation_locks[camera_id] = threading.Lock()
+            self._persist_locked()
+            return self._copy_camera(camera), "added"
 
     def bind_identity(
         self,

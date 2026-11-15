@@ -28,13 +28,19 @@ try:
         read_inference_record,
         write_inference_record,
     )
-    from .camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
+    from .camera_registry import (
+        CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address,
+        sync_registry_from_heartbeat,
+    )
     from .camera_dashboard_templates import PI_TABBED_DASHBOARD_HTML
     from .capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from .laptop_test_server import camera_url_argument, normalize_camera_url
     from .pi_motion import MotionService
     from .motion_crop import rgb_to_gray, select_motion_crop
     from .roi_control import ROI_CONTROL_JS
+    from .fleet_monitor import FleetMonitor, register_fleet_routes
+    from .hub_clock import HubClock, step_system_clock
+    from .run_log import HubStatusLogger, RunLog
 except ImportError:  # Direct execution: python server/raspberry_pi_server.py
     from bird_inference import (
         BirdInferenceEngine,
@@ -47,13 +53,19 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
         read_inference_record,
         write_inference_record,
     )
-    from camera_registry import CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address
+    from camera_registry import (
+        CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address,
+        sync_registry_from_heartbeat,
+    )
     from camera_dashboard_templates import PI_TABBED_DASHBOARD_HTML
     from capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from laptop_test_server import camera_url_argument, normalize_camera_url
     from pi_motion import MotionService
     from motion_crop import rgb_to_gray, select_motion_crop
     from roi_control import ROI_CONTROL_JS
+    from fleet_monitor import FleetMonitor, register_fleet_routes
+    from hub_clock import HubClock, step_system_clock
+    from run_log import HubStatusLogger, RunLog
 
 
 DEFAULT_SAVE_DIR = Path.home() / "bird_images"
@@ -132,7 +144,7 @@ PI_DASHBOARD_HTML = r"""
     </section>
     <section>
       <h2>Camera fleet</h2>
-      <p class="muted">Add cameras by IP address. Enabled cameras receive an independent Pi motion worker.</p>
+      <p class="muted">Cameras add themselves when they check in and follow their own IP changes; just give new ones a name. Adding by IP address remains as a fallback. Enabled cameras receive an independent Pi motion worker.</p>
       <input id="fleet-name" placeholder="Camera name (optional)">
       <input id="fleet-address" placeholder="192.168.1.84">
       <button onclick="addFleetCamera()">Add camera</button>
@@ -148,6 +160,7 @@ PI_DASHBOARD_HTML = r"""
       return `<p><strong>${camera.name}</strong>${camera.default ? ' (default)' : ''}<br>${camera.url}<br>` +
         `${sensor} | ${camera.reachable === true ? 'reachable' : camera.reachable === false ? 'offline' : 'not checked'} | ` +
         `motion ${service.running ? 'running' : 'stopped'}<br>` +
+        `<button onclick="renameFleetCamera('${camera.id}')">${camera.needs_name ? 'Name this camera' : 'Rename'}</button> ` +
         `<button onclick="updateFleetCamera('${camera.id}', {default:true})">Set default</button> ` +
         `<button onclick="updateFleetCamera('${camera.id}', {enabled:${!camera.enabled}})">${camera.enabled ? 'Disable' : 'Enable'}</button> ` +
         `<button onclick="pollFleetCamera('${camera.id}')">Poll</button> ` +
@@ -173,6 +186,10 @@ PI_DASHBOARD_HTML = r"""
       const payload = await response.json();
       if (!response.ok) showCameraResult(payload.error || 'Could not update camera.', true);
       await loadFleet();
+    }
+    async function renameFleetCamera(id) {
+      const name = (window.prompt('Name for this camera (for example: Back garden feeder)') || '').trim();
+      if (name) await updateFleetCamera(id, {name});
     }
     async function pollFleetCamera(id) { await fetch(`/api/cameras/${id}/poll`, {method:'POST'}); await loadFleet(); }
     async function removeFleetCamera(id) { await fetch(`/api/cameras/${id}`, {method:'DELETE'}); await loadFleet(); }
@@ -299,6 +316,9 @@ def create_app(
     registry_file: Path | None = None,
     camera_registry: CameraRegistry | None = None,
     start_registry_poller: bool = False,
+    auto_register_cameras: bool = True,
+    manage_system_clock: bool = False,
+    start_hub_status: bool = False,
     manage_motion_services: bool | None = None,
 ) -> Flask:
     """Create the receiver/classifier app, with optional ESP32 camera controls."""
@@ -320,6 +340,45 @@ def create_app(
     if start_registry_poller:
         registry.start()
     app.config["CAMERA_REGISTRY"] = registry
+    # Permanent run log + hub time keeping for unattended deployments.
+    run_log = RunLog(store.root / "runlog")
+    hub_clock = HubClock(
+        store.root / "hub_clock.json",
+        set_system_time=step_system_clock if manage_system_clock else None,
+        journal=run_log.write,
+    )
+    run_log.context = lambda: {"hub_boot": hub_clock.boot_id, "clock": hub_clock.state()["source"]}
+    hub_status_logger = HubStatusLogger(run_log, store.root, hub_clock)
+    app.config["RUN_LOG"], app.config["HUB_CLOCK"] = run_log, hub_clock
+    app.config["HUB_STATUS_LOGGER"] = hub_status_logger
+    if start_hub_status:
+        run_log.write("hub_start", pid=os.getpid(), save_dir=str(store.root), clock_state=hub_clock.state())
+        hub_status_logger.start()
+
+    def registry_log(message: str) -> None:
+        print(message, flush=True)
+        run_log.write("registry", message=message)
+    fleet = FleetMonitor(
+        store.root / "fleet.json",
+        name_lookup=lambda hardware_id: (registry.get_by_hardware_id(hardware_id) or {}).get("name"),
+    )
+    app.config["FLEET_MONITOR"] = fleet
+
+    def heartbeat_seen(payload: dict[str, Any], remote_addr: str | None) -> None:
+        # Cameras announce themselves: new ones are added, moved ones re-addressed,
+        # and the per-camera motion workers follow the registry.
+        _, change = sync_registry_from_heartbeat(registry, payload, remote_addr, log=registry_log)
+        if change in {"added", "moved", "bound"}:
+            sync_motion_services()
+
+    register_fleet_routes(
+        app,
+        fleet,
+        capture_dir=store.root,
+        on_heartbeat=heartbeat_seen if auto_register_cameras else None,
+        run_log=run_log,
+        hub_clock=hub_clock,
+    )
     default_camera = registry.resolve()
     if camera_url is None and default_camera is not None:
         camera_url = default_camera["url"]
@@ -506,7 +565,9 @@ def create_app(
         existing_service = motion_services.get(camera["id"])
         if existing_service is not None:
             expected = getattr(existing_service, "expected_camera_id", camera.get("hardware_camera_id"))
-            if expected == camera.get("hardware_camera_id"):
+            # A heartbeat can re-address a camera; a worker on the old URL must restart.
+            same_url = getattr(existing_service, "camera_url", camera["url"]) == camera["url"]
+            if expected == camera.get("hardware_camera_id") and same_url:
                 if hasattr(existing_service, "camera_name"):
                     existing_service.camera_name = camera["name"]
                 return existing_service
@@ -1063,6 +1124,21 @@ def parse_args() -> argparse.Namespace:
         default=max(1, min(4, os.cpu_count() or 1)),
         help="TFLite interpreter threads per model (default: up to 4)",
     )
+    parser.add_argument(
+        "--hub-name",
+        default="birdhub",
+        help="Name cameras look this server up by, as <name>.local (default: birdhub)",
+    )
+    parser.add_argument(
+        "--no-advertise",
+        action="store_true",
+        help="Do not answer for <hub-name>.local; cameras then need server_ip",
+    )
+    parser.add_argument(
+        "--no-auto-register",
+        action="store_true",
+        help="Do not add or re-address cameras from their heartbeats; manage the registry by hand",
+    )
     return parser.parse_args()
 
 
@@ -1107,8 +1183,21 @@ if __name__ == "__main__":
         motion_timeout_seconds=args.motion_timeout_seconds,
         registry_file=args.registry_file,
         start_registry_poller=True,
+        auto_register_cameras=not args.no_auto_register,
+        manage_system_clock=True,
+        start_hub_status=True,
+    )
+    try:
+        from .hub_advertiser import start_hub_advertiser
+    except ImportError:
+        from hub_advertiser import start_hub_advertiser
+    advertiser = (
+        None if args.no_advertise else start_hub_advertiser(args.hub_name, args.port, bind_host=args.host)
     )
     try:
         application.run(host=args.host, port=args.port, debug=False, threaded=True)
     finally:
+        if advertiser is not None:
+            advertiser.stop()
+        application.config["HUB_STATUS_LOGGER"].stop()
         application.config["CLEANUP"]()

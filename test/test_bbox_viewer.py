@@ -41,7 +41,84 @@ class VirtualRowsTests(unittest.TestCase):
         self.assertEqual(bbox_viewer.visible_row_range(10, 10000, 100).stop, 10)
 
 
+class RecentSpeciesTests(unittest.TestCase):
+    def test_merge_is_recent_first_case_insensitive_and_limited(self) -> None:
+        self.assertEqual(
+            bbox_viewer.merge_recent_species(
+                ["Robin", "Blue Tit", "Goldfinch"],
+                [" sparrow ", "ROBIN", ""],
+                limit=3,
+            ),
+            ["sparrow", "ROBIN", "Blue Tit"],
+        )
+        self.assertEqual(bbox_viewer.merge_recent_species(["Robin"], [], limit=0), [])
+
+    def test_saved_reviews_seed_shared_and_per_box_species(self) -> None:
+        first = record(1)
+        second = record(2)
+        shared = GroundTruthRecord.from_image_record(
+            first, "boxed", bboxes=[BBox(1, 2, 10, 10)], species="Robin"
+        )
+        mixed = GroundTruthRecord.from_image_record(
+            second,
+            "boxed",
+            bboxes=[BBox(1, 2, 10, 10), BBox(20, 5, 10, 10)],
+            mixed_species=True,
+            box_species=["Sparrow", "Blue Tit"],
+        )
+        self.assertEqual(
+            bbox_viewer.recent_species_from_reviews([shared, mixed]),
+            ["Sparrow", "Blue Tit", "Robin"],
+        )
+
+
+class DirectoryReviewTests(unittest.TestCase):
+    def test_only_reviews_for_current_files_are_kept(self) -> None:
+        current = ImageRecord(
+            "current-id", "image_directory", "bird", "bird.jpg", width=100, height=80
+        )
+        stale_record = ImageRecord(
+            "stale-id", "image_directory", "old", "old.jpg", width=100, height=80
+        )
+        saved_current = GroundTruthRecord.from_image_record(
+            ImageRecord(
+                "old-id", "image_directory", "bird", "bird.jpg", width=100, height=80
+            ),
+            "boxed",
+            bboxes=[BBox(1, 2, 30, 20)],
+            species="Robin",
+        )
+        saved_stale = GroundTruthRecord.from_image_record(stale_record, "no_bird")
+        dataset = BBoxDataset((current,), Path("images"), "image_directory", Path("images"))
+
+        reviews = bbox_viewer.reviews_for_current_images(
+            dataset, [saved_current, saved_stale]
+        )
+
+        self.assertEqual(set(reviews), {"current-id"})
+        self.assertEqual(reviews["current-id"].relative_path, "bird.jpg")
+        self.assertEqual(reviews["current-id"].species, "Robin")
+        self.assertEqual(reviews["current-id"].bboxes, [BBox(1, 2, 30, 20)])
+
+
 class EditingGeometryTests(unittest.TestCase):
+    def test_context_defaults_to_zero_percent(self) -> None:
+        centered = bbox_viewer.bbox_with_context(BBox(20, 30, 50, 40), 100, 100)
+        self.assertEqual(centered, BBox(20, 30, 50, 40))
+        edge = bbox_viewer.bbox_with_context(BBox(0, 0, 50, 40), 100, 100)
+        self.assertEqual(edge, BBox(0, 0, 50, 40))
+
+    def test_context_supports_custom_and_zero_percentages(self) -> None:
+        box = BBox(20, 30, 50, 40)
+        self.assertEqual(bbox_viewer.bbox_with_context(box, 100, 100, 0), box)
+        self.assertEqual(
+            bbox_viewer.bbox_with_context(box, 100, 100, 50),
+            BBox(7.5, 20, 75, 60),
+        )
+        self.assertEqual(bbox_viewer.parse_context_percent("12.5"), 12.5)
+        with self.assertRaises(ValueError):
+            bbox_viewer.parse_context_percent("-1")
+
     def test_hit_test_prefers_handles_then_box_interior(self) -> None:
         box = BBox(10, 20, 30, 40)
         self.assertEqual(bbox_viewer.hit_test_bbox(box, 11, 21, 3), "nw")
@@ -211,6 +288,216 @@ class TkWorkflowTests(unittest.TestCase):
         self.assertIsNone(app._shortcut(event, action))
         action.assert_not_called()
 
+    def test_context_control_defaults_to_zero(self) -> None:
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        self.assertEqual(app.context_percent_var.get(), "0")
+
+    def test_species_fields_share_editable_recent_species_dropdown(self) -> None:
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app._remember_species(["Robin", "Blue Tit"])
+
+        self.assertEqual(app.species_entry.winfo_class(), "TCombobox")
+        self.assertEqual(app.active_species_entry.winfo_class(), "TCombobox")
+        self.assertEqual(tuple(app.species_entry.cget("values")), ("Robin", "Blue Tit"))
+        self.assertEqual(
+            tuple(app.active_species_entry.cget("values")), ("Robin", "Blue Tit")
+        )
+        self.assertEqual(str(app.species_entry.cget("state")), "normal")
+
+    def test_successful_save_adds_species_to_the_top_of_both_dropdowns(self) -> None:
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        image = directory / "bird.jpg"
+        Image.new("RGB", (100, 80)).save(image)
+        source = ImageRecord(
+            "capture:1", "capture", "1", "bird.jpg", width=100, height=80
+        )
+        output = directory / "reviews.csv"
+        app = bbox_viewer.BBoxViewerApp(self.root, ground_truth_path=output)
+        app.ground_truth_path = output
+        app.session = bbox_viewer.ReviewSession(
+            BBoxDataset((source,), output, "detector_annotations_csv", directory), {}
+        )
+        app.detector_manifest_mode = True
+        app.load_current()
+        app._remember_species(["Robin"])
+        app.draft_bboxes = [BBox(10, 15, 30, 25)]
+        app.species_var.set("Blue Tit")
+
+        self.assertTrue(app._save_review("boxed"))
+        self.assertEqual(tuple(app.species_entry.cget("values")), ("Blue Tit", "Robin"))
+        self.assertEqual(
+            tuple(app.active_species_entry.cget("values")), ("Blue Tit", "Robin")
+        )
+
+    def test_keep_species_repeats_only_into_images_without_an_existing_species(self) -> None:
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        for name in ("first.jpg", "second.jpg", "third.jpg"):
+            Image.new("RGB", (100, 80)).save(directory / name)
+        dataset = BBoxDataset(
+            (
+                ImageRecord("capture:1", "capture", "1", "first.jpg", width=100, height=80),
+                ImageRecord("capture:2", "capture", "2", "second.jpg", width=100, height=80),
+                ImageRecord(
+                    "capture:3", "capture", "3", "third.jpg",
+                    width=100, height=80, class_name="Robin",
+                ),
+            ),
+            directory / "manifest.csv",
+            "detector_annotations_csv",
+            directory,
+        )
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(dataset, {})
+        app.load_current()
+        app.keep_species_var.set(True)
+        app.species_var.set("Blue Tit")
+        app.draft_dirty = False
+
+        app.next()
+        self.assertEqual(app.species_var.get(), "Blue Tit")
+
+        app.draft_dirty = False
+        app.next()
+        self.assertEqual(app.species_var.get(), "Robin")
+
+    def test_keep_species_repeats_selected_mixed_name_without_repeating_boxes(self) -> None:
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        for name in ("first.jpg", "second.jpg"):
+            Image.new("RGB", (100, 80)).save(directory / name)
+        records = (
+            ImageRecord("capture:1", "capture", "1", "first.jpg", width=100, height=80),
+            ImageRecord("capture:2", "capture", "2", "second.jpg", width=100, height=80),
+        )
+        dataset = BBoxDataset(
+            records, directory / "manifest.csv", "detector_annotations_csv", directory
+        )
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(dataset, {})
+        app.load_current()
+        app.keep_species_var.set(True)
+        app.mixed_species_var.set(True)
+        app.draft_bboxes = [BBox(10, 10, 20, 20)]
+        app.draft_box_species = ["Blue Tit"]
+        app.active_box_index = 0
+        app.active_species_var.set("Blue Tit")
+        app.draft_dirty = False
+
+        app.next()
+
+        self.assertEqual(app.draft_bboxes, [])
+        self.assertTrue(app.mixed_species_var.get())
+        self.assertEqual(app.active_species_var.get(), "Blue Tit")
+
+        app.transform = bbox_viewer.ImageCanvasTransform.fit(100, 80, 100, 80)
+        event = type("Event", (), {"x": 10, "y": 10, "state": 0})()
+        app._drag_started(event)
+        self.assertEqual(app.draft_box_species, ["Blue Tit"])
+
+    def test_keep_boxes_repeats_clipped_geometry_over_reviewed_images(self) -> None:
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        Image.new("RGB", (100, 80)).save(directory / "first.jpg")
+        Image.new("RGB", (80, 60)).save(directory / "second.jpg")
+        Image.new("RGB", (100, 80)).save(directory / "third.jpg")
+        records = (
+            ImageRecord("capture:1", "capture", "1", "first.jpg", width=100, height=80),
+            ImageRecord("capture:2", "capture", "2", "second.jpg", width=80, height=60),
+            ImageRecord("capture:3", "capture", "3", "third.jpg", width=100, height=80),
+        )
+        saved_third = GroundTruthRecord.from_image_record(
+            records[2], "boxed", bbox=BBox(5, 6, 20, 25), species="Robin", is_bird=True
+        )
+        dataset = BBoxDataset(
+            records, directory / "manifest.csv", "detector_annotations_csv", directory
+        )
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(dataset, {records[2].source_id: saved_third})
+        app.load_current()
+        app.keep_boxes_var.set(True)
+        app.draft_bboxes = [BBox(70, 50, 30, 30)]
+        app.draft_dirty = False
+
+        app.next()
+        self.assertEqual(app.draft_bboxes, [BBox(70, 50, 10, 10)])
+        self.assertTrue(app.draft_dirty)
+
+        app.draft_dirty = False
+        app.next()
+        self.assertEqual(app.draft_bboxes, [BBox(70, 50, 10, 10)])
+        self.assertEqual(app.saved_bboxes, [BBox(5, 6, 20, 25)])
+        self.assertEqual(app.species_var.get(), "Robin")
+        self.assertTrue(app.draft_dirty)
+        saved_items = app.image_canvas.find_withtag("saved-box")
+        self.assertEqual(len(saved_items), 1)
+        self.assertEqual(app.image_canvas.itemcget(saved_items[0], "outline"), "#ff4d6d")
+
+    def test_keep_species_and_boxes_repeat_mixed_labels_without_overwriting_saved_review(self) -> None:
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        Image.new("RGB", (100, 80)).save(directory / "first.jpg")
+        Image.new("RGB", (80, 60)).save(directory / "second.jpg")
+        Image.new("RGB", (100, 80)).save(directory / "third.jpg")
+        records = (
+            ImageRecord("capture:1", "capture", "1", "first.jpg", width=100, height=80),
+            ImageRecord(
+                "capture:2", "capture", "2", "second.jpg",
+                width=80, height=60, class_name="Source-level guess",
+            ),
+            ImageRecord("capture:3", "capture", "3", "third.jpg", width=100, height=80),
+        )
+        saved_third = GroundTruthRecord.from_image_record(
+            records[2],
+            "boxed",
+            bboxes=[BBox(5, 6, 20, 25), BBox(40, 10, 15, 20)],
+            mixed_species=True,
+            box_species=["Robin", "Sparrow"],
+            is_bird=True,
+        )
+        dataset = BBoxDataset(
+            records, directory / "manifest.csv", "detector_annotations_csv", directory
+        )
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(dataset, {records[2].source_id: saved_third})
+        app.load_current()
+        app.keep_species_var.set(True)
+        app.keep_boxes_var.set(True)
+        app.mixed_species_var.set(True)
+        app.draft_bboxes = [
+            BBox(90, 70, 5, 5),
+            BBox(10, 10, 20, 20),
+            BBox(75, 50, 20, 20),
+        ]
+        app.draft_box_species = ["Blackbird", "Blue Tit", "Goldfinch"]
+        app.draft_dirty = False
+
+        app.next()
+        self.assertEqual(
+            app.draft_bboxes,
+            [BBox(10, 10, 20, 20), BBox(75, 50, 5, 10)],
+        )
+        self.assertEqual(app.draft_box_species, ["Blue Tit", "Goldfinch"])
+        self.assertTrue(app.mixed_species_var.get())
+        self.assertEqual(app.active_species_var.get(), "Goldfinch")
+        self.assertTrue(app.draft_dirty)
+
+        app.draft_dirty = False
+        app.next()
+        self.assertEqual(
+            app.draft_bboxes,
+            [BBox(10, 10, 20, 20), BBox(75, 50, 5, 10)],
+        )
+        self.assertEqual(app.draft_box_species, ["Blue Tit", "Goldfinch"])
+        self.assertEqual(app.saved_bboxes, saved_third.bboxes)
+        self.assertTrue(app.mixed_species_var.get())
+
     def test_cancelled_filter_change_preserves_draft_and_restores_controls(self) -> None:
         from unittest import mock
         dataset = BBoxDataset((record(1), record(2)), Path("manifest.csv"), "test")
@@ -312,6 +599,68 @@ class TkWorkflowTests(unittest.TestCase):
         app.delete_draft()
         self.assertEqual(app.draft_bboxes, boxes[:1])
         self.assertEqual(app.active_box_index, 0)
+
+    def test_delete_picture_removes_image_json_and_advances_without_confirmation(self) -> None:
+        from unittest import mock
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        first_image = directory / "first.jpg"
+        second_image = directory / "second.jpg"
+        first_json = directory / "first.json"
+        Image.new("RGB", (100, 80)).save(first_image)
+        Image.new("RGB", (100, 80)).save(second_image)
+        first_json.write_text('{"filename": "first.jpg"}', encoding="utf-8")
+        first = ImageRecord("capture:1", "capture", "1", "first.jpg", width=100, height=80)
+        second = ImageRecord("capture:2", "capture", "2", "second.jpg", width=100, height=80)
+        dataset = BBoxDataset(
+            (first, second), directory / "manifest.csv", "test", directory
+        )
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(dataset, {})
+        app.load_current()
+        app.draft_bboxes = [BBox(1, 2, 3, 4)]
+        app.draft_dirty = True
+
+        with mock.patch("bbox_viewer.messagebox.askyesno") as confirmation:
+            self.assertTrue(app.delete_picture())
+
+        confirmation.assert_not_called()
+        self.assertFalse(first_image.exists())
+        self.assertFalse(first_json.exists())
+        self.assertTrue(second_image.exists())
+        self.assertEqual([item.source_id for item in app.session.dataset], ["capture:2"])
+        self.assertEqual(app.session.current.source_id, "capture:2")
+        self.assertFalse(app.draft_dirty)
+
+    def test_delete_picture_removes_saved_review_from_review_file(self) -> None:
+        from PIL import Image
+        from bbox_data import load_ground_truth, save_ground_truth
+
+        directory = Path(self.temporary.name)
+        image = directory / "bird.jpg"
+        image.with_suffix(".json").write_text("{}", encoding="utf-8")
+        Image.new("RGB", (100, 80)).save(image)
+        source = ImageRecord(
+            "capture:1", "capture", "1", "bird.jpg", width=100, height=80
+        )
+        review = GroundTruthRecord.from_image_record(source, "no_bird")
+        output = directory / "reviews.csv"
+        save_ground_truth(output, [review])
+        dataset = BBoxDataset(
+            (source,), directory / "manifest.csv", "test", directory
+        )
+        app = bbox_viewer.BBoxViewerApp(self.root, ground_truth_path=output)
+        app.ground_truth_path = output
+        app.ground_truth_signature = bbox_viewer.file_signature(output)
+        app.session = bbox_viewer.ReviewSession(dataset, {source.source_id: review})
+        app.load_current()
+
+        self.assertTrue(app.delete_picture())
+
+        self.assertEqual(load_ground_truth(output), {})
+        self.assertEqual(app.session.reviews, {})
+        self.assertIsNone(app.session.current)
 
     def test_review_file_lock_rejects_a_concurrent_writer(self) -> None:
         if bbox_viewer.os.name != "nt":

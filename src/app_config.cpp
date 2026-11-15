@@ -236,6 +236,7 @@ Config cfg = {
     0.25f, // maximum clipped-pixel fraction in either version of a block
     12,    // minimum valid blocks required for a decision
     0.45f, // broad-change upper bound (lighting/scene change rather than motion)
+    "birdhub.local",  // hub name found by mDNS; server_ip above is the fallback
 };
 
 bool sdReady = false;
@@ -474,6 +475,9 @@ void loadConfig() {
   if (document.containsKey("server_port")) {
     cfg.serverPort = document["server_port"];
   }
+  if (document.containsKey("server_host")) {
+    strlcpy(cfg.serverHost, document["server_host"] | cfg.serverHost, sizeof(cfg.serverHost));
+  }
   if (document.containsKey("save_birds_to_sd")) {
     cfg.saveBirdsToSd = document["save_birds_to_sd"];
   }
@@ -574,7 +578,8 @@ void loadConfig() {
   Serial.printf("  OV5640 profile:      %s, quality %d, xclk %d Hz\n",
                 configFramesizeName(cfg.ov5640.framesize), cfg.ov5640.jpegQuality,
                 cfg.ov5640.xclkHz);
-  Serial.printf("  server_ip:          %s\n", cfg.serverIp);
+  Serial.printf("  server_host:        %s\n", cfg.serverHost);
+  Serial.printf("  server_ip:          %s (fallback)\n", cfg.serverIp);
   Serial.printf("  server_port:        %d\n", cfg.serverPort);
   Serial.printf("  save_birds_to_sd:   %s\n", cfg.saveBirdsToSd ? "true" : "false");
   Serial.printf("  bird_confidence:    %.2f\n", cfg.birdConfidenceThreshold);
@@ -614,6 +619,7 @@ void saveConfig() {
   JsonObject sensors = document["sensors"].to<JsonObject>();
   writeSensorProfile(sensors["0x2642"].to<JsonObject>(), cfg.ov2640);
   writeSensorProfile(sensors["0x5640"].to<JsonObject>(), cfg.ov5640);
+  document["server_host"] = cfg.serverHost;
   document["server_ip"] = cfg.serverIp;
   document["server_port"] = cfg.serverPort;
   document["save_birds_to_sd"] = cfg.saveBirdsToSd;

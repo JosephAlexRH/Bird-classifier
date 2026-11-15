@@ -13,6 +13,7 @@
 #include <new>
 
 #include "app_config.h"
+#include "device_health.h"
 #include "device_telemetry.h"
 
 static_assert(ESP_ARDUINO_VERSION == ESP_ARDUINO_VERSION_VAL(2, 0, 17),
@@ -39,8 +40,15 @@ constexpr int kPclkPin = 22;
 constexpr uint8_t kMaxExposureConsistencyAttempts = 3;
 constexpr int kOv2640FrameBufferCount = 1;
 constexpr camera_grab_mode_t kOv2640GrabMode = CAMERA_GRAB_WHEN_EMPTY;
-constexpr int kOv5640FrameBufferCount = 2;
-constexpr camera_grab_mode_t kOv5640GrabMode = CAMERA_GRAB_LATEST;
+// One buffer, filled only when asked for: between motion checks the ESP32 stops
+// receiving frames instead of copying ~15 fps into PSRAM nobody reads. This is
+// the mode the OV2640 has always used, and it runs the board noticeably cooler.
+constexpr int kOv5640FrameBufferCount = 1;
+constexpr camera_grab_mode_t kOv5640GrabMode = CAMERA_GRAB_WHEN_EMPTY;
+// Real idle: power the sensor down after this long with nothing using it.
+constexpr unsigned long kCameraIdlePowerDownMs = 30000;
+// After power-up, let auto exposure / gain / white balance settle before use.
+constexpr unsigned long kCameraWakeSettleMs = 1500;
 constexpr int kProbeXclkHz = 20000000;
 constexpr uint32_t kOv2640AecDriverLimitLines = 1200;
 constexpr size_t kOv2640RegisterCountPerBank = 255;
@@ -59,6 +67,11 @@ constexpr size_t kMaximumRegisterDumpBytes =
                                                         : kOv5640RegisterDumpBytes;
 
 uint64_t framesSinceBoot = 0;
+bool cameraPowered = false;
+bool cachedSensorIdentityValid = false;
+uint16_t cachedSensorPid = 0;
+uint8_t cachedSensorVersion = 0;
+unsigned long lastCameraUseMs = 0;
 uint32_t settingsRevision = 0;
 int64_t lastSettingsChangeUs = 0;
 bool settingsChangeTimeValid = false;
@@ -285,6 +298,7 @@ bool reinitializeCameraForProfile(uint16_t expectedSensorKey,
   const esp_err_t error = esp_camera_init(&cameraConfig);
   if (error != ESP_OK) {
     Serial.printf("Camera profile initialization failed: 0x%x\n", error);
+    cameraPowered = false;
     return false;
   }
 
@@ -293,9 +307,15 @@ bool reinitializeCameraForProfile(uint16_t expectedSensorKey,
       cameraSensorConfigKey(sensor->id.PID, sensor->id.VER) != expectedSensorKey) {
     Serial.println("Camera identity changed after applying the selected profile");
     esp_camera_deinit();
+    cameraPowered = false;
     return false;
   }
 
+  cameraPowered = true;
+  cachedSensorPid = sensor->id.PID;
+  cachedSensorVersion = sensor->id.VER;
+  cachedSensorIdentityValid = true;
+  lastCameraUseMs = millis();
   initializedFramesize = profile.framesize;
   initializedXclkHz = profile.xclkHz;
   initializedFrameBufferCount = cameraConfig.fb_count;
@@ -618,6 +638,7 @@ camera_grab_mode_t getCameraGrabMode() { return initializedGrabMode; }
 bool cameraUsesLatestFrameGrab() { return initializedGrabMode == CAMERA_GRAB_LATEST; }
 
 bool prepareJpegCapture(bool drainQueuedFrame) {
+  if (!wakeCamera()) return false;
   CameraMutexGuard cameraLock;
   if (!cameraLock.locked()) return false;
   sensor_t *sensor = esp_camera_sensor_get();
@@ -630,6 +651,10 @@ bool prepareJpegCapture(bool drainQueuedFrame) {
 }
 
 bool configureMotionCapture(bool &changed) {
+  if (!wakeCamera()) {
+    changed = false;
+    return false;
+  }
   CameraMutexGuard cameraLock;
   if (!cameraLock.locked()) {
     changed = false;
@@ -656,7 +681,9 @@ bool configureMotionCapture(bool &changed) {
 }
 
 camera_fb_t *acquireCameraFrame() {
+  if (!wakeCamera()) return nullptr;
   if (!lockCamera()) return nullptr;
+  lastCameraUseMs = millis();
   camera_fb_t *frameBuffer = esp_camera_fb_get();
   if (frameBuffer != nullptr) {
     ++framesSinceBoot;
@@ -673,6 +700,14 @@ void releaseCameraFrame(camera_fb_t *frameBuffer) {
 }
 
 bool getCameraSensorIdentity(uint16_t &pid, uint8_t &version) {
+  // Answer from the cache while the sensor is powered down, so status polls
+  // neither fail nor wake it.
+  if (!cameraPowered) {
+    if (!cachedSensorIdentityValid) return false;
+    pid = cachedSensorPid;
+    version = cachedSensorVersion;
+    return true;
+  }
   CameraMutexGuard cameraLock;
   if (!cameraLock.locked()) return false;
   sensor_t *sensor = esp_camera_sensor_get();
@@ -1101,4 +1136,48 @@ String buildCameraMetadata(const CameraMetadataSnapshot &snapshot, const char *s
   String json;
   serializeJson(document, json);
   return json;
+}
+bool isCameraPowered() { return cameraPowered; }
+
+bool wakeCamera() {
+  CameraMutexGuard cameraLock;
+  if (!cameraLock.locked()) return false;
+  lastCameraUseMs = millis();
+  if (cameraPowered) return true;
+  // Only re-power a camera that initialized successfully at boot.
+  if (!cachedSensorIdentityValid) return false;
+
+  const unsigned long started = millis();
+  if (!reinitializeActiveCamera()) {
+    logEvent("camera: power-up failed");
+    return false;
+  }
+  while (millis() - started < kCameraWakeSettleMs) {
+    camera_fb_t *frameBuffer = esp_camera_fb_get();
+    if (frameBuffer == nullptr) break;
+    esp_camera_fb_return(frameBuffer);
+  }
+  lastCameraUseMs = millis();
+  logEvent("camera: powered up in %lu ms", static_cast<unsigned long>(millis() - started));
+  return true;
+}
+
+bool suspendCamera() {
+  if (!cameraPowered) return true;
+  if (cameraMutex == nullptr || xSemaphoreTakeRecursive(cameraMutex, 0) != pdTRUE) {
+    return false;  // a capture or settings change is in progress; try again later
+  }
+  esp_camera_deinit();  // stops the I2S DMA and the XCLK, frees the frame buffers
+  pinMode(kPowerDownPin, OUTPUT);
+  digitalWrite(kPowerDownPin, HIGH);  // sensor power-down
+  cameraPowered = false;
+  unlockCamera();
+  logEvent("camera: powered down (idle)");
+  return true;
+}
+
+void maintainCameraPower(bool idleAllowed) {
+  if (!cameraPowered || !idleAllowed) return;
+  if (millis() - lastCameraUseMs < kCameraIdlePowerDownMs) return;
+  suspendCamera();
 }

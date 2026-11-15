@@ -8,6 +8,7 @@
 #include "app_config.h"
 #include "camera_runtime.h"
 #include "camera_service.h"
+#include "device_health.h"
 #include "device_telemetry.h"
 #include "image_storage.h"
 #include "motion_detector.h"
@@ -239,6 +240,7 @@ String configJson() {
                                       ? nullptr
                                       : cameraSensorKeyName(getActiveCameraSensorKey());
   document["camera_restart_required"] = isCameraRestartRequired();
+  document["server_host"] = cfg.serverHost;
   document["server_ip"] = cfg.serverIp;
   document["server_port"] = cfg.serverPort;
   document["save_birds_to_sd"] = cfg.saveBirdsToSd;
@@ -441,6 +443,14 @@ bool validConfig(const JsonDocument &document, String &error) {
       return false;
     }
   }
+  if (document.containsKey("server_host")) {
+    // Empty is allowed: it switches name lookup off so only server_ip is used.
+    if (!document["server_host"].is<const char *>() ||
+        strlen(document["server_host"] | "") >= sizeof(cfg.serverHost)) {
+      error = "server_host must be a host name shorter than 64 characters";
+      return false;
+    }
+  }
   if (document.containsKey("bird_confidence_threshold")) {
     const float value = document["bird_confidence_threshold"];
     if (value < 0.0f || value > 1.0f) {
@@ -636,6 +646,9 @@ void applyConfig(const JsonDocument &document) {
     strlcpy(cfg.serverIp, document["server_ip"] | cfg.serverIp, sizeof(cfg.serverIp));
   }
   if (document.containsKey("server_port")) cfg.serverPort = document["server_port"];
+  if (document.containsKey("server_host")) {
+    strlcpy(cfg.serverHost, document["server_host"] | cfg.serverHost, sizeof(cfg.serverHost));
+  }
   if (document.containsKey("save_birds_to_sd")) cfg.saveBirdsToSd = document["save_birds_to_sd"];
   if (document.containsKey("pipeline") &&
       document["pipeline"].as<JsonObjectConst>().containsKey("bird_confidence_threshold")) {
@@ -723,6 +736,7 @@ void handleClient(WiFiClient client) {
   } else if (request.method == "GET" && request.path == "/config") {
     sendJson(client, 200, "OK", configJson());
   } else if (request.method == "POST" && request.path == "/config") {
+    wakeCamera();  // settings are applied to a powered sensor
     JsonDocument document;
     const DeserializationError error = deserializeJson(document, request.body);
     if (error || !document.is<JsonObject>()) {
@@ -941,6 +955,13 @@ void handleClient(WiFiClient client) {
     String json;
     serializeJson(document, json);
     sendJson(client, 200, "OK", json);
+  } else if (request.method == "GET" && request.path == "/health") {
+    sendJson(client, 200, "OK", deviceHealthJson());
+  } else if (request.method == "POST" && request.path == "/reboot") {
+    sendJson(client, 200, "OK", "{\"rebooting\":true}");
+    client.flush();
+    client.stop();
+    rebootDevice("requested over HTTP");
   } else {
     sendJson(client, 404, "Not Found", "{\"error\":\"Endpoint not found\"}");
   }

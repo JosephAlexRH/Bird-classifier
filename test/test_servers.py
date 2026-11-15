@@ -466,7 +466,7 @@ class LaptopServerTests(unittest.TestCase):
         app.testing = True
         client = app.test_client()
         self.assertEqual(client.get("/camera/capture").status_code, 503)
-        dashboard = client.get("/").get_data(as_text=True)
+        dashboard = client.get("/legacy").get_data(as_text=True)
         self.assertIn("Start stream", dashboard)
         self.assertIn("Arm motion", dashboard)
         self.assertIn("Camera state", dashboard)
@@ -493,7 +493,7 @@ class LaptopServerTests(unittest.TestCase):
         response = self.client.get(f"/api/cameras/{camera['id']}/status")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(mocked_urlopen.call_args.args[0].full_url, "http://192.168.1.84/status")
-        self.assertIn("Camera fleet", self.client.get("/").get_data(as_text=True))
+        self.assertIn("Camera fleet", self.client.get("/legacy").get_data(as_text=True))
 
     @patch("server.laptop_test_server.urlopen")
     def test_busy_camera_does_not_block_another_registered_camera(self, mocked_urlopen) -> None:
@@ -567,12 +567,12 @@ class LaptopServerTests(unittest.TestCase):
         self.assertFalse(self.client.get("/api/info").get_json()["camera_streaming"])
 
     def test_dashboard_has_exact_six_calibration_choices(self) -> None:
-        dashboard = self.client.get("/").get_data(as_text=True)
+        dashboard = self.client.get("/legacy").get_data(as_text=True)
         choices = re.findall(r'<option value="([^"]+)">', dashboard)
         self.assertEqual(choices, list(calibration_type_values()))
 
     def test_dashboard_has_mouse_touch_roi_editor(self) -> None:
-        dashboard = self.client.get("/").get_data(as_text=True)
+        dashboard = self.client.get("/legacy").get_data(as_text=True)
         self.assertIn('id="camera-tabs"', dashboard)
         self.assertIn('role="tablist"', dashboard)
         self.assertIn("/api/cameras/${encodeURIComponent(activeCameraId)}", dashboard)

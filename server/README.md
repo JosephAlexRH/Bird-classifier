@@ -7,7 +7,66 @@ The firmware sends raw JPEG bytes to `POST /upload` with the content type
 ## Multiple cameras
 
 Both `laptop_test_server.py` and `raspberry_pi_server.py` maintain a persistent
-camera registry. Open either dashboard and use **Camera fleet** to add an
+camera registry, and cameras add themselves to it. Every ESP32 posts a heartbeat
+to `/api/heartbeat` every 15 s carrying its stable hardware `camera_id` and its
+current IP, and the server keeps the registry in step with that:
+
+- **New camera**: added automatically as `New camera <last 4 of its ID>`, enabled,
+  and flagged `needs_name`. The dashboards show a **name this camera** button;
+  naming it (or any rename) clears the flag.
+- **Known camera, new IP** (router handed out a different address): the stored
+  URL is rewritten in place. The name, registry ID, captures and settings are
+  untouched, and on the Pi the camera's motion worker restarts on the new address.
+- **Camera you already added by hand** at that address: the hardware ID is
+  attached to your entry instead of creating a duplicate.
+- **Address still claimed by a different registered camera that has not checked
+  in**: nothing changes and the server prints one notice. Remove the retired
+  camera from the dashboard and the new one is added on its next heartbeat.
+
+Cameras find the server by name too (see **Finding the hub by name** below), so
+neither side needs an IP address typed in. A camera that is removed
+from the dashboard while still powered on will re-add itself on its next
+heartbeat; use **Disable** to keep a live camera out of use. Pass
+`--no-auto-register` to either server to manage the registry purely by hand.
+
+### Finding the hub by name
+
+Both servers answer on the local network for `birdhub.local` (mDNS). Each camera
+looks that name up just before its heartbeat and sends heartbeats and uploads to
+whatever address answers, so every camera can carry the same `config.json`:
+
+```json
+"server_host": "birdhub.local",
+"server_ip": "192.168.1.100"
+```
+
+- `server_host` is tried first. It may also be a plain IPv4 address or a normal
+  DNS name. Set it to `""` to switch name lookup off.
+- `server_ip` is the fallback, used until the name has resolved once. Cameras
+  with an older `config.json` (no `server_host`) get `birdhub.local` by default
+  and keep their `server_ip` as that fallback.
+- If the hub's own address changes, a camera notices at its next failed
+  heartbeat and looks the name up again (at most every 30 s).
+- Each camera's `/health` and heartbeat report `hub.host`, `hub.address` and
+  `hub.found_by_name`, and its event log notes `hub: birdhub.local is at ...`.
+
+Server side this needs the optional `zeroconf` package (now in
+`requirements.txt`; `pip install zeroconf`). At startup the server prints
+`Hub name: cameras can find this server as birdhub.local (...)`. Options:
+
+| Option | Purpose |
+|---|---|
+| `--hub-name garden` | Answer for `garden.local` instead (set the cameras' `server_host` to match) |
+| `--no-advertise` | Do not answer for any name; cameras use `server_ip` |
+
+Only one server on a network should use a given name. If the laptop and the Pi
+both run with the default, cameras may reach either one; start one of them with
+`--no-advertise` or a different `--hub-name`. On Windows, allow Python through
+the firewall on private networks when prompted (mDNS uses UDP port 5353). A
+Raspberry Pi whose own hostname is `birdhub` already answers for `birdhub.local`
+through Raspberry Pi OS, with or without `zeroconf`.
+
+Adding by address remains as a fallback: use **Camera fleet** to add an
 ESP32-CAM by IP address, for example `192.168.1.84`. A complete base URL such as
 `http://192.168.1.84` is also accepted. The optional name is used in the
 dashboard and capture sidecars.
@@ -146,6 +205,30 @@ Keep these candidates in their own directory and review them before training:
 ```powershell
 python .\image_labeler.py E:\Datasets\ESP32_environment
 ```
+
+`image_labeler.py` now opens the combined label and bounding-box editor (the
+same application as `bbox_viewer.py`). A directory does not need an existing
+manifest: the editor discovers its images and creates `bird_annotations.csv`
+on the first save. You can also open the current detector annotation CSV
+directly to edit it in place:
+
+```powershell
+python .\bbox_viewer.py .\Models\Multi_Object_Detector\runs\RUN_NAME\joined_bird_detector_annotations.csv
+```
+
+For one species across all boxes, enter the shared species (for example
+`Blue Tit`). Enable **Mixed species — label each box** only when individual
+boxes need different `species_name` values. The manifest stores `is_Bird`,
+`mixed_species`, and `bird_count` for every image; `bird_count` is kept equal
+to the number of accepted bird boxes.
+
+The **Context around boxes (%)** control defaults to 0, so the context rectangle
+initially matches the tight box. Positive values add that total percentage to
+the box width and height, shifted or clipped to remain inside the image. Cyan
+rectangles remain the tight detector annotations; dashed orange rectangles
+preview the context. Detector CSVs preserve the tight `xmin`/`ymin`/`xmax`/
+`ymax` values and write `context_percent` plus `context_xmin`/`context_ymin`/
+`context_xmax`/`context_ymax` alongside them.
 
 For unattended collection on Windows, the recommended setup is a Task Scheduler
 task that invokes the one-picture command every 30 minutes. Set the action's
@@ -415,6 +498,83 @@ When supplied, the Pi root page exposes camera capture preview, config/status,
 motion/idle mode controls, and the same normalized drag-to-draw ROI editor as
 the laptop dashboard. Browser requests go through the Pi's `/camera/capture`,
 `/camera/config`, `/camera/status`, and `/camera/mode` proxy endpoints.
+
+### Unattended field runs: service, time and run log
+
+**Hub service.** Install the Pi server as a service so it starts at power-on and
+restarts itself after any failure. Run once, at home, with internet:
+
+```bash
+sudo bash deploy/install_pi_hub.sh
+# or, with your own arguments (models, a USB drive for captures, ...):
+sudo bash deploy/install_pi_hub.sh -- --save-dir /mnt/usb/bird_images
+```
+
+Arguments live in `/etc/default/birdhub`; edit that file and run
+`sudo systemctl restart birdhub`. Follow the output with
+`journalctl -u birdhub -f`. The service does not wait for internet, so it comes
+up at a site that has none. It replaces the hand-written `bird-pi.service`
+below (the installer disables that one if it is enabled).
+
+**Wi-Fi hotspot (no router at the site).** The Pi can be its own Wi-Fi network
+that the cameras join directly:
+
+```bash
+sudo bash deploy/pi_hotspot.sh on        # field mode; stays on across reboots
+sudo bash deploy/pi_hotspot.sh status    # network name, password, connected devices
+sudo bash deploy/pi_hotspot.sh off       # back to your normal Wi-Fi
+```
+
+The first `on` creates a network called `BirdHub` with a random password and
+prints both (choose your own with `--ssid` and `--password`). The hub is then
+always at `10.42.0.1`. Put the network name and password in each camera's
+`config.json` as `wifi_ssid` / `wifi_password`, and set `server_ip` to
+`10.42.0.1` as the fallback for `server_host`. The Pi has a single Wi-Fi radio,
+so it is either the hotspot or on your home Wi-Fi, not both: switching modes
+drops a Wi-Fi SSH session (use Ethernet, or rejoin through the hotspot). With an
+Ethernet cable plugged in, the hotspot also shares that internet connection.
+To view the dashboard or give the hub the time, join `BirdHub` from your phone
+and open `http://10.42.0.1:5000`. Needs Raspberry Pi OS Bookworm or newer.
+
+**Time without internet or a clock module.** A Pi has no battery clock, and the
+cameras normally take their time from internet servers. In the field:
+
+- Cameras set their clocks from the hub: every heartbeat reply carries
+  `server_time_unix_ms`. Camera and hub timestamps therefore always agree. The
+  heartbeat reports `time_source` (`ntp`, `hub` or `none`).
+- Any phone or laptop that opens the dashboard offers its own clock to the hub
+  (`POST /api/time`). If the hub has no network time and disagrees by more than
+  two seconds, the hub's clock is corrected and the offset is written to the
+  run log, so timestamps taken before the visit can be fixed afterwards.
+  **Open the dashboard from your phone when you set the kit up at the site**:
+  that one visit gives the whole power-up correct time.
+- The hub saves the latest time every minute and never lets its clock run
+  backwards after a power cut. After a cut it resumes from the last saved time,
+  so it runs behind by however long the power was off until a phone visits.
+  The dashboard shows `HUB CLOCK UNVERIFIED` until then, and every run-log line
+  records the clock state (`ntp`, `system`, `reference`, `offset`, `unverified`).
+
+With a clock module fitted later, none of this changes; the phone visit simply
+finds nothing to correct.
+
+**Run log.** Everything the fleet page shows only briefly is kept permanently in
+`<save-dir>/runlog/run-YYYY-MM-DD.jsonl`, one JSON object per line: every
+heartbeat, each camera boot (with its reset reason), camera event-log lines,
+crashes, cameras added or re-addressed, clock corrections, server starts, and a
+hub status line every 5 minutes (free disk, CPU temperature, and the Pi's
+under-voltage flag, which is the one to watch on a battery). Each line also
+carries a monotonic time and the hub power-up it belongs to, so durations stay
+right even where the wall clock was wrong. Expect very roughly 10 MB per camera per day.
+
+Summarise a run afterwards:
+
+```bash
+python server/run_report.py ~/bird_images/runlog
+```
+
+It prints, per camera, the share of time it was reachable, the gaps, restarts by
+cause, crashes, Wi-Fi signal and memory lows, and for the hub its restarts,
+clock corrections, power warnings and lowest free disk.
 
 ### Start the Pi receiver at boot
 

@@ -69,6 +69,11 @@ class ImageLabelerMetadataTests(unittest.TestCase):
             self.assertEqual({path.name for path in labeled}, {"a.jpg"})
             self.assertEqual(species, ["Robin", image_labeler.UNKNOWN_SPECIES])
 
+    def test_main_delegates_to_the_combined_label_and_bbox_editor(self) -> None:
+        with mock.patch("bbox_viewer.main", return_value=17) as combined:
+            self.assertEqual(image_labeler.main(["captures"]), 17)
+        combined.assert_called_once_with(["captures"])
+
 
 class VirtualGalleryTkTests(unittest.TestCase):
     def setUp(self) -> None:

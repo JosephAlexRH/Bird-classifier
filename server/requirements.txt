@@ -3,3 +3,5 @@ numpy>=1.26,<3
 Pillow>=10,<13
 # Decodes JPEGs bit-identically to tf.io.decode_jpeg (fast DCT); Pillow is the fallback.
 simplejpeg>=1.7,<2
+# Lets cameras find this server as birdhub.local instead of a typed-in IP (optional).
+zeroconf>=0.130,<1

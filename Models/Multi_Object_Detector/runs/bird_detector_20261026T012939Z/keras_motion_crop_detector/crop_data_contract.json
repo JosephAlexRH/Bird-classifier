@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-10-26T20:57:13.456998+00:00",
+  "source_run": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Models/Multi_Object_Detector/runs/bird_detector_20261026T012939Z",
+  "input_size": 288,
+  "feature_layer": "block_6_expand_relu",
+  "feature_stride": 8,
+  "grid_size": 36,
+  "native_160x120_excluded": true,
+  "full_scene_metrics": "not generated",
+  "data_audit": [
+    {
+      "dataset": "train_crop",
+      "images": 12677,
+      "positive_images": 10065,
+      "negative_images": 2612,
+      "birds": 11617,
+      "missing_images": 0
+    },
+    {
+      "dataset": "validation_crop",
+      "images": 506,
+      "positive_images": 373,
+      "negative_images": 133,
+      "birds": 500,
+      "missing_images": 0
+    },
+    {
+      "dataset": "test_crop",
+      "images": 147,
+      "positive_images": 80,
+      "negative_images": 67,
+      "birds": 112,
+      "missing_images": 0
+    },
+    {
+      "dataset": "calibration_crop",
+      "images": 500,
+      "positive_images": 250,
+      "negative_images": 250,
+      "birds": 330,
+      "missing_images": 0
+    }
+  ]
+}

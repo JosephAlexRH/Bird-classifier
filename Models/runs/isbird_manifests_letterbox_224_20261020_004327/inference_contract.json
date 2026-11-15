@@ -1,0 +1,38 @@
+{
+  "model_file": "model_uint8.tflite",
+  "task": "binary bird/not-bird classification",
+  "labels": {
+    "0": "not_bird",
+    "1": "bird"
+  },
+  "positive_output": "bird_probability",
+  "bird_probability_threshold": 0.9453125,
+  "uint8_output_threshold": 242,
+  "input_shape": [
+    1,
+    224,
+    224,
+    3
+  ],
+  "input_dtype": "uint8",
+  "input_quantization": [
+    1.0,
+    0
+  ],
+  "color_order": "RGB",
+  "jpeg_decode_channels": 3,
+  "geometry": "letterbox",
+  "geometry_location": "outside the model",
+  "resize_method": "TensorFlow bilinear",
+  "resize_antialias": true,
+  "letterbox_padding_value": 0,
+  "centering": "TensorFlow resize_with_pad / resize_with_crop_or_pad semantics",
+  "center_crop_scaled_dimension_rounding": "ceil",
+  "numeric_scaling": "[0,255] to [-1,1] inside the model",
+  "input_quantization_formula": "clip(round(float_pixels / scale + zero_point), dtype_min, dtype_max)",
+  "output_dtype": "uint8",
+  "output_quantization": [
+    0.00390625,
+    0
+  ]
+}

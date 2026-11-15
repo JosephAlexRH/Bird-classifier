@@ -56,6 +56,9 @@ struct Config {
   float motionMaxClippedFraction;
   int motionMinValidBlocks;
   float motionMaxChangedFraction;
+  // Hub name looked up on the network (see hub_locator.h); serverIp is the fallback.
+  // Keep this the last member: cfg is initialized positionally in app_config.cpp.
+  char serverHost[64];
 };
 
 constexpr int kMaxBurstCount = 10;
