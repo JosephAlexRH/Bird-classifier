@@ -1,0 +1,26 @@
+{
+  "ground_truth_images": 200,
+  "ground_truth_boxes": 270,
+  "scored_ground_truth_boxes": 242,
+  "ignored_ground_truth_boxes": 28,
+  "no_bird_images": 3,
+  "unusable_images_skipped": 3,
+  "evaluated_predictions": 219,
+  "true_positives": 146,
+  "false_positives": 73,
+  "precision": 0.6666666666666666,
+  "recall": 0.6033057851239669,
+  "average_precision_iou_50": 0.5868542398256694,
+  "mean_iou_true_positives": 0.7589080680080909,
+  "false_positives_on_no_bird_images": 3,
+  "recall_by_image_type": {
+    "multi-bird": {
+      "ground_truth_boxes": 73,
+      "recall": 0.1780821917808219
+    },
+    "single-bird": {
+      "ground_truth_boxes": 169,
+      "recall": 0.7869822485207101
+    }
+  }
+}

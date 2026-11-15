@@ -10,17 +10,58 @@ include/secrets.h
 # Device config
 data/config.json
 
-# Jupyter autosaves
-.ipynb_checkpoints/
-
-# Python bytecode
+# Python caches and environments
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+.ipynb_checkpoints/
 
-# Generated outputs (iNaturalist, Bridge, CUB)
-Notebooks/Outputs/
 
-# Images
+# IDE and system files
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+.pio/
+
+# Ignore images and metadata sidecars
 *.jpg
 *.jpeg
-*.JPG
+*.png
+*.webp
+*.sidecar
+*.xmp
+
+# Ignore all CSVs except experiment results
+*.csv
+!**/runs/**/*.csv
+
+# Ignore datasets copied into experiment runs
+**/runs/**/datasets/
+**/pascal_voc/Annotations/
+
+# Model training artifacts
+checkpoints/
+runs/
+*.ckpt
+*.pt
+*.pth
+
+# Python caches
+*.pyc
+
+# Annotation and dataset processing progress
+*progress*.jsonl
+
+# Temporary locks and logs
+*.lock
+*.log
+
+# Backup source files
+*.bak_before_*

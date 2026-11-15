@@ -1,0 +1,11 @@
+1. ESP32 - primary deployment domain
+ 
+"E:\Datasets\ESP32_capture\manifests\esp32_capture_manifest_generated_bbox_annotations.csv"
+
+2. CUB - Clean supervised detection 
+
+"C:\Users\Joe\Desktop\ESP_Classifier\esp32_Classifier\Notebooks\Outputs\CUB Outputs\cub_200_2011_image_manifest.csv"
+
+3. iNaturalist - supplemental pesudo-labeled data 
+
+"C:\Users\Joe\Desktop\ESP_Classifier\esp32_Classifier\Notebooks\Outputs\iNaturalist Outputs\Bounding Box Outputs\inaturalist_bird_boxes.csv"

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "generated_utc": "2026-10-10T16:56:49.946096+00:00",
+  "configuration": {
+    "capture_root": "C:\\Users\\Joe\\Pictures\\ESP32Cam",
+    "output_dir": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\ESP32 Capture Manifest",
+    "sidecar_rule": "same directory and stem, .json extension (case-insensitive)",
+    "image_extensions": [
+      ".bmp",
+      ".gif",
+      ".jpeg",
+      ".jpg",
+      ".png",
+      ".tif",
+      ".tiff",
+      ".webp"
+    ]
+  },
+  "dataset": {
+    "images_discovered": 3305,
+    "valid_paired_captures": 3260,
+    "labeled_captures": 3254,
+    "unlabeled_or_invalid_label_captures": 6,
+    "rejected_images": 45,
+    "bird_presence_counts": {
+      "false": 877,
+      "true": 2377
+    },
+    "class_count": 10,
+    "issue_counts": {
+      "missing_manual_label": 6,
+      "missing_sidecar": 45,
+      "orphan_sidecar": 11
+    },
+    "ignored_non_capture_json_files": 1
+  },
+  "outputs": {
+    "capture_manifest": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\ESP32 Capture Manifest\\esp32_capture_manifest.csv",
+    "labeled_manifest": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\ESP32 Capture Manifest\\esp32_labeled_manifest.csv",
+    "label_summary": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\ESP32 Capture Manifest\\esp32_label_summary.csv",
+    "issues": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\ESP32 Capture Manifest\\esp32_manifest_issues.csv",
+    "summary": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\ESP32 Capture Manifest\\esp32_manifest_summary.json",
+    "capture_manifest_sha256": "9c4f4978c396f4431b0168cdaa4d45be56f4cc2a60df3b657ce3aed27c462ffd",
+    "labeled_manifest_sha256": "145dff7dea25be0936f495479be050035fab41bcffbbe964101ffe983f2c3ffe"
+  }
+}

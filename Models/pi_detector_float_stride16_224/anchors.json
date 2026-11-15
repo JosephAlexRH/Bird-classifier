@@ -1,0 +1,21 @@
+{
+  "config_fingerprint": "359f13558c5ca6c3bfc9c4ea1cb73c56d0ec58fcde1e115abd93e7da55ce32dc",
+  "input_size": 224,
+  "feature_layer": "block_13_expand_relu",
+  "feature_stride": 16,
+  "grid_size": 14,
+  "anchors": [
+    [
+      0.30197447538375854,
+      0.30662021040916443
+    ],
+    [
+      0.5027866959571838,
+      0.5528455972671509
+    ],
+    [
+      0.831632673740387,
+      0.6747719645500183
+    ]
+  ]
+}

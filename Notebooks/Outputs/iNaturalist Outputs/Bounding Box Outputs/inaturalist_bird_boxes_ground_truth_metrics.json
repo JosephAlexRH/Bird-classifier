@@ -1,0 +1,59 @@
+{
+  "headline_split": "gt_select",
+  "gt_train": {
+    "note": "trained on: memorised, not a quality estimate",
+    "images": 100,
+    "ground_truth_boxes": 128,
+    "scored_ground_truth_boxes": 126,
+    "ignored_ground_truth_boxes": 2,
+    "no_bird_images": 2,
+    "evaluated_predictions": 125,
+    "images_with_multiple_predictions": 11,
+    "true_positives": 125,
+    "false_positives": 0,
+    "precision": 1.0,
+    "recall": 0.9920634920634921,
+    "f1": 0.9960159362549801,
+    "average_precision_iou_50": 0.9920634920634921,
+    "mean_iou_true_positives": 0.945250261596156,
+    "false_positives_on_no_bird_images": 0,
+    "recall_by_image_type": {
+      "multi-bird": {
+        "ground_truth_boxes": 41,
+        "recall": 0.975609756097561
+      },
+      "single-bird": {
+        "ground_truth_boxes": 85,
+        "recall": 1.0
+      }
+    }
+  },
+  "gt_select": {
+    "note": "held out from training; chose checkpoint + threshold (slightly optimistic)",
+    "images": 97,
+    "ground_truth_boxes": 142,
+    "scored_ground_truth_boxes": 116,
+    "ignored_ground_truth_boxes": 26,
+    "no_bird_images": 1,
+    "evaluated_predictions": 95,
+    "images_with_multiple_predictions": 6,
+    "true_positives": 89,
+    "false_positives": 6,
+    "precision": 0.9368421052631579,
+    "recall": 0.7672413793103449,
+    "f1": 0.8436018957345971,
+    "average_precision_iou_50": 0.7616226511456039,
+    "mean_iou_true_positives": 0.812839659502894,
+    "false_positives_on_no_bird_images": 0,
+    "recall_by_image_type": {
+      "multi-bird": {
+        "ground_truth_boxes": 32,
+        "recall": 0.46875
+      },
+      "single-bird": {
+        "ground_truth_boxes": 84,
+        "recall": 0.8809523809523809
+      }
+    }
+  }
+}

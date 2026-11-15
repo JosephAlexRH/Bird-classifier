@@ -1,0 +1,190 @@
+{
+  "generated_utc": "2026-10-19T20:54:09.717494+00:00",
+  "run_signature": "f21df69e17fdf44b",
+  "coordinate_space": "stored_pixels_no_exif_rotation",
+  "source_manifest": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/Bridge Outputs/bird_bridge_manifest.csv",
+  "source_manifest_kind": "bridge",
+  "source_manifest_sha256": "44a4665411e28d91f5aecdf407b2990560441b5023d95fa70f41206d233c9885",
+  "cub_manifest": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/CUB Outputs/cub_200_2011_image_manifest.csv",
+  "cub_manifest_sha256": "52c824562a8d05715fcb16fea911b59af1f657d41b40de93665ad88d9ce3a0b1",
+  "checkpoint": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/checkpoints/bird_detector_fasterrcnn_resnet50_fpn_v2_best.pt",
+  "checkpoint_sha256": "2c6f73d829b0f997599e1911d970b2360fac07215ec3267eecb1b2bf7984ecde",
+  "model": "fasterrcnn_resnet50_fpn_v2",
+  "postprocess_policy": {
+    "progress_schema_version": 3,
+    "bird_class_id": 16,
+    "model_output_score_floor": 0.01,
+    "nms_iou_threshold": 0.5,
+    "internal_nms_iou_threshold": 1.0,
+    "score_threshold": 0.8,
+    "score_threshold_source": "max_f1 on gt_select (97 images)",
+    "minimum_short_side_px": 32.0,
+    "mixed_size_area_ratio": 4.0,
+    "mixed_rule_min_score": 0.5,
+    "main_bird_priority": "clipped_box_area_times_confidence",
+    "raw_detections_per_image": 1000,
+    "inference_min_size": 800,
+    "exif_transpose": false
+  },
+  "threshold_selection": {
+    "rule": "max_f1",
+    "reason": "max_f1 on gt_select (97 images)",
+    "selected_threshold": 0.8,
+    "target_precision": null,
+    "selection_split": "gt_select",
+    "selection_images": 97,
+    "metrics_at_selected_threshold": {
+      "images": 97,
+      "ground_truth_boxes": 142,
+      "scored_ground_truth_boxes": 116,
+      "ignored_ground_truth_boxes": 26,
+      "no_bird_images": 1,
+      "evaluated_predictions": 95,
+      "images_with_multiple_predictions": 6,
+      "true_positives": 89,
+      "false_positives": 6,
+      "precision": 0.9368421052631579,
+      "recall": 0.7672413793103449,
+      "f1": 0.8436018957345971,
+      "average_precision_iou_50": 0.7624724718980225,
+      "mean_iou_true_positives": 0.8120551791771643,
+      "false_positives_on_no_bird_images": 0,
+      "recall_by_image_type": {
+        "multi-bird": {
+          "ground_truth_boxes": 32,
+          "recall": 0.46875
+        },
+        "single-bird": {
+          "ground_truth_boxes": 84,
+          "recall": 0.8809523809523809
+        }
+      }
+    }
+  },
+  "training": {
+    "selection_metric": "inat_gt_ap50",
+    "selected_epoch": 5,
+    "ground_truth_train_images": 100,
+    "ground_truth_split_file": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_ground_truth_split.csv",
+    "inat_epoch_fraction": 0.25,
+    "cub_extra_target_boxes": 35,
+    "cub_extra_targets_file": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/cub_extra_targets_7b6db84d2cc4de44.csv"
+  },
+  "input_images": 74300,
+  "output_boxes": 78901,
+  "images_with_boxes": 66672,
+  "images_with_multiple_boxes": 7545,
+  "mixed_size_images_collapsed": 1170,
+  "images_reaching_returned_detection_cap": 0,
+  "status_counts": {
+    "detected": 66672,
+    "no_qualifying_detection": 7628
+  },
+  "box_score": {
+    "minimum": 0.8000029921531677,
+    "median": 0.9985690116882324,
+    "maximum": 0.9997628331184387
+  },
+  "cub_sanity_metrics": {
+    "validation": {
+      "threshold": 0.5,
+      "images": 800,
+      "detections": 800,
+      "detection_rate": 1.0,
+      "mean_iou_all_images": 0.9199598185497083,
+      "median_iou_detected": 0.9400993146837471,
+      "recall_iou_50": 0.995,
+      "recall_iou_75": 0.97375,
+      "multiple_bird_rate_after_nms": 0.045
+    },
+    "test": {
+      "threshold": 0.5,
+      "images": 5794,
+      "detections": 5788,
+      "detection_rate": 0.9989644459785986,
+      "mean_iou_all_images": 0.9142612712469778,
+      "median_iou_detected": 0.9364054886853093,
+      "recall_iou_50": 0.9944770452191922,
+      "recall_iou_75": 0.9615119088712462,
+      "multiple_bird_rate_after_nms": 0.040386606834656544
+    }
+  },
+  "outputs": {
+    "boxes": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_boxes.csv",
+    "boxes_sha256": "78f2b16d6ed2e9a1fbb2cc72286af843982b25cd9b505857f1af47809da57755",
+    "image_audit": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_boxes_image_audit.csv",
+    "image_audit_sha256": "ff147a4cce62c4f090a02909ccac03754b7160cb45b78208ccc29f736ea10050",
+    "cub_metrics": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/cub_bird_detector_metrics.csv",
+    "progress": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_multibox_progress_f21df69e17fdf44b.jsonl",
+    "ground_truth_matches": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_boxes_ground_truth_matches.csv",
+    "ground_truth_matches_sha256": "0e81fd8c3db9f84c55ce6ecfb28474aa228c288632fc22ac76473f2e8e46c789",
+    "ground_truth_metrics": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_boxes_ground_truth_metrics.json",
+    "ground_truth_metrics_sha256": "508218f8f59153facf4a538e005d92573186f600e143f157dec770d8c0c97e1d"
+  },
+  "limitations": [
+    "Bounding boxes are model-generated pseudo-labels, not human annotations.",
+    "The detector has one bird class and cannot directly identify species or colour.",
+    "A configurable area-ratio heuristic collapses potentially mixed-size groups to the main bird.",
+    "The score threshold was chosen on gt_select; gt_select metrics are therefore slightly optimistic.",
+    "Boxes are in the coordinate space named in coordinate_space; consumers must open images the same way."
+  ],
+  "manual_ground_truth": {
+    "headline_split": "gt_select",
+    "gt_train": {
+      "note": "trained on: memorised, not a quality estimate",
+      "images": 100,
+      "ground_truth_boxes": 128,
+      "scored_ground_truth_boxes": 126,
+      "ignored_ground_truth_boxes": 2,
+      "no_bird_images": 2,
+      "evaluated_predictions": 125,
+      "images_with_multiple_predictions": 11,
+      "true_positives": 125,
+      "false_positives": 0,
+      "precision": 1.0,
+      "recall": 0.9920634920634921,
+      "f1": 0.9960159362549801,
+      "average_precision_iou_50": 0.9920634920634921,
+      "mean_iou_true_positives": 0.945250261596156,
+      "false_positives_on_no_bird_images": 0,
+      "recall_by_image_type": {
+        "multi-bird": {
+          "ground_truth_boxes": 41,
+          "recall": 0.975609756097561
+        },
+        "single-bird": {
+          "ground_truth_boxes": 85,
+          "recall": 1.0
+        }
+      }
+    },
+    "gt_select": {
+      "note": "held out from training; chose checkpoint + threshold (slightly optimistic)",
+      "images": 97,
+      "ground_truth_boxes": 142,
+      "scored_ground_truth_boxes": 116,
+      "ignored_ground_truth_boxes": 26,
+      "no_bird_images": 1,
+      "evaluated_predictions": 95,
+      "images_with_multiple_predictions": 6,
+      "true_positives": 89,
+      "false_positives": 6,
+      "precision": 0.9368421052631579,
+      "recall": 0.7672413793103449,
+      "f1": 0.8436018957345971,
+      "average_precision_iou_50": 0.7616226511456039,
+      "mean_iou_true_positives": 0.812839659502894,
+      "false_positives_on_no_bird_images": 0,
+      "recall_by_image_type": {
+        "multi-bird": {
+          "ground_truth_boxes": 32,
+          "recall": 0.46875
+        },
+        "single-bird": {
+          "ground_truth_boxes": 84,
+          "recall": 0.8809523809523809
+        }
+      }
+    }
+  }
+}

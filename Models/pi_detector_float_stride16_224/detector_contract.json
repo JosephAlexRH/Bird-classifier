@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "model_file": "bird_detector_motion_crop_stride16_float32.tflite",
+  "model_sha256": "ce1dbbaa645f8172030d146762fb968e8916d3ea18580e3dc1bcdda79456ef24",
+  "anchors_file": "anchors.json",
+  "anchors_sha256": "7405f8d22dd922e5b1ccbfb7eed499bcbf9bf9d7dee49b72df7e33be4e9ee43a",
+  "tensor_details_file": "tflite_tensor_details.json",
+  "tensor_details_sha256": "0e84484eb0a1f1c3ba889aa5b7589795ebf4a4ce3274d2658c0da566441e6d30",
+  "source_export": "Models/Multi_Object_Detector/runs/bird_detector_20261026T012939Z/keras_motion_crop_detector_stride16_split_heads_224",
+  "source_uint8_metadata_sha256": "cd98ce6013ce4fc7a8e41188e0aa60872921599ad70f29e1a999dd00ef41dbf3",
+  "input": {
+    "name": "serving_default_image:0",
+    "shape": [1, 224, 224, 3],
+    "dtype": "float32",
+    "quantization": [0.0, 0],
+    "color_order": "RGB",
+    "geometry": "selected_crop_then_letterbox",
+    "geometry_location": "outside the model",
+    "crop_source": "capture_motion_record.selection.final_bounds_px",
+    "crop_coordinate_space": "original_decoded_frame_pixels",
+    "crop_bounds_semantics": "half_open_left_top_right_bottom",
+    "crop_is_final": true,
+    "additional_runtime_margin": 0,
+    "letterbox_padding_value": 114,
+    "resize_method": "bilinear",
+    "resize_antialias": true,
+    "numeric_scaling": "[0,255] to [-1,1] inside the model"
+  },
+  "outputs": {
+    "box": {
+      "name": "StatefulPartitionedCall_1:0",
+      "shape": [1, 14, 14, 3, 4],
+      "dtype": "float32",
+      "quantization": [0.0, 0],
+      "output_position": 0,
+      "order": ["tx", "ty", "tw", "th"]
+    },
+    "score": {
+      "name": "StatefulPartitionedCall_1:1",
+      "shape": [1, 14, 14, 3, 1],
+      "dtype": "float32",
+      "quantization": [0.0, 0],
+      "output_position": 1,
+      "order": ["bird_score_logit"],
+      "activation": "sigmoid outside the model"
+    }
+  },
+  "anchors_normalized_wh": [
+    [0.30197447538375854, 0.30662021040916443],
+    [0.5027866959571838, 0.5528455972671509],
+    [0.831632673740387, 0.6747719645500183]
+  ],
+  "decode": {
+    "center_x": "(sigmoid(tx) * 3 - 1 + grid_x) / grid_width",
+    "center_y": "(sigmoid(ty) * 3 - 1 + grid_y) / grid_height",
+    "width": "anchor_width * exp(clamp(tw, -4, 4))",
+    "height": "anchor_height * exp(clamp(th, -4, 4))",
+    "score": "sigmoid(bird_score_logit)"
+  },
+  "postprocess": {
+    "candidate_score_threshold": 0.01,
+    "deployment_score_threshold": 0.5,
+    "deployment_threshold_source": "requested float deployment threshold",
+    "nms_iou": 0.45,
+    "max_detections": 5
+  }
+}

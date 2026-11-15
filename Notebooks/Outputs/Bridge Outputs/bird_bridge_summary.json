@@ -1,0 +1,58 @@
+{
+  "generated_utc": "2026-10-06T20:51:36.920189+00:00",
+  "source_manifests": {
+    "cub": {
+      "path": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\CUB Outputs\\cub_200_2011_image_manifest.csv",
+      "rows": 11788,
+      "classes": 200,
+      "dataset_root": "E:\\Datasets\\CUB_200\\CUB_200_2011",
+      "photos_directory": "E:\\Datasets\\CUB_200\\CUB_200_2011\\images",
+      "declared_missing_files": 0
+    },
+    "inaturalist": {
+      "path": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\iNaturalist Outputs\\bird_manifest.csv",
+      "rows": 74300,
+      "categories": 1486,
+      "dataset_root": "E:\\Datasets\\iNaturalist",
+      "photos_directory": "E:\\Datasets\\iNaturalist\\train_mini\\train_mini",
+      "declared_missing_files": 0
+    }
+  },
+  "bridge": {
+    "image_rows": 86088,
+    "canonical_taxa": 1507,
+    "cub_match_methods": {
+      "curated_alias": 27,
+      "normalized_common_name": 152,
+      "unmatched": 21
+    },
+    "taxon_status_counts": {
+      "cub_only": 21,
+      "inaturalist_only": 1307,
+      "shared_taxon": 179
+    },
+    "live_file_check_performed": true,
+    "live_files_found": 86088,
+    "live_files_missing": 0,
+    "first_missing_paths": []
+  },
+  "outputs": {
+    "image_manifest": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\Bridge Outputs\\bird_bridge_manifest.csv",
+    "taxon_crosswalk": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\Bridge Outputs\\cub_inaturalist_taxon_crosswalk.csv",
+    "summary": "C:\\Users\\Joe\\Desktop\\ESP_Classifier\\esp32_Classifier\\Notebooks\\Outputs\\Bridge Outputs\\bird_bridge_summary.json"
+  },
+  "validations": {
+    "cub_image_count_matches_expected": true,
+    "cub_class_count_matches_expected": true,
+    "inaturalist_image_count_matches_expected": true,
+    "inaturalist_category_count_matches_expected": true,
+    "source_manifests_declare_all_files_present": true,
+    "dataset_roots_exist": true,
+    "photo_roots_exist": true,
+    "crosswalk_taxon_ids_are_unique": true,
+    "every_cub_class_has_crosswalk_entry": true,
+    "every_inaturalist_category_has_crosswalk_entry": true,
+    "bridge_row_count_matches_sources": true,
+    "all_referenced_photos_exist_now": true
+  }
+}

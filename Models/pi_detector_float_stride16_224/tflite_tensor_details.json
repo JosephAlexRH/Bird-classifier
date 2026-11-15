@@ -1,0 +1,129 @@
+{
+  "float": {
+    "path": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Models/Multi_Object_Detector/runs/bird_detector_20261026T012939Z/keras_motion_crop_detector_stride16_split_heads_224/exports/bird_detector_motion_crop_stride16_float32.tflite",
+    "bytes": 509748,
+    "sha256": "ce1dbbaa645f8172030d146762fb968e8916d3ea18580e3dc1bcdda79456ef24",
+    "inputs": [
+      {
+        "name": "serving_default_image:0",
+        "shape": [
+          1,
+          224,
+          224,
+          3
+        ],
+        "dtype": "float32",
+        "quantization": [
+          0.0,
+          0
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "StatefulPartitionedCall_1:0",
+        "shape": [
+          1,
+          14,
+          14,
+          3,
+          4
+        ],
+        "dtype": "float32",
+        "quantization": [
+          0.0,
+          0
+        ]
+      },
+      {
+        "name": "StatefulPartitionedCall_1:1",
+        "shape": [
+          1,
+          14,
+          14,
+          3,
+          1
+        ],
+        "dtype": "float32",
+        "quantization": [
+          0.0,
+          0
+        ]
+      }
+    ],
+    "operations": [
+      "ADD",
+      "CONV_2D",
+      "DEPTHWISE_CONV_2D",
+      "MUL",
+      "PACK",
+      "RESHAPE",
+      "SHAPE",
+      "STRIDED_SLICE"
+    ]
+  },
+  "uint8": {
+    "path": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Models/Multi_Object_Detector/runs/bird_detector_20261026T012939Z/keras_motion_crop_detector_stride16_split_heads_224/exports/bird_detector_motion_crop_stride16_uint8.tflite",
+    "bytes": 279136,
+    "sha256": "909f43811b26b23871120e824905a7f1d7816426e470a25641c13206ec986d30",
+    "inputs": [
+      {
+        "name": "serving_default_image:0",
+        "shape": [
+          1,
+          224,
+          224,
+          3
+        ],
+        "dtype": "uint8",
+        "quantization": [
+          1.0,
+          0
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "StatefulPartitionedCall_1:0",
+        "shape": [
+          1,
+          14,
+          14,
+          3,
+          4
+        ],
+        "dtype": "uint8",
+        "quantization": [
+          0.048781152814626694,
+          144
+        ]
+      },
+      {
+        "name": "StatefulPartitionedCall_1:1",
+        "shape": [
+          1,
+          14,
+          14,
+          3,
+          1
+        ],
+        "dtype": "uint8",
+        "quantization": [
+          0.16050861775875092,
+          226
+        ]
+      }
+    ],
+    "operations": [
+      "ADD",
+      "CONV_2D",
+      "DEPTHWISE_CONV_2D",
+      "MUL",
+      "PACK",
+      "QUANTIZE",
+      "RESHAPE",
+      "SHAPE",
+      "STRIDED_SLICE"
+    ]
+  }
+}

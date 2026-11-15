@@ -1,0 +1,70 @@
+{
+  "generated_utc": "2026-10-14T04:31:38.927949+00:00",
+  "run_signature": "d259a16046822f0f",
+  "source_manifest": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/Bridge Outputs/bird_bridge_manifest.csv",
+  "source_manifest_kind": "bridge",
+  "source_manifest_sha256": "44a4665411e28d91f5aecdf407b2990560441b5023d95fa70f41206d233c9885",
+  "cub_manifest": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/CUB Outputs/cub_200_2011_image_manifest.csv",
+  "cub_manifest_sha256": "52c824562a8d05715fcb16fea911b59af1f657d41b40de93665ad88d9ce3a0b1",
+  "checkpoint": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/checkpoints/cub_bird_detector_best.pt",
+  "checkpoint_sha256": "3b950742d9cb67399cb91555ca25c8b21caf76e49bcf91f96147d1cb1071f0ac",
+  "model": "fasterrcnn_mobilenet_v3_large_320_fpn",
+  "bird_class_id": 16,
+  "confidence_threshold": 0.95,
+  "threshold_selection": "highest threshold within 0.01 of best CUB validation Recall@IoU0.50",
+  "input_rows": 74300,
+  "status_counts": {
+    "detected": 53107,
+    "below_threshold": 18973,
+    "no_bird_detection": 2220
+  },
+  "detected_fraction": 0.714764468371467,
+  "bbox_area_fraction": {
+    "minimum": 0.018659354995912363,
+    "median": 0.17068134466535412,
+    "maximum": 0.9808206754482817
+  },
+  "bbox_confidence": {
+    "minimum_detected": 0.9500236511230469,
+    "median_detected": 0.9993467926979065,
+    "maximum_detected": 0.9999880790710449
+  },
+  "cub_metrics": {
+    "validation": {
+      "threshold": 0.95,
+      "images": 800,
+      "detections": 796,
+      "detection_rate": 0.995,
+      "mean_iou_all_images": 0.8990001557422451,
+      "median_iou_detected": 0.922479554365665,
+      "recall_iou_50": 0.9925,
+      "recall_iou_75": 0.96375,
+      "multiple_bird_detection_rate": 0.03625
+    },
+    "test": {
+      "threshold": 0.95,
+      "images": 5794,
+      "detections": 5740,
+      "detection_rate": 0.9906800138073869,
+      "mean_iou_all_images": 0.8935826299763558,
+      "median_iou_detected": 0.9232705808156596,
+      "recall_iou_50": 0.9874007594062824,
+      "recall_iou_75": 0.9411460131170176,
+      "multiple_bird_detection_rate": 0.03261995167414567
+    }
+  },
+  "outputs": {
+    "manifest": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_bbox_manifest.csv",
+    "manifest_sha256": "052354d5b7bc18e1c4dcf29c678e748d1cc82fa3573b097cc1c94b3e74636ac8",
+    "failures": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_bbox_failures.csv",
+    "failures_sha256": "5a35fa09b2c8ceecbd16e790bf8d2f0660a9f8ecd0716c54276104703048c49d",
+    "cub_metrics": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/cub_bird_detector_metrics.csv",
+    "progress": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bbox_progress_d259a16046822f0f.jsonl"
+  },
+  "limitations": [
+    "Bounding boxes are model-generated pseudo-labels, not human annotations.",
+    "Only the highest-confidence bird is retained, matching CUB's one-box-per-image convention.",
+    "Threshold validation uses positive bird images and does not estimate non-bird false-positive rate.",
+    "Review low-confidence, extreme-area, multiple-detection, and missing-detection samples before training."
+  ]
+}

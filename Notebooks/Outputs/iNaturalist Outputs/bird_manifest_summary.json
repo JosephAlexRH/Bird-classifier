@@ -1,0 +1,35 @@
+{
+  "generated_utc": "2026-09-29T01:38:39.790990+00:00",
+  "dataset_root": "E:\\Datasets\\iNaturalist",
+  "metadata_path": "E:\\Datasets\\iNaturalist\\train_mini\\train_mini.json\\train_mini.json",
+  "image_root": "E:\\Datasets\\iNaturalist\\train_mini\\train_mini",
+  "output_directory": "C:\\Users\\Joe\\Desktop\\ESP Classifier\\esp32_Classifier\\Notebooks",
+  "selection_rule": "category[\"class\"] == \"Aves\"",
+  "source_counts": {
+    "images": 500000,
+    "annotations": 500000,
+    "categories": 10000,
+    "licenses": 7
+  },
+  "bird_counts": {
+    "images": 74300,
+    "categories": 1486,
+    "files_found": 74300,
+    "files_missing": 0
+  },
+  "validations": {
+    "all_manifest_rows_are_aves": true,
+    "image_ids_are_unique": true,
+    "annotation_ids_are_unique": true,
+    "category_totals_match_manifest": true,
+    "manifest_count_matches_expected": true,
+    "category_count_matches_expected": true
+  },
+  "outputs": [
+    "bird_manifest.csv",
+    "bird_categories.csv",
+    "bird_category_summary.csv",
+    "missing_bird_images.csv",
+    "bird_manifest_summary.json"
+  ]
+}

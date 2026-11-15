@@ -1,0 +1,109 @@
+{
+  "generated_utc": "2026-10-16T23:34:33.319660+00:00",
+  "run_signature": "63530a42b1e95243",
+  "source_manifest": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/Bridge Outputs/bird_bridge_manifest.csv",
+  "source_manifest_kind": "bridge",
+  "source_manifest_sha256": "44a4665411e28d91f5aecdf407b2990560441b5023d95fa70f41206d233c9885",
+  "cub_manifest": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/CUB Outputs/cub_200_2011_image_manifest.csv",
+  "cub_manifest_sha256": "52c824562a8d05715fcb16fea911b59af1f657d41b40de93665ad88d9ce3a0b1",
+  "checkpoint": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/checkpoints/cub_bird_detector_best.pt",
+  "checkpoint_sha256": "940ddc9b285cb82e6ff14c728600fb8a9cedb346e3e0faf4bf01c6fccfda9135",
+  "model": "fasterrcnn_mobilenet_v3_large_320_fpn",
+  "postprocess_policy": {
+    "progress_schema_version": 2,
+    "bird_class_id": 16,
+    "model_output_score_floor": 0.01,
+    "nms_iou_threshold": 0.5,
+    "internal_nms_iou_threshold": 1.0,
+    "score_threshold": 0.05,
+    "minimum_short_side_px": 32.0,
+    "mixed_size_area_ratio": 4.0,
+    "main_bird_priority": "clipped_box_area_times_confidence",
+    "raw_detections_per_image": 1000,
+    "ground_truth_iou_threshold": 0.5,
+    "ground_truth_iou_epsilon": 1e-12
+  },
+  "input_images": 74300,
+  "output_boxes": 86089,
+  "images_with_boxes": 69805,
+  "images_with_multiple_boxes": 12207,
+  "mixed_size_images_collapsed": 4257,
+  "images_reaching_returned_detection_cap": 0,
+  "status_counts": {
+    "detected": 69805,
+    "no_qualifying_detection": 4495
+  },
+  "box_score": {
+    "minimum": 0.050001680850982666,
+    "median": 0.9908692836761475,
+    "maximum": 0.9999836683273315
+  },
+  "cub_metrics": {
+    "validation": {
+      "threshold": 0.95,
+      "images": 800,
+      "detections": 797,
+      "detection_rate": 0.99625,
+      "mean_iou_all_images": 0.8989936588508323,
+      "median_iou_detected": 0.9216429547309046,
+      "recall_iou_50": 0.9925,
+      "recall_iou_75": 0.96,
+      "multiple_bird_detection_rate": 1.0
+    },
+    "test": {
+      "threshold": 0.95,
+      "images": 5794,
+      "detections": 5726,
+      "detection_rate": 0.9882637210907835,
+      "mean_iou_all_images": 0.8908574511834805,
+      "median_iou_detected": 0.9233064354346607,
+      "recall_iou_50": 0.9860200207110804,
+      "recall_iou_75": 0.9408008284432171,
+      "multiple_bird_detection_rate": 1.0
+    }
+  },
+  "outputs": {
+    "boxes": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_boxes.csv",
+    "boxes_sha256": "4a8a152a75b8ae45e888f54ddd8c957811a1d29b0c4ca5aaea8a4705b261d9de",
+    "image_audit": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_boxes_image_audit.csv",
+    "image_audit_sha256": "89890b76deb49b749d219a08c91971f5bfb225d2dbb509c81ff73723520d60eb",
+    "cub_metrics": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/cub_bird_detector_metrics.csv",
+    "progress": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_multibox_progress_63530a42b1e95243.jsonl",
+    "ground_truth_matches": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_boxes_ground_truth_matches.csv",
+    "ground_truth_matches_sha256": "09040ef8bc25d9b0980c75645166add12e744f6c3d124355430945ddab3367c4",
+    "ground_truth_metrics": "/mnt/c/Users/Joe/Desktop/ESP_Classifier/esp32_Classifier/Notebooks/Outputs/iNaturalist Outputs/Bounding Box Outputs/inaturalist_bird_boxes_ground_truth_metrics.json",
+    "ground_truth_metrics_sha256": "c70303c358081dcfb3587c75c8549fdc5347bfb553aceccddc72fbb21dc9d31e"
+  },
+  "limitations": [
+    "Bounding boxes are model-generated pseudo-labels, not human annotations.",
+    "The detector has one bird class and cannot directly identify species or colour.",
+    "A configurable area-ratio heuristic collapses potentially mixed-size groups to the main bird.",
+    "AP is evaluated after the fixed score, size, and mixed-size export policy."
+  ],
+  "manual_ground_truth": {
+    "ground_truth_images": 200,
+    "ground_truth_boxes": 270,
+    "scored_ground_truth_boxes": 242,
+    "ignored_ground_truth_boxes": 28,
+    "no_bird_images": 3,
+    "unusable_images_skipped": 3,
+    "evaluated_predictions": 219,
+    "true_positives": 146,
+    "false_positives": 73,
+    "precision": 0.6666666666666666,
+    "recall": 0.6033057851239669,
+    "average_precision_iou_50": 0.5868542398256694,
+    "mean_iou_true_positives": 0.7589080680080909,
+    "false_positives_on_no_bird_images": 3,
+    "recall_by_image_type": {
+      "multi-bird": {
+        "ground_truth_boxes": 73,
+        "recall": 0.1780821917808219
+      },
+      "single-bird": {
+        "ground_truth_boxes": 169,
+        "recall": 0.7869822485207101
+      }
+    }
+  }
+}
