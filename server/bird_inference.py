@@ -1011,7 +1011,7 @@ class BirdInferenceEngine:
     def __init__(
         self,
         is_bird_model: Path | None,
-        species_model: Path,
+        species_model: Path | None,
         *,
         detector_model: Path | None = None,
         detector_contract_file: Path | None = None,
@@ -1023,6 +1023,7 @@ class BirdInferenceEngine:
         top_k: int = 5,
         num_threads: int | None = None,
         interpreter_factory: Callable[..., Any] | None = None,
+        species_enabled: bool = True,
     ) -> None:
         is_bird_model = (
             Path(is_bird_model).expanduser().resolve() if is_bird_model is not None else None
@@ -1030,12 +1031,14 @@ class BirdInferenceEngine:
         detector_model = (
             Path(detector_model).expanduser().resolve() if detector_model is not None else None
         )
-        species_model = Path(species_model).expanduser().resolve()
+        species_model = Path(species_model).expanduser().resolve() if species_model is not None else None
         species_labels = (
             Path(species_labels).expanduser().resolve()
             if species_labels is not None
-            else species_model.with_name("labels.txt")
+            else species_model.with_name("labels.txt") if species_model is not None else None
         )
+        if species_model is None and detector_model is None:
+            raise ValueError("Detector-only inference requires detector_model.")
         if detector_model is not None and is_bird_model is not None:
             raise ValueError("Configure either detector_model or is_bird_model, not both.")
         if detector_model is None and is_bird_model is None:
@@ -1045,8 +1048,17 @@ class BirdInferenceEngine:
         self.contract: InferenceContract | None = None
         self.is_bird: TFLiteModel | None = None
 
-        self.labels = [line.strip() for line in species_labels.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not self.labels:
+        self.species_model_path = species_model
+        self.species_labels_path = species_labels
+        self._species_factory = interpreter_factory
+        self._species_threads = num_threads
+        self._requested_top_k = top_k
+        load_species = species_model is not None and species_enabled
+        if not species_enabled and detector_model is None:
+            raise ValueError("Optional species inference requires the bounding-box detector.")
+        self.labels = ([line.strip() for line in species_labels.read_text(encoding="utf-8").splitlines() if line.strip()]
+                       if load_species else [])
+        if load_species and not self.labels:
             raise ValueError(f"Species label file is empty: {species_labels}")
         if top_k < 1:
             raise ValueError("top_k must be positive.")
@@ -1107,13 +1119,14 @@ class BirdInferenceEngine:
             if self.contract is not None:
                 self.contract.validate_model(self.is_bird)
             species_image_size = image_size
+        self._species_image_size = species_image_size
         self.species = TFLiteModel(
             species_model,
             output_size=len(self.labels),
             image_size=species_image_size,
             interpreter_factory=interpreter_factory,
             num_threads=num_threads,
-        )
+        ) if load_species else None
 
         if detector_model is not None:
             self.species_labels_path = species_labels
@@ -1165,6 +1178,29 @@ class BirdInferenceEngine:
             return f"raw_output >= {self.raw_output_threshold}"
         return f"bird_probability >= {self.bird_threshold}"
 
+    def set_species_enabled(self, enabled: bool) -> None:
+        """Caller holds the shared inference lock while changing model state."""
+        if self.detector is None:
+            if enabled != (self.species is not None):
+                raise ValueError("Species switching requires the bounding-box detector.")
+            return
+        if not enabled:
+            self.species = None
+            return
+        if self.species is not None:
+            return
+        if self.species_model_path is None or self.species_labels_path is None:
+            raise ValueError("No species model has been configured on this hub.")
+        labels = [s.strip() for s in self.species_labels_path.read_text(encoding="utf-8").splitlines() if s.strip()]
+        if not labels:
+            raise ValueError("The species label file is empty.")
+        model = TFLiteModel(self.species_model_path, output_size=len(labels),
+                            image_size=self._species_image_size,
+                            interpreter_factory=self._species_factory, num_threads=self._species_threads)
+        self.labels = labels
+        self.top_k = min(self._requested_top_k, len(labels))
+        self.species = model
+
     def infer(
         self,
         image_path: Path,
@@ -1202,7 +1238,7 @@ class BirdInferenceEngine:
                 self.detector.image_size,
                 padding_value=self.detector_contract.padding_value,
             )
-            species_pixels = letterbox_array(rgb, self.species.image_size)
+            species_pixels = letterbox_array(rgb, self.species.image_size) if self.species is not None else None
             preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
 
             detector_started = time.perf_counter()
@@ -1220,14 +1256,17 @@ class BirdInferenceEngine:
             bird_probability = float(top_detection["score"]) if top_detection is not None else 0.0
             is_bird = bird_probability >= self.bird_threshold
 
-            species_started = time.perf_counter()
-            species_scores = self.species.predict_pixels(species_pixels)
-            species_ms = (time.perf_counter() - species_started) * 1000
-            order = np.argsort(-species_scores, kind="stable")[: self.top_k]
-            species_top = [
-                {"label": self.labels[int(index)], "probability": float(species_scores[int(index)])}
-                for index in order
-            ]
+            species_top = []
+            species_ms = 0.0
+            if self.species is not None:
+                species_started = time.perf_counter()
+                species_scores = self.species.predict_pixels(species_pixels)
+                species_ms = (time.perf_counter() - species_started) * 1000
+                order = np.argsort(-species_scores, kind="stable")[: self.top_k]
+                species_top = [
+                    {"label": self.labels[int(index)], "probability": float(species_scores[int(index)])}
+                    for index in order
+                ]
             crop_provenance = {
                 "crop_source": crop_source,
                 "crop_coordinate_space": "original_decoded_frame_pixels",
@@ -1264,13 +1303,13 @@ class BirdInferenceEngine:
                     "decision": bool(is_bird),
                     "detections": detections,
                 },
-                "guess": species_top[0]["label"],
-                "species_probability": species_top[0]["probability"],
+                "guess": species_top[0]["label"] if species_top else None,
+                "species_probability": species_top[0]["probability"] if species_top else None,
                 "species_top_k": species_top,
                 "models": {
                     "detector": self.detector.describe(),
                     "is_bird": None,
-                    "species": self.species.describe(),
+                    "species": self.species.describe() if self.species is not None else None,
                 },
                 "contract": None,
                 "detector_contract": self.detector_contract.describe(),
@@ -1292,7 +1331,8 @@ class BirdInferenceEngine:
                     },
                     "species": {
                         "method": LETTERBOX_GEOMETRY,
-                        "size": self.species.image_size,
+                        "size": self.species.image_size if self.species is not None else None,
+                        "enabled": self.species is not None,
                         "crop": None,
                         "source": "whole_original_frame",
                     },
@@ -1307,8 +1347,9 @@ class BirdInferenceEngine:
             result["classification"] = {
                 "is_bird": result["is_bird"],
                 "confidence": bird_probability,
-                "label": result["guess"],
             }
+            if result["guess"] is not None:
+                result["classification"]["label"] = result["guess"]
             return result
 
         geometry = self.contract.geometry if self.contract is not None else LETTERBOX_GEOMETRY
@@ -1472,6 +1513,9 @@ class BirdInferenceEngine:
             "threshold_source": self.threshold_source,
             "top_k": self.top_k,
             "species_count": len(self.labels),
+            "species_enabled": self.species is not None,
+            "species_available": bool(self.species_model_path is not None and self.species_model_path.is_file()
+                                      and self.species_labels_path is not None and self.species_labels_path.is_file()),
             "jpeg_decoder": jpeg_decoder_name(),
             "contract": self.contract.describe() if self.contract is not None else None,
             "detector_contract": (
@@ -1479,7 +1523,7 @@ class BirdInferenceEngine:
             ),
             "detector": self.detector.describe() if self.detector is not None else None,
             "is_bird": self.is_bird.describe() if self.is_bird is not None else None,
-            "species": self.species.describe(),
+            "species": self.species.describe() if self.species is not None else None,
         }
 
     def detector_record(self, *, top_score: float | None = None, box: Any = None, decision: Any = None) -> dict[str, Any] | None:

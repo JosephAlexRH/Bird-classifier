@@ -31,6 +31,27 @@ class FakeJsonResponse:
 
 
 class CameraRegistryTests(unittest.TestCase):
+    def test_status_poll_coordinates_with_capture_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry = CameraRegistry(Path(directory) / "cameras.json")
+            camera = registry.add("Test", "http://camera.local")
+            operation = registry.operation_lock(camera["id"])
+            calls = []
+
+            def fetch(url, endpoint):
+                self.assertFalse(operation.acquire(blocking=False))
+                calls.append(endpoint)
+                return {}
+
+            with patch.object(registry, "_fetch_json", side_effect=fetch):
+                with operation:
+                    registry.poll(camera["id"])
+                self.assertEqual(calls, [])
+                registry.poll(camera["id"])
+                self.assertEqual(calls, ["status", "config", "metadata"])
+                self.assertTrue(operation.acquire(blocking=False))
+                operation.release()
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.registry_path = Path(self.temporary.name) / "cameras.json"

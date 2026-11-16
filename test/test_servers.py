@@ -829,6 +829,9 @@ class RaspberryPiServerTests(unittest.TestCase):
 
     def test_dashboard_has_roi_controls_and_unconfigured_proxy_is_503(self) -> None:
         dashboard = self.client.get("/").get_data(as_text=True)
+        self.assertIn("Bird hub", dashboard)
+        self.assertIn("Confirm empty", dashboard)
+        dashboard = self.client.get("/legacy").get_data(as_text=True)
         self.assertIn('id="camera-tabs"', dashboard)
         self.assertIn('role="tablist"', dashboard)
         self.assertIn("onboard_motion_detection", dashboard)

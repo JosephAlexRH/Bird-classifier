@@ -535,12 +535,24 @@ def create_app(
     auto_register_cameras: bool = True,
     manage_system_clock: bool = False,
     start_hub_status: bool = False,
+    pi_url: str | None = None,
 ) -> Flask:
     """Create the Flask application. Parameters are injectable for tests."""
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = MAX_JPEG_BYTES
     store = CaptureStore(save_dir)
+    try:
+        from .pi_bridge import register_pi_bridge
+    except ImportError:
+        from pi_bridge import register_pi_bridge
+    register_pi_bridge(app, store.root / "pi_monitor.json", pi_url)
+    try:
+        from .collection_dashboard import collection_page
+    except ImportError:
+        from collection_dashboard import collection_page
+    app.config["UNIFIED_DASHBOARD"] = lambda: collection_page(remote=True) if app.config["PI_URL"] else None
     camera_url = normalize_camera_url(camera_url)
+    app.config["DIRECT_CAMERA_CONFIGURED"] = camera_url is not None
     registry = camera_registry or CameraRegistry(
         registry_file or (store.root / "cameras.json"),
         timeout_seconds=CAMERA_PROBE_TIMEOUT_SECONDS,
@@ -552,7 +564,10 @@ def create_app(
             registry.add("Default camera", camera_url, make_default=True)
         else:
             registry.update(matching["id"], default=True)
-    if start_registry_poller:
+    # Pi-owned cameras are polled by the hub. A saved Pi connection must not
+    # silently start a competing laptop poller against an old camera registry.
+    app.config["PI_MONITOR_ONLY"] = bool(app.config["PI_URL"] and not camera_url)
+    if start_registry_poller and not app.config["PI_MONITOR_ONLY"]:
         registry.start()
     app.config["CAMERA_REGISTRY"] = registry
     # Permanent run log + hub time keeping for unattended deployments.
@@ -866,6 +881,8 @@ def create_app(
 
     @app.get("/legacy")
     def dashboard() -> str:
+        if app.config["PI_URL"]:
+            return collection_page(remote=True, initial_tab="settings")
         return render_template_string(LAPTOP_TABBED_DASHBOARD_HTML)
 
     @app.post("/upload")
@@ -1238,6 +1255,7 @@ def parse_args() -> argparse.Namespace:
         help="ESP32-CAM plain HTTP(S) base URL, for example http://192.168.1.84",
     )
     parser.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIR, help="Dataset folder")
+    parser.add_argument("--pi-url", help="Pi receiver base URL for the integrated collection monitor")
     parser.add_argument(
         "--registry-file",
         type=Path,
@@ -1278,14 +1296,17 @@ if __name__ == "__main__":
         auto_register_cameras=not args.no_auto_register,
         manage_system_clock=True,
         start_hub_status=True,
+        pi_url=args.pi_url,
     )
     try:
         from .hub_advertiser import start_hub_advertiser
     except ImportError:
         from hub_advertiser import start_hub_advertiser
     advertiser = (
-        None if args.no_advertise else start_hub_advertiser(args.hub_name, args.port, bind_host=args.host)
+        None if args.no_advertise or application.config["PI_MONITOR_ONLY"]
+        else start_hub_advertiser(args.hub_name, args.port, bind_host=args.host)
     )
+    application.config["HUB_ADVERTISER"] = advertiser
     try:
         application.run(host=args.host, port=args.port, debug=False, threaded=True)
     finally:

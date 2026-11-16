@@ -538,6 +538,11 @@ def register_fleet_routes(
         return send_file(path, mimetype="image/jpeg", max_age=3600)
 
     def fleet_dashboard() -> Response:
+        unified = app.config.get("UNIFIED_DASHBOARD")
+        if callable(unified):
+            page = unified()
+            if page is not None:
+                return Response(page, mimetype="text/html")
         return Response(CONSOLE_DASHBOARD_HTML, mimetype="text/html")
 
     for index, path in enumerate(dashboard_paths):

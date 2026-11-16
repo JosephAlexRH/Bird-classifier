@@ -107,6 +107,8 @@ class PiPoller:
         if self.mirror_dir is None:
             return
         capture_id = capture["capture_id"]
+        if not capture_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in capture_id):
+            raise ValueError("Invalid capture ID from Pi.")
         image_path = self.mirror_dir / f"{capture_id}.jpg"
         if not image_path.exists():
             image, _ = self._request(capture["image_url"])
@@ -115,6 +117,9 @@ class PiPoller:
             if expected and actual != expected:
                 raise ValueError(f"SHA-256 mismatch while mirroring {capture_id}.")
             _atomic_write(image_path, image)
+        if capture.get("metadata_url") and not (self.mirror_dir / f"{capture_id}.json").exists():
+            metadata, _ = self._request(f"/api/captures/{capture_id}/metadata")
+            _atomic_write(self.mirror_dir / f"{capture_id}.json", metadata)
         inference = capture.get("inference")
         if isinstance(inference, dict):
             _atomic_write(
@@ -127,6 +132,23 @@ class PiPoller:
                 self.mirror_dir / f"{capture_id}.motion.json",
                 (json.dumps(motion, indent=2, sort_keys=True) + "\n").encode("utf-8"),
             )
+        review = capture.get("review")
+        if isinstance(review, dict):
+            _atomic_write(self.mirror_dir / f"{capture_id}.review.json",
+                          (json.dumps(review, indent=2, sort_keys=True) + "\n").encode())
+        for kind, record in (("crops", inference), ("review_crops", review)):
+            for crop in ((record or {}).get("collection") or {}).get("crops", []):
+                index = crop.get("detection_index")
+                if type(index) is not int or index < 0:
+                    continue
+                local = self.mirror_dir / kind / f"{capture_id}_bird_{index:02d}.png"
+                if local.exists() and hashlib.sha256(local.read_bytes()).hexdigest() == crop.get("sha256"):
+                    continue
+                route = "review-crops" if kind == "review_crops" else "crops"
+                content, _ = self._request(f"/api/captures/{capture_id}/{route}/{index}/image")
+                if hashlib.sha256(content).hexdigest() != crop.get("sha256"):
+                    raise ValueError(f"Crop SHA-256 mismatch while mirroring {capture_id}.")
+                _atomic_write(local, content)
 
     def poll_once(self) -> None:
         with self.lock:

@@ -645,6 +645,101 @@ them on a trusted LAN and do not forward port 5000 from the public internet.
 
 ## Automated checks
 
+### Detector-only field collection and Pi review
+
+Use `--collection-mode` on the Pi for dataset collection. This skips loading and
+running the species model. Camera acquisition runs independently from detector
+inference at `--motion-poll-seconds` (two seconds is a starting point, not a
+guaranteed rate). Every acquired JPEG and its original acquisition sidecar are
+retained, including empty, uncertain and failed-inference examples. A camera has
+one waiting inference job: if processing falls behind, the newest waiting frame
+replaces it, but the superseded original stays on disk with `status: skipped`.
+This bounds inference memory without silently losing the evidence of short visits.
+Capture pauses below 256 MiB of free disk space; it does not delete originals.
+
+```bash
+source ~/.venv/bin/activate
+cd ~/birdserver
+LD_PRELOAD=/usr/lib/arm-linux-gnueabihf/libatomic.so.1 \
+python server/raspberry_pi_server.py --collection-mode \
+  --deployment-id garden-feeder-20261116 --num-threads 1 \
+  --motion-poll-seconds 2 --motion-timeout-seconds 10
+```
+
+The existing camera registry and heartbeats supply camera addresses; omit a
+fixed `--camera-url` when cameras already register with the Pi. Keep
+`onboard_motion_detection: false` on each camera. Use a new deployment ID when
+the scene changes. Camera ID plus deployment ID becomes the manifest split
+group, so frames from the same scene stay together. No random train/test split
+is assigned automatically. The Pi Zero still has limited processing capacity:
+use measured capture rates and skipped-inference counters when adding cameras.
+
+From Windows, the prepared updater backs up Pi server code, copies the changed
+files, and enables a systemd override using the **existing** `~/.venv` and models:
+
+```powershell
+.\deploy\update_pi_collection.ps1 -PiAddress 192.168.7.128 -DeploymentId garden-feeder-20261116
+```
+
+It requires the existing `birdhub.service`, SSH authentication and sudo. It does
+not install Python packages. The service override is
+`/etc/systemd/system/birdhub.service.d/collection.conf`; removing that override
+and reloading/restarting systemd restores the previous service arguments.
+The code backup path is printed during transfer.
+
+The Pi root page is the unified **Bird hub**. Live & capture, Review data and
+Settings share one camera selection and visual layout. Old `/fleet` and `/legacy`
+bookmarks display the same interface (`/legacy` initially selects Settings).
+The laptop proxy also uses this interface when connected to a Pi. On the laptop, launch:
+
+No laptop server is needed in the field: join the Pi's hotspot and open
+`http://10.42.0.1:5000`. The same hub page runs locally on the Pi
+without internet or external web assets. Live & capture includes previews,
+manual/calibration capture, ROI editing and MJPEG framing. Streaming holds the
+camera's operation lock and pauses its acquisition; close the stream to resume.
+Sensor settings and hub-wide processing switches are in the Settings tab.
+The updater also copies `deploy/pi_hotspot.sh`, which can enable the existing
+NetworkManager hotspot setup. Cameras must join that hotspot too; keep
+`server_host: birdhub.local` and use `server_ip: 10.42.0.1` as fallback.
+Opening the dashboard offers the laptop/phone time through the hub clock API;
+when the OS clock cannot be set, the existing clock-offset logging applies.
+
+```powershell
+python .\server\laptop_test_server.py --pi-url http://192.168.7.128:5000 --no-advertise
+```
+
+Open the Pi section on the laptop overview, then **Open collection monitor &
+review**, or visit `/pi`. The connection URL is saved in the laptop capture
+directory's `pi_monitor.json`. This monitor reads the Pi APIs rather than
+starting a second camera poller. `--no-advertise` avoids competing with the Pi's
+`birdhub.local` name. Avoid registering Pi-owned cameras in a second receiver;
+close direct camera streams after framing because streaming blocks acquisition.
+
+Review the complete original frame before **Confirm empty**. Draw/remove boxes
+to tightly enclose every visible bird, then **Confirm bird boxes**. A species
+name is optional and applies to all boxes in that frame; leave it blank for
+unknown or mixed species. Reviews and their history are saved separately in
+`.review.json`; acquisition sidecars and model predictions are not rewritten.
+Model crops in `crops/` and human-corrected crops in `review_crops/` are native
+resolution PNGs with half-open original-frame pixel coordinates, no padding,
+and no resizing. They include hashes and retain links to the original image.
+The detector's proposed boxes can be poor: exported candidates are not ground truth.
+
+**Export dataset CSV** uses the existing detector manifest's column order,
+followed by camera, deployment, time and model provenance. Only human-reviewed
+`boxed` and `no_bird` rows have `eligible_for_training=True`. Empty rows have
+`is_Bird=FALSE`, `bird_count=0`, and blank box/species fields. Unreviewed model
+negatives and skipped frames are never exported as confirmed empties. CSV image
+paths are relative to the original capture directory; copy the original JPEGs
+and sidecars as well, and point the existing bbox editor at that directory.
+Legacy schema-4 captures lacking an ROI retain that missing provenance; no
+current ROI or hardware identity is invented for them.
+
+For an optional local data mirror, the separate `pi_monitor.py` additionally
+downloads original metadata and available crops with checksum verification.
+Reviews made after a historical frame was mirrored need to be re-synced; the
+live collection review page always reads current Pi records.
+
 From the project root:
 
 ```powershell

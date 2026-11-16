@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import shutil
 import os
 import queue
 import threading
@@ -36,7 +38,7 @@ try:
     from .capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from .laptop_test_server import camera_url_argument, normalize_camera_url
     from .pi_motion import MotionService
-    from .motion_crop import rgb_to_gray, select_motion_crop
+    from .motion_crop import MotionConfig, rgb_to_gray, select_motion_crop
     from .roi_control import ROI_CONTROL_JS
     from .fleet_monitor import FleetMonitor, register_fleet_routes
     from .hub_clock import HubClock, step_system_clock
@@ -61,7 +63,7 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
     from capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
     from laptop_test_server import camera_url_argument, normalize_camera_url
     from pi_motion import MotionService
-    from motion_crop import rgb_to_gray, select_motion_crop
+    from motion_crop import MotionConfig, rgb_to_gray, select_motion_crop
     from roi_control import ROI_CONTROL_JS
     from fleet_monitor import FleetMonitor, register_fleet_routes
     from hub_clock import HubClock, step_system_clock
@@ -320,11 +322,38 @@ def create_app(
     manage_system_clock: bool = False,
     start_hub_status: bool = False,
     manage_motion_services: bool | None = None,
+    collection_mode: bool = False,
+    deployment_id: str = "",
 ) -> Flask:
     """Create the receiver/classifier app, with optional ESP32 camera controls."""
     app = Flask(__name__)
+    try:
+        from .collection_dashboard import collection_page
+    except ImportError:
+        from collection_dashboard import collection_page
+    app.config["UNIFIED_DASHBOARD"] = lambda: collection_page()
     app.config["MAX_CONTENT_LENGTH"] = MAX_JPEG_BYTES
     store = CaptureStore(save_dir)
+    try:
+        from .hub_settings import HubSettings
+    except ImportError:
+        from hub_settings import HubSettings
+    hub_settings = HubSettings(store.root / "hub_settings.json", {
+        "collection_mode": collection_mode, "poll_seconds": motion_poll_seconds,
+        "species_enabled": getattr(inference_engine, "species", None) is not None,
+        "detector_enabled": inference_engine is not None,
+        "detector_threshold": float(getattr(inference_engine, "bird_threshold", .5)),
+    })
+    collection_mode = hub_settings.value["collection_mode"]
+    motion_poll_seconds = hub_settings.value["poll_seconds"]
+    if inference_engine is not None:
+        if callable(getattr(inference_engine, "set_species_enabled", None)):
+            inference_engine.set_species_enabled(hub_settings.value["species_enabled"])
+        if getattr(inference_engine, "bird_threshold", .5) != hub_settings.value["detector_threshold"]:
+            inference_engine.threshold_source = "saved hub settings"
+        inference_engine.bird_threshold = hub_settings.value["detector_threshold"]
+    app.config["HUB_SETTINGS"] = hub_settings
+    app.config["COLLECTION_MODE"] = collection_mode
     camera_url = normalize_camera_url(camera_url)
     registry = camera_registry or CameraRegistry(
         registry_file or (store.root / "cameras.json"),
@@ -443,6 +472,16 @@ def create_app(
     def run_classifier(
         destination: Path,
     ) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
+        def disabled_result():
+            record = {"schema_version": INFERENCE_SCHEMA_VERSION, "status": "skipped",
+                      "reason": "analysis_disabled", "is_bird": None, "classification": None,
+                      "completed_at": datetime.now(timezone.utc).isoformat(), "capture_id": destination.stem,
+                      "image": {"filename": destination.name, "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()},
+                      "hub_pipeline": hub_settings.snapshot(), "camera_provenance": camera_provenance(destination)}
+            write_inference_record(destination, record)
+            return None, None, record
+        if inference_engine is not None and not hub_settings.value["detector_enabled"]:
+            return disabled_result()
         try:
             if inference_engine is not None:
                 roi, roi_source = capture_roi(destination)
@@ -492,6 +531,8 @@ def create_app(
                         "crop_source": SELECTED_CROP_SOURCE,
                     }
                 with inference_lock:
+                    if not hub_settings.value["detector_enabled"]:
+                        return disabled_result()
                     inference = inference_engine.infer(destination, **kwargs)
                 inference["capture_id"] = destination.stem
                 inference["camera_provenance"] = camera_provenance(destination)
@@ -514,6 +555,12 @@ def create_app(
             if error:
                 inference["status"] = "error"
                 inference["error"] = error
+            if collection_mode:
+                try:
+                    from .collection import export_bird_crops
+                except ImportError:
+                    from collection import export_bird_crops
+                inference["collection"] = export_bird_crops(destination, inference)
             write_inference_record(destination, inference)
             return classification, error, inference
         except Exception as error:  # Inference failure must not discard a valid field image.
@@ -543,6 +590,7 @@ def create_app(
     threading.Thread(target=classification_worker, name="classifier", daemon=True).start()
 
     motion_services: dict[str, Any] = {}
+    runtime_lock = threading.RLock()
     motion_management_enabled = (
         start_motion_service if manage_motion_services is None else manage_motion_services
     )
@@ -554,6 +602,8 @@ def create_app(
     ) -> None:
         classification, _ = validate_classification(inference.get("classification"))
         with state_lock:
+            if latest["path"] is not None and destination.stem < latest["path"].stem:
+                return
             latest.update(
                 path=destination,
                 received_at=capture.get("received_at"),
@@ -570,7 +620,9 @@ def create_app(
             if expected == camera.get("hardware_camera_id") and same_url:
                 if hasattr(existing_service, "camera_name"):
                     existing_service.camera_name = camera["name"]
-                return existing_service
+                threads = (getattr(existing_service, "_thread", None), getattr(existing_service, "_analysis_thread", None))
+                if getattr(existing_service, "running", True) or any(t is not None and t.is_alive() for t in threads):
+                    return existing_service
             stop_camera_motion(camera["id"])
         if inference_engine is None:
             raise ValueError("Pi motion polling requires both camera_url and inference_engine.")
@@ -588,6 +640,17 @@ def create_app(
             expected_camera_id=camera.get("hardware_camera_id"),
             camera_registry_id=camera["id"],
             camera_name=camera["name"],
+            **({"collection_mode": True} if collection_mode else {}),
+            **({"deployment_id": deployment_id, "collection_run_id": hub_clock.boot_id}
+               if deployment_id or collection_mode else {}),
+            **({"detector_enabled": False} if not hub_settings.value["detector_enabled"] else {}),
+            **({"motion_localization_enabled": False} if not hub_settings.value["motion_localization_enabled"] else {}),
+            **({"settings_revision": hub_settings.value["revision"]} if hub_settings.value["revision"] else {}),
+            config=MotionConfig(minimum_threshold=int(hub_settings.value['motion_threshold']),
+                maximum_threshold=max(48, int(hub_settings.value['motion_threshold'])),
+                minimum_component_pixels=int(hub_settings.value['motion_minimum_area'])),
+            motion_triggered=hub_settings.value['motion_triggered'],
+            empty_sample_seconds=hub_settings.value['empty_sample_seconds'],
         )
         service.start()
         motion_services[camera["id"]] = service
@@ -599,14 +662,18 @@ def create_app(
             service.stop()
 
     def sync_motion_services() -> None:
+        with runtime_lock:
+            _sync_motion_services()
+
+    def _sync_motion_services() -> None:
         cameras = {camera["id"]: camera for camera in registry.snapshot()}
         for camera_id in list(motion_services):
             camera = cameras.get(camera_id)
-            if camera is None or not camera["enabled"]:
+            if camera is None or not camera["enabled"] or not hub_settings.camera_running(camera_id):
                 stop_camera_motion(camera_id)
         if motion_management_enabled:
             for camera in cameras.values():
-                if camera["enabled"]:
+                if camera["enabled"] and hub_settings.camera_running(camera["id"]):
                     start_camera_motion(camera)
         selected = registry.resolve()
         app.config["MOTION_SERVICE"] = (
@@ -615,6 +682,7 @@ def create_app(
         app.config["MOTION_SERVICES"] = motion_services
 
     def cleanup() -> None:
+        app.config["SHUTTING_DOWN"] = True
         for camera_id in list(motion_services):
             stop_camera_motion(camera_id)
         registry.stop()
@@ -681,7 +749,148 @@ def create_app(
 
     @app.get("/")
     def dashboard() -> str:
-        return render_template_string(PI_TABBED_DASHBOARD_HTML)
+        try:
+            from .collection_dashboard import collection_page
+        except ImportError:
+            from collection_dashboard import collection_page
+        return collection_page()
+
+    def settings_response():
+        models = inference_engine.describe() if inference_engine is not None else {}
+        return {"settings": hub_settings.snapshot(), "capabilities": {
+            "detector_available": inference_engine is not None,
+            "species_available": bool(models.get("species_available", models.get("species") is not None)),
+            "camera_settings_scope": "selected_camera", "hub_settings_scope": "all_cameras"}}
+
+    def apply_hub_settings(proposed, camera_id=None):
+        nonlocal collection_mode, motion_poll_seconds
+        previous = hub_settings.snapshot()
+        previous_threshold_source = getattr(inference_engine, "threshold_source", None)
+        if proposed["detector_enabled"] and inference_engine is None:
+            raise ValueError("No inference model is loaded on this hub.")
+        setter = getattr(inference_engine, "set_species_enabled", None)
+        if proposed["species_enabled"] != previous["species_enabled"] and not callable(setter):
+            raise ValueError("Species switching is not available for the loaded engine.")
+        if proposed["species_enabled"] and not settings_response()["capabilities"]["species_available"]:
+            raise ValueError("Species model or labels are missing on the Pi. Detection and collection remain available.")
+        targets = [camera_id] if camera_id else list(motion_services)
+        for identifier in targets:
+            camera = registry.get(identifier)
+            if camera and camera.get("streaming"):
+                raise RuntimeError("Stop the framing stream before changing capture settings.")
+        committed = False
+        try:
+            for identifier in targets:
+                service = motion_services.get(identifier)
+                if isinstance(service, MotionService):
+                    service._stop.set()
+            for identifier in targets:
+                service = motion_services.get(identifier)
+                if service is not None:
+                    service.stop(timeout=30) if isinstance(service, MotionService) else service.stop()
+                    if any(t is not None and t.is_alive() for t in
+                           (getattr(service, "_thread", None), getattr(service, "_analysis_thread", None))):
+                        raise RuntimeError("A camera is still finishing its current operation. Retry shortly.")
+                    motion_services.pop(identifier, None)
+            if camera_id is None and inference_engine is not None:
+                with inference_lock:
+                    if callable(setter):
+                        setter(proposed["species_enabled"])
+                    inference_engine.bird_threshold = proposed["detector_threshold"]
+                    if proposed["detector_threshold"] != previous["detector_threshold"]:
+                        inference_engine.threshold_source = "saved hub settings"
+            hub_settings.save(proposed)
+            committed = True
+            collection_mode = proposed["collection_mode"]
+            motion_poll_seconds = proposed["poll_seconds"]
+            app.config["COLLECTION_MODE"] = collection_mode
+            sync_motion_services()
+            run_log.write("pipeline_settings", camera_registry_id=camera_id, previous=previous, settings=proposed)
+        except Exception:
+            if camera_id is None and inference_engine is not None:
+                with inference_lock:
+                    if callable(setter):
+                        setter(previous["species_enabled"])
+                    inference_engine.bird_threshold = previous["detector_threshold"]
+                    if previous_threshold_source is not None:
+                        inference_engine.threshold_source = previous_threshold_source
+            if committed:
+                hub_settings.save(previous)
+            collection_mode = previous["collection_mode"]
+            motion_poll_seconds = previous["poll_seconds"]
+            app.config["COLLECTION_MODE"] = collection_mode
+            sync_motion_services()
+            # If a long-running interpreter has not returned yet, resume the
+            # previous capture policy once it finishes, without a second click.
+            for identifier, service in list(motion_services.items()):
+                if isinstance(service, MotionService) and service._stop.is_set():
+                    def recover(identifier=identifier, service=service):
+                        for thread in (service._thread, service._analysis_thread):
+                            if thread is not None:
+                                thread.join()
+                        with runtime_lock:
+                            if not app.config.get("SHUTTING_DOWN") and motion_services.get(identifier) is service:
+                                motion_services.pop(identifier, None)
+                                sync_motion_services()
+                    threading.Thread(target=recover, name="hub-capture-recovery", daemon=True).start()
+            raise
+
+    @app.route("/api/hub/settings", methods=["GET", "POST"])
+    def hub_settings_route():
+        if request.method == "POST":
+            try:
+                with runtime_lock:
+                    apply_hub_settings(hub_settings.propose(request.get_json(silent=True)))
+            except (ValueError, OSError) as error:
+                return jsonify(error=str(error)), 400
+            except RuntimeError as error:
+                return jsonify(error=str(error)), 409
+        return jsonify(settings_response())
+
+    @app.post("/api/cameras/<camera_id>/pipeline")
+    def camera_pipeline(camera_id):
+        if registry.get(camera_id) is None:
+            return jsonify(error="Camera not found."), 404
+        try:
+            with runtime_lock:
+                apply_hub_settings(hub_settings.propose(request.get_json(silent=True), camera_id=camera_id), camera_id)
+        except (ValueError, OSError) as error:
+            return jsonify(error=str(error)), 400
+        except RuntimeError as error:
+            return jsonify(error=str(error)), 409
+        return jsonify(settings_response())
+
+    @app.route('/api/cameras/<camera_id>/background', methods=['GET', 'POST'])
+    def camera_background(camera_id):
+        if registry.get(camera_id) is None:
+            return jsonify(error='Camera not found.'), 404
+        with runtime_lock:
+            service = motion_services.get(camera_id)
+            if service is None or not hasattr(service, 'background_command'):
+                return jsonify(error='Enable automatic capture for this camera before learning a background.'), 409
+            if request.method == 'GET':
+                return jsonify(service.describe().get('background_calibration'))
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict):
+                return jsonify(error='Supply a background action.'), 400
+            try:
+                result = service.background_command(payload.get('action'),
+                    confirmed_empty=payload.get('confirmed_empty') is True)
+            except ValueError as error:
+                return jsonify(error=str(error)), 400
+            except RuntimeError as error:
+                return jsonify(error=str(error)), 409
+            run_log.write('background_action', camera_registry_id=camera_id,
+                          action=payload.get('action'), state=result)
+            return jsonify(result), 202
+
+    @app.get("/legacy")
+    def legacy_dashboard() -> str:
+        try:
+            from .collection_dashboard import collection_page
+        except ImportError:
+            from collection_dashboard import collection_page
+        return collection_page(initial_tab="settings")
 
     @app.get("/camera/capture")
     def camera_capture():
@@ -776,6 +985,24 @@ def create_app(
     @app.get("/api/cameras/<camera_id>/capture")
     def camera_capture_scoped(camera_id: str):
         return camera_proxy("capture", camera_id=camera_id)
+
+    def manual_capture_saved(record):
+        destination = store.root / record["filename"]
+        normal = record["calibration_type"] == "normal"
+        analyze = normal and (inference_engine is None or hub_settings.value["detector_enabled"])
+        status = "pending" if analyze else "skipped"
+        inference = {"status": status, "capture_id": record["capture_id"],
+                     "reason": "manual_capture" if analyze else "analysis_disabled" if normal else "calibration_frame"}
+        write_inference_record(destination, inference)
+        motion_persisted(destination, record, inference)
+        if status == "pending":
+            pending.put(destination)
+
+    try:
+        from .camera_tools import register_camera_tools
+    except ImportError:
+        from camera_tools import register_camera_tools
+    register_camera_tools(app, registry, store, camera_proxy, manual_capture_saved)
 
     @app.get("/api/cameras/<camera_id>/<endpoint>")
     def camera_get_scoped(camera_id: str, endpoint: str):
@@ -886,6 +1113,11 @@ def create_app(
         except (OSError, json.JSONDecodeError):
             pass
         inference = read_inference_record(path)
+        review = None
+        try:
+            review = json.loads(path.with_suffix(".review.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
         motion_path = path.with_suffix(".motion.json")
         motion = None
         try:
@@ -906,8 +1138,10 @@ def create_app(
             "sha256": sidecar.get("sha256"),
             "inference_status": (inference or {}).get("status", "pending"),
             "inference": inference,
+            "review": review,
             "motion": motion,
             "image_url": f"/api/captures/{path.stem}/image",
+            "metadata_url": f"/api/captures/{path.stem}/metadata",
             "inference_url": f"/api/captures/{path.stem}/inference",
             "motion_url": f"/api/captures/{path.stem}/motion",
         }
@@ -974,12 +1208,27 @@ def create_app(
             paths = filtered
         if after:
             paths = [path for path in paths if path.stem > after]
+        if request.args.get("order") == "desc":
+            before = request.args.get("before", "")
+            if before:
+                paths = [path for path in paths if path.stem < before]
+            paths.reverse()
         selected = paths[:limit]
         return jsonify(
             captures=[capture_summary(path) for path in selected],
             next_after=selected[-1].stem if selected else after or None,
+            next_before=selected[-1].stem if selected else None,
             has_more=len(paths) > len(selected),
         )
+
+    @app.get("/api/collection/export.csv")
+    def collection_export():
+        try:
+            from .collection import manifest_csv
+        except ImportError:
+            from collection import manifest_csv
+        return Response(manifest_csv(store.root), mimetype="text/csv",
+                        headers={"Content-Disposition": 'attachment; filename="deployment_collection.csv"'})
 
     @app.get("/api/captures/<capture_id>")
     def capture_detail(capture_id: str):
@@ -994,6 +1243,102 @@ def create_app(
         if path is None:
             return jsonify(error="Capture not found."), 404
         return send_file(path, mimetype="image/jpeg", max_age=0)
+
+    @app.get("/api/captures/<capture_id>/metadata")
+    def capture_metadata(capture_id: str):
+        path = capture_path(capture_id)
+        if path is None or not path.with_suffix(".json").is_file():
+            return jsonify(error="Capture metadata not found."), 404
+        return send_file(path.with_suffix(".json"), mimetype="application/json", max_age=0)
+
+    @app.post("/api/captures/<capture_id>/review")
+    def review_capture(capture_id: str):
+        path = capture_path(capture_id)
+        if path is None:
+            return jsonify(error="Capture not found."), 404
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or payload.get("decision") not in {"boxed", "bird", "no_bird", "unusable", "unreviewed"}:
+            return jsonify(error="Choose boxed, bird, no_bird, unusable, or unreviewed."), 400
+        note = payload.get("note", "")
+        if not isinstance(note, str) or len(note) > 1000:
+            return jsonify(error="Note must contain at most 1000 characters."), 400
+        boxes = payload.get("boxes", [])
+        species_name = payload.get("species_name") or None
+        if species_name is not None and (not isinstance(species_name, str) or len(species_name) > 120):
+            return jsonify(error="Species must be blank or a name of at most 120 characters."), 400
+        if payload["decision"] == "boxed":
+            if not isinstance(boxes, list) or not 1 <= len(boxes) <= 50:
+                return jsonify(error="Confirm between 1 and 50 tight bird boxes."), 400
+            from PIL import Image
+            with Image.open(path) as image:
+                width, height = image.size
+            cleaned = []
+            for box in boxes:
+                if not isinstance(box, dict):
+                    return jsonify(error="Each box must contain left, top, right, bottom."), 400
+                values = [box.get(k) for k in ("left", "top", "right", "bottom")]
+                if not all(type(v) in (int, float) and math.isfinite(v) for v in values):
+                    return jsonify(error="Box coordinates must be finite numbers."), 400
+                left, top, right, bottom = values
+                if not (0 <= left < right <= width and 0 <= top < bottom <= height):
+                    return jsonify(error="Boxes must have positive area within the original image."), 400
+                cleaned.append(dict(zip(("left", "top", "right", "bottom"), values)))
+            boxes = cleaned
+        else:
+            boxes, species_name = [], None
+        with state_lock:
+            history = []
+            try:
+                history = json.loads(path.with_suffix(".review.json").read_text(encoding="utf-8")).get("history", [])
+            except (OSError, ValueError):
+                pass
+            entry = {"decision": payload["decision"], "note": note,
+                     "boxes": boxes, "species_name": species_name,
+                     "reviewed_at": datetime.now(timezone.utc).isoformat()}
+            record = {"schema_version": 1, "capture_id": capture_id,
+                      "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                      "scope": "human_boxes" if boxes else "frame_review",
+                      **entry, "history": history + [entry]}
+            if boxes:
+                try:
+                    from .collection import export_bird_crops
+                except ImportError:
+                    from collection import export_bird_crops
+                record["collection"] = export_bird_crops(path, {"status": "complete", "detector": {
+                    "threshold": 0, "detections": [{"score": 1.0, "box": box} for box in boxes]}}, reviewed=True)
+            try:
+                from .collection import write_review_record
+            except ImportError:
+                from collection import write_review_record
+            write_review_record(path.with_suffix(".review.json"), record)
+        return jsonify(record)
+
+    @app.get("/api/captures/<capture_id>/review-crops/<int:index>/image")
+    def reviewed_crop_image(capture_id: str, index: int):
+        original = capture_path(capture_id)
+        if original is None:
+            return jsonify(error="Capture not found."), 404
+        try:
+            review = json.loads(original.with_suffix(".review.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return jsonify(error="Review not found."), 404
+        path = store.root / "review_crops" / f"{capture_id}_bird_{index:02d}.png"
+        if review.get("decision") != "boxed" or index >= len(review.get("boxes", [])) or not path.is_file():
+            return jsonify(error="Reviewed crop not found."), 404
+        return send_file(path, mimetype="image/png", max_age=0)
+
+    @app.get("/api/captures/<capture_id>/crops/<int:index>/image")
+    def crop_image(capture_id: str, index: int):
+        original = capture_path(capture_id)
+        if original is None:
+            return jsonify(error="Capture not found."), 404
+        inference = read_inference_record(original) or {}
+        crops = (inference.get("collection") or {}).get("crops", [])
+        crop = next((item for item in crops if item.get("detection_index") == index), None)
+        path = store.root / "crops" / f"{capture_id}_bird_{index:02d}.png"
+        if crop is None or not path.is_file():
+            return jsonify(error="Crop not found."), 404
+        return send_file(path, mimetype="image/png", max_age=3600)
 
     @app.get("/api/captures/<capture_id>/inference")
     def capture_inference(capture_id: str):
@@ -1024,7 +1369,8 @@ def create_app(
             received_at = latest["received_at"]
             classification = latest["classification"]
             latest_inference = latest["inference"]
-        services = {camera_id: service.describe() for camera_id, service in motion_services.items()}
+        with runtime_lock:
+            services = {camera_id: service.describe() for camera_id, service in motion_services.items()}
         selected = registry.resolve()
         selected_service = motion_services.get(selected["id"]) if selected is not None else None
         return jsonify(
@@ -1041,6 +1387,10 @@ def create_app(
             motion_service=(selected_service.describe() if selected_service is not None else {"running": False}),
             motion_services=services,
             models=(inference_engine.describe() if inference_engine is not None else {"ready": False}),
+            collection_mode=collection_mode,
+            pipeline=settings_response(),
+            storage_free_bytes=shutil.disk_usage(store.root).free,
+            hub_clock=hub_clock.state(),
         )
 
     return app
@@ -1106,6 +1456,10 @@ def parse_args() -> argparse.Namespace:
         help="Override the contract threshold (uses the probability rule, not the uint8 rule)",
     )
     parser.add_argument("--top-k", type=int, default=5, help="Number of species guesses to retain")
+    parser.add_argument("--collection-mode", action="store_true",
+                        help="Detector only; retain every processed frame and export unlabelled candidate bird crops")
+    parser.add_argument("--deployment-id", default="",
+                        help="Scene/deployment identifier recorded for grouping data; change when cameras move")
     parser.add_argument(
         "--motion-poll-seconds",
         type=float,
@@ -1158,6 +1512,7 @@ if __name__ == "__main__":
             bird_threshold=args.bird_threshold,
             top_k=args.top_k,
             num_threads=args.num_threads,
+            species_enabled=not args.collection_mode,
         )
     except Exception as error:
         raise SystemExit(f"Model startup error: {error}") from error
@@ -1186,6 +1541,8 @@ if __name__ == "__main__":
         auto_register_cameras=not args.no_auto_register,
         manage_system_clock=True,
         start_hub_status=True,
+        collection_mode=args.collection_mode,
+        deployment_id=args.deployment_id,
     )
     try:
         from .hub_advertiser import start_hub_advertiser

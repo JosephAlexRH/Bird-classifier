@@ -211,16 +211,16 @@ Config cfg = {
     {static_cast<int>(FRAMESIZE_VGA), 10, 20000000},
     10,
     static_cast<int>(FRAMESIZE_VGA),
-    "192.168.7.170",
+    "192.168.7.128",  // current Pi LAN fallback; birdhub.local is preferred
     5000,
-    true,
+    false, // camera-side confirmed-bird saving is opt-in; Pi owns collection
     0.80f,
-    true,  // wait for the receiver's classification before re-arming
+    false, // Pi-owned polling does not wait for camera-side classification
     3,     // JPEGs uploaded per motion trigger
     150,   // pause between burst JPEGs, ms
     true,  // keep the pre-trigger background so a subject that stays keeps triggering
     10,    // consecutive triggers before the background is relearned anyway
-    true,  // write undeliverable motion JPEGs to /pending on SD and upload later
+    false, // legacy firmware-motion SD buffering is an explicit opt-in
     0.0f,  // normalized motion ROI x
     0.0f,  // normalized motion ROI y
     1.0f,  // normalized motion ROI width

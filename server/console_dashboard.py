@@ -120,7 +120,7 @@ pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.5 
     <div class="warn-list" id="warnings"></div>
 
     <div class="sec-head" style="margin-top: 18px;"><h2>Pi</h2><span class="fill"></span><span class="small muted">monitor</span></div>
-    <div class="pi-empty" id="pi">No Pi reporting. This section is reserved for the Pi monitor (host health, model, classification queue) once it's rebuilt and sending heartbeats.</div>
+    <div class="pi-empty" id="pi">Checking Pi connection…</div>
   </aside>
 
   <section class="cam" aria-label="Selected camera" id="cam">
@@ -267,7 +267,8 @@ function renderMain() {
     `<button type="button" class="${S.streaming ? "" : "primary"}" data-act="stream" ${can && !off ? "" : "disabled"}>${S.streaming ? "stop stream" : "stream"}</button>
      <button type="button" data-act="capture" ${can && !off ? "" : "disabled"}>capture</button>
      <button type="button" data-act="${k.motion_enabled ? "idle" : "motion"}" aria-pressed="${!!k.motion_enabled}" ${off ? "disabled" : ""}>motion [${k.motion_enabled ? "x" : " "}] ${k.motion_enabled ? "on" : "off"}</button>
-     <button type="button" class="dashed" data-act="reboot">reboot</button>`;
+     <button type="button" class="dashed" data-act="reboot">reboot</button>
+     <button type="button" class="dashed" data-act="remove" title="Delete this camera and its history from the dashboard">remove</button>`;
   $("health").innerHTML = healthRows(c);
   const crash = (c.crashes || []).slice(-1)[0];
   if (crash) {
@@ -398,6 +399,7 @@ function offerTime() {
 }
 
 async function refresh() {
+  refreshPi();
   try {
     const [fleet, registry] = await Promise.all([api("/api/fleet"), api("/api/cameras").catch(() => ({cameras: []}))]);
     S.cameras = fleet.cameras || []; S.clock = fleet.hub_clock || null;
@@ -405,6 +407,27 @@ async function refresh() {
     S.registry = {}; for (const r of registry.cameras || []) if (r.hardware_camera_id) S.registry[r.hardware_camera_id] = r;
     renderAll();
   } catch (e) { $("meta").textContent = "server unreachable – retrying"; }
+}
+
+let piLoading = false, piCheckedAt = 0;
+async function refreshPi() {
+  if (piLoading || Date.now() - piCheckedAt < 10000) return;
+  piLoading = true; piCheckedAt = Date.now();
+  try {
+    let config = null, local = false;
+    const response = await fetch('/api/pi/config', {cache:'no-store'});
+    if (response.status === 404) local = true;
+    else if (!response.ok) throw Error('Pi monitor configuration unavailable');
+    else config = await response.json();
+    if (!local && !config.pi_url) { $("pi").innerHTML = '<a href="/pi">Connect Pi and open collection monitor</a>'; return; }
+    const h = await api(local ? '/health' : '/api/pi/health');
+    const services = Object.values(h.motion_services || {});
+    const failures = services.reduce((n,s) => n + (s.failures || 0), 0);
+    $("pi").innerHTML = `<strong>${h.collection_mode ? 'Collection · detector only' : 'Receiver online'}</strong><br>` +
+      `${esc(local ? 'This hub' : config.pi_url)}<br>${services.length} cameras · ${failures} capture failures · queue ${h.classification_queue_depth ?? '–'}<br>` +
+      `<a href="${local ? '/' : '/pi'}">Open collection monitor &amp; review</a>`;
+  } catch (e) { $("pi").innerHTML = `Pi unavailable · ${esc(e.message)}<br><a href="/pi">Connection settings</a>`; }
+  finally { piLoading = false; }
 }
 
 function select(id) {
@@ -422,11 +445,21 @@ document.addEventListener("click", async e => {
   const c = current(); if (!c) return;
   const id = encodeURIComponent(c.camera_id), r = reg(c), act = b.dataset.act;
   if (act === "reboot" && !confirm(`Reboot ${label(c)}?`)) return;
+  if (act === "remove" && !confirm(`Remove ${label(c)} from the dashboard?\n\nIts saved images are kept. A camera that is still powered on will add itself again within about 15 seconds.`)) return;
   b.disabled = true;
   try {
     if (act === "reboot") { const x = await api(`/api/fleet/${id}/reboot`, {method: "POST"}); toast(x.result === "rebooting" ? "rebooting now" : "no answer; will reboot on next heartbeat"); }
     else if (act === "motion" || act === "idle") { await api(`/api/fleet/${id}/mode`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({mode: act})}); toast(`motion ${act === "motion" ? "on" : "off"}`); }
     else if (act === "register") { await api("/api/cameras", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name: label(c), address: c.ip})}); toast("registered"); }
+    else if (act === "remove") {
+      if (S.streaming) { S.streaming = false; setPreview(null); }
+      // Both records go: the registry entry (stream/capture target) and the fleet history.
+      if (r) await api(`/api/cameras/${encodeURIComponent(r.id)}`, {method: "DELETE"}).catch(() => {});
+      await api(`/api/fleet/${id}`, {method: "DELETE"}).catch(() => {});
+      S.selected = null; S.built = null;
+      try { localStorage.removeItem("fleet.selected"); } catch (e) {}
+      toast("removed");
+    }
     else if (act === "name") {
       const n = (prompt("Name for this camera (for example: Back garden feeder)", r.needs_name ? "" : r.name) || "").trim();
       if (n) { await api(`/api/cameras/${encodeURIComponent(r.id)}`, {method: "PATCH", headers: {"Content-Type": "application/json"}, body: JSON.stringify({name: n})}); toast("named"); }

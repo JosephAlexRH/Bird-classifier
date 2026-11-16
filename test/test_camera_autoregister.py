@@ -126,12 +126,18 @@ class ServerHeartbeatTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.save_dir = Path(self.temporary.name)
+        self.apps = []
 
     def tearDown(self) -> None:
+        for app in self.apps:
+            app.config['CLEANUP']()
+            app.config['HUB_STATUS_LOGGER'].stop()
         self.temporary.cleanup()
 
     def test_laptop_server_adds_and_follows_a_heartbeating_camera(self) -> None:
-        client = create_laptop_app(self.save_dir).test_client()
+        app = create_laptop_app(self.save_dir)
+        self.apps.append(app)
+        client = app.test_client()
         self.assertEqual(client.post("/api/heartbeat", json=heartbeat()).status_code, 200)
         cameras = client.get("/api/cameras").get_json()["cameras"]
         self.assertEqual(len(cameras), 1)
@@ -148,7 +154,9 @@ class ServerHeartbeatTests(unittest.TestCase):
         self.assertEqual(fleet[0]["name"], "Feeder")
 
     def test_auto_registration_can_be_switched_off(self) -> None:
-        client = create_laptop_app(self.save_dir, auto_register_cameras=False).test_client()
+        app = create_laptop_app(self.save_dir, auto_register_cameras=False)
+        self.apps.append(app)
+        client = app.test_client()
         self.assertEqual(client.post("/api/heartbeat", json=heartbeat()).status_code, 200)
         self.assertEqual(client.get("/api/cameras").get_json()["cameras"], [])
 
@@ -177,6 +185,7 @@ class ServerHeartbeatTests(unittest.TestCase):
             manage_motion_services=True,
             motion_service_factory=FakeMotionService,
         )
+        self.apps.append(app)
         client = app.test_client()
         self.assertEqual(client.post("/api/heartbeat", json=heartbeat()).status_code, 200)
         camera = client.get("/api/cameras").get_json()["cameras"][0]

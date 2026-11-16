@@ -551,7 +551,14 @@ class CameraRegistry:
             camera["polling"] = True
         if not poll_lock.acquire(blocking=False):
             return self.get(camera_id)
+        operation_lock = self.operation_lock(camera_id)
+        operation_acquired = False
         try:
+            # The firmware serves one client at a time. Status polling must
+            # coordinate with motion capture and dashboard proxy requests too.
+            if operation_lock is None or not operation_lock.acquire(blocking=False):
+                return self.get(camera_id)
+            operation_acquired = True
             values: dict[str, dict[str, Any] | None] = {
                 "status": None,
                 "config": None,
@@ -601,6 +608,8 @@ class CameraRegistry:
                 self._persist_locked()
                 return self._copy_camera(current)
         finally:
+            if operation_acquired:
+                operation_lock.release()
             with self._lock:
                 current = self._cameras.get(camera_id)
                 if current is not None:

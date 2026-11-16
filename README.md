@@ -45,7 +45,14 @@ Clear-blob events and birds are stored with immutable `.motion.json` and
 3. Copy `data/config.example.json` to the root of a FAT32 microSD card as
    `config.json`. Set `wifi_ssid` and `wifi_password` for a **2.4 GHz** network,
    and set `server_ip` to the LAN address of the machine running the receiver.
-   The example contains placeholders only; do not commit your populated file.
+   Keep `server_host: "birdhub.local"` for hub discovery. The example and compiled
+   defaults use `192.168.7.128` as the current project's Pi fallback; change it
+   for another network. Wi-Fi credentials remain placeholders; do not commit
+   your populated file. Pi-owned motion and collection are the default, with
+   `motion_enabled: false`, `onboard_motion_detection: false`, and
+   `motion_owner: "pi"`. Camera-side bird saving, classification waiting, and
+   legacy SD upload buffering are disabled by default. They do not provide
+   automatic offline capture while the Pi owns polling.
    Keep both `sensors["0x2642"]` and `sensors["0x5640"]` profiles so either
    supported module can be installed without reflashing.
 4. Optional fallback: copy `include/secrets.example.h` to `include/secrets.h`

@@ -20,9 +20,9 @@
     }
   },
   "server_host": "birdhub.local",
-  "server_ip": "192.168.1.100",
+  "server_ip": "192.168.7.128",
   "server_port": 5000,
-  "save_birds_to_sd": true,
+  "save_birds_to_sd": false,
   "pipeline": {
     "bird_confidence_threshold": 0.8
   },
@@ -31,7 +31,7 @@
   "burst_interval_ms": 150,
   "keep_reference_after_trigger": true,
   "max_consecutive_triggers": 10,
-  "buffer_uploads_to_sd": true,
+  "buffer_uploads_to_sd": false,
   "motion_roi": {
     "x": 0.0,
     "y": 0.0,
