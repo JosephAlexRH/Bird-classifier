@@ -28,6 +28,7 @@ try:
     from .capture_storage import CaptureStore, parse_camera_metadata
     from .collection import export_bird_crops
     from .scene_background import SceneBackground
+    from .visits import CaptureRef, VisitTracker
     from .motion_crop import (
         MotionConfig,
         RunningMedianBackground,
@@ -49,6 +50,7 @@ except ImportError:  # Direct execution support.
     from capture_storage import CaptureStore, parse_camera_metadata
     from collection import export_bird_crops
     from scene_background import SceneBackground
+    from visits import CaptureRef, VisitTracker
     from motion_crop import (
         MotionConfig,
         RunningMedianBackground,
@@ -108,12 +110,14 @@ class MotionService:
         settings_revision: int = 0,
         motion_triggered: bool = False,
         empty_sample_seconds: float = 0,
+        visit_tracker: "VisitTracker | None" = None,
     ) -> None:
         if poll_seconds <= 0 or timeout_seconds <= 0:
             raise ValueError("Motion polling interval and timeout must be positive")
         self.camera_url = camera_url
         self.store = store
         self.engine = inference_engine
+        self.visit_tracker = visit_tracker
         self.poll_seconds = float(poll_seconds)
         self.timeout_seconds = float(timeout_seconds)
         self.config = config
@@ -284,7 +288,7 @@ class MotionService:
                 return result
             background_before = self.background.median()
             motion = select_motion_crop(gray, background_before if self.motion_localization_enabled else None,
-                                        static_roi, self.config)
+                                        static_roi, self.config, pixel_thresholds=self.background.pixel_thresholds)
             if not self.motion_localization_enabled:
                 motion["selection"]["fallback_reason"] = "motion_localization_disabled"
                 motion["detection"]["reason"] = "motion_localization_disabled"
@@ -304,9 +308,12 @@ class MotionService:
             changed = (motion['selection']['source'] == 'dynamic_motion_blob' or
                        (motion['detection'].get('reason') == 'ambiguous_blob' and
                         motion['detection'].get('changed_pixels', 0) >= self.config.minimum_component_pixels))
-            if (motion['detection'].get('reason') in ('broad_scene_change', 'excessive_noise') or
-                    abs(motion['detection'].get('global_shift', 0)) > 32):
-                changed = False
+            uncertain_scene = (motion['detection'].get('reason') in ('broad_scene_change', 'excessive_noise') or
+                               abs(motion['detection'].get('global_shift', 0)) > 32)
+            if uncertain_scene:
+                # A large/close bird can fill the ROI. Run the detector on the
+                # fallback crop instead of silently rejecting it as lighting.
+                changed = True
                 empty_sample_due = False
             try:
                 if gate and background_before is not None and not changed and not empty_sample_due:
@@ -342,12 +349,14 @@ class MotionService:
             is_bird = inference.get("status") == "complete" and inference.get("is_bird") is True
             persistence_due = self.last_persisted_at is None or now - self.last_persisted_at >= self.minimum_persist_seconds
             event = is_bird or (clear_blob and persistence_due)
-            if gate and (background_before is None or not changed):
+            if gate and background_before is not None and not changed:
                 event = False
             persisted = self.collection_mode or event or empty_sample_due
             motion['capture_policy'] = {'motion_required': gate, 'motion_candidate': changed,
                 'periodic_background_sample': empty_sample_due,
-                'training_label': 'unreviewed', 'background_ready_at_capture': background_before is not None}
+                'training_label': 'unreviewed', 'background_ready_at_capture': background_before is not None,
+                'detector_fallback_no_background': gate and background_before is None,
+                'uncertain_scene': uncertain_scene}
             capture: dict[str, Any] | None = None
             if persisted:
                 if shutil.disk_usage(self.store.root).free < 256 * 1024 * 1024:
@@ -408,6 +417,12 @@ class MotionService:
                         inference["collection"] = export_bird_crops(destination, inference)
                     except Exception as error:
                         inference["collection"] = {"status": "error", "error": str(error), "crops": []}
+                if self.visit_tracker is not None:
+                    try:
+                        inference["visit"] = self.visit_tracker.observe(
+                            CaptureRef(capture["capture_id"], camera_id, self.deployment_id, boot_id), inference)
+                    except Exception as error:  # visits are derived data; never lose a capture over them
+                        inference["visit"] = {"status": "error", "error": str(error)}
                 write_inference_record(destination, inference)
                 self.frames_persisted += 1
                 if empty_sample_due:
@@ -427,6 +442,12 @@ class MotionService:
                 self.frames_polled += 1
                 self.last_result = result
                 self.last_error = None
+            if self.visit_tracker is not None:
+                try:
+                    self.visit_tracker.close_stale()
+                except OSError as error:
+                    with self._state_lock:
+                        self.last_error = f"visit log: {error}"
             return result
         finally:
             if temporary_path is not None:
@@ -609,5 +630,8 @@ class MotionService:
                 "background_samples": background.sample_count if background else 0,
                 "background_ready": background.ready if background else False,
                 'background_calibration': background.state() if background else {'phase': 'waiting_for_camera', 'ready': False},
+                'capture_policy_state': ('learning' if background and background.phase == 'learning' else
+                    'detector_fallback_no_background' if self.motion_triggered and self.motion_localization_enabled and
+                    not (background and background.ready) else 'active'),
                 "last_selection": ((self.last_result or {}).get("motion") or {}).get("selection"),
             }

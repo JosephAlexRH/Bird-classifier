@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PySourceRootDetectionService">
+    <option name="sourcePathsSet">
+      <set>
+        <option value="$PROJECT_DIR$" />
+        <option value="$PROJECT_DIR$/src/image_storage.cpp" />
+        <option value="$PROJECT_DIR$/src/web_server.cpp" />
+        <option value="$PROJECT_DIR$/src/device_telemetry.cpp" />
+        <option value="$PROJECT_DIR$/src/main.cpp" />
+        <option value="$PROJECT_DIR$/src/app_config.cpp" />
+        <option value="$PROJECT_DIR$/src/camera_runtime.cpp" />
+        <option value="$PROJECT_DIR$/src/camera_service.cpp" />
+        <option value="$PROJECT_DIR$/src/upload_buffer.cpp" />
+        <option value="$PROJECT_DIR$/src/motion_detector.cpp" />
+      </set>
+    </option>
+  </component>
+</project>

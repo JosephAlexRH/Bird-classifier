@@ -324,6 +324,7 @@ def create_app(
     manage_motion_services: bool | None = None,
     collection_mode: bool = False,
     deployment_id: str = "",
+    visit_tracker: Any | None = None,
 ) -> Flask:
     """Create the receiver/classifier app, with optional ESP32 camera controls."""
     app = Flask(__name__)
@@ -651,6 +652,7 @@ def create_app(
                 minimum_component_pixels=int(hub_settings.value['motion_minimum_area'])),
             motion_triggered=hub_settings.value['motion_triggered'],
             empty_sample_seconds=hub_settings.value['empty_sample_seconds'],
+            **({"visit_tracker": visit_tracker} if visit_tracker is not None else {}),
         )
         service.start()
         motion_services[camera["id"]] = service
@@ -685,6 +687,8 @@ def create_app(
         app.config["SHUTTING_DOWN"] = True
         for camera_id in list(motion_services):
             stop_camera_motion(camera_id)
+        if visit_tracker is not None:
+            visit_tracker.close_all()
         registry.stop()
 
     if start_motion_service:
@@ -1431,8 +1435,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--is-bird-model",
         type=Path,
-        help="Legacy binary bird/not-bird TFLite model (disables the default detector)",
+        help="Binary bird/not-bird TFLite model (disables the default detector)",
     )
+    parser.add_argument(
+        "--localizer-model",
+        type=Path,
+        help="ROI detector that only localises birds for species crops (use with --is-bird-model), "
+        "e.g. the v3 esp32_detector_int8.tflite with esp32_detector_contract.json beside it",
+    )
+    parser.add_argument("--localizer-contract", type=Path, help="Localizer contract (default: beside the model)")
+    parser.add_argument(
+        "--species-contract",
+        type=Path,
+        help="species_contract.json for a bird-crop species model (default: beside the species model; "
+        "without one the species model gets the whole frame, as before)",
+    )
+    parser.add_argument("--visit-gap-seconds", type=float, default=120.0,
+                        help="Captures from one camera closer than this form one visit (default: 120)")
+    parser.add_argument("--no-visits", action="store_true", help="Do not track visits or write visits.jsonl")
     parser.add_argument(
         "--species-model",
         type=Path,
@@ -1513,9 +1533,21 @@ if __name__ == "__main__":
             top_k=args.top_k,
             num_threads=args.num_threads,
             species_enabled=not args.collection_mode,
+            localizer_model=args.localizer_model,
+            localizer_contract_file=args.localizer_contract,
+            species_contract_file=args.species_contract,
         )
     except Exception as error:
         raise SystemExit(f"Model startup error: {error}") from error
+    visit_tracker = None
+    if not args.no_visits:
+        try:
+            from .visits import VisitTracker
+        except ImportError:
+            from visits import VisitTracker
+        species_contract = getattr(engine, "species_contract", None)
+        visit_tracker = VisitTracker(args.save_dir / "visits.jsonl", gap_seconds=args.visit_gap_seconds,
+                                     automation=species_contract.automation if species_contract is not None else None)
     print(f"Models ready: {json.dumps(engine.describe(), sort_keys=True)}", flush=True)
     print(f"Bird decision: {engine.decision_rule} (from {engine.threshold_source})", flush=True)
     if engine.contract is None and engine.detector_contract is None:
@@ -1543,6 +1575,7 @@ if __name__ == "__main__":
         start_hub_status=True,
         collection_mode=args.collection_mode,
         deployment_id=args.deployment_id,
+        visit_tracker=visit_tracker,
     )
     try:
         from .hub_advertiser import start_hub_advertiser

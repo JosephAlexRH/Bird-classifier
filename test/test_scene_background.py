@@ -44,7 +44,9 @@ class SceneBackgroundTests(unittest.TestCase):
         self.assertTrue(self.service.background.ready)
 
     def test_manual_learning_bypasses_feeder_scores_and_keeps_evidence_unreviewed(self):
-        self.assertFalse(self.poll()['persisted'])
+        initial = self.poll()
+        self.assertTrue(initial['persisted'])
+        self.assertTrue(initial['motion']['capture_policy']['detector_fallback_no_background'])
         with self.assertRaises(ValueError):
             self.service.background_command('learn')
         self.service.background_command('learn', confirmed_empty=True)
@@ -52,10 +54,12 @@ class SceneBackgroundTests(unittest.TestCase):
             self.poll()
         self.assertTrue(self.service.background.ready)
         self.assertEqual(len(self.engine.calls), 1)
-        self.assertEqual(len(list(self.root.glob('capture_*.jpg'))), 5)
+        self.assertEqual(len(list(self.root.glob('capture_*.jpg'))), 6)
         self.assertEqual(len(self.service.background.evidence), 5)
         for record in self.root.glob('*.inference.json'):
             value = json.loads(record.read_text())
+            if value.get('status') == 'complete':
+                continue
             self.assertEqual(value['reason'], 'background_calibration')
             self.assertIsNone(value['is_bird'])
         self.assertEqual(list(self.root.glob('*.review.json')), [])
@@ -94,7 +98,7 @@ class SceneBackgroundTests(unittest.TestCase):
         value = json.loads(metadata())
         value['camera']['requested']['motion']['roi'] = {'x': 0, 'y': 0, 'width': .5, 'height': 1}
         self.header = json.dumps(value)
-        self.assertFalse(self.poll()['persisted'])
+        self.assertTrue(self.poll()['persisted'])
         self.assertFalse(self.service.background.ready)
         self.assertIn('changed', self.service.background.reason)
 
@@ -103,7 +107,8 @@ class SceneBackgroundTests(unittest.TestCase):
         self.service.background_command('learn', confirmed_empty=True)
         self.poll()
         self.frame[20:60, 20:60] = 200
-        self.poll()
+        for _ in range(4):
+            self.poll()
         self.assertEqual(self.service.background.phase, 'failed')
         self.assertFalse(self.service.background.ready)
         self.assertFalse(self.service.background.cache_path.exists())
@@ -132,12 +137,79 @@ class SceneBackgroundTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.service.background_command('learn', confirmed_empty=True)
 
-    def test_broad_scene_change_invalidates_without_saving_false_events(self):
+    def test_large_subject_preserves_reference_and_runs_detector(self):
         self.calibrate()
+        baseline = self.service.background.median().copy()
         self.frame[10:110, 10:150] = 140
         for _ in range(3):
-            self.assertFalse(self.poll()['persisted'])
+            result = self.poll()
+            self.assertTrue(result['persisted'])
+            self.assertTrue(result['motion']['capture_policy']['uncertain_scene'])
+        self.assertTrue(self.service.background.ready)
+        self.assertTrue(self.service.background.cache_path.exists())
+        self.assertEqual(self.service.background.phase, 'attention')
+        np.testing.assert_array_equal(self.service.background.median(), baseline)
+        self.frame[:] = 60
+        self.assertFalse(self.poll()['persisted'])
+        self.assertEqual(self.service.background.phase, 'ready')
+        history = self.service.background.cache_path.with_suffix('.events.jsonl').read_text()
+        self.assertIn('reference_frozen', history)
+        self.assertIn('reference_recovered', history)
+
+    def test_missing_reference_preserves_detected_bird_and_logs_fallback(self):
+        result = self.poll()
+        self.assertTrue(result['persisted'])
+        self.assertTrue(result['capture']['capture_policy']['detector_fallback_no_background'])
+        self.assertEqual(self.service.describe()['capture_policy_state'], 'detector_fallback_no_background')
         self.assertFalse(self.service.background.ready)
+
+    def test_swaying_thin_feeder_edges_calibrate_and_do_not_trigger_events(self):
+        self.poll()
+        self.service.background_command('learn', confirmed_empty=True)
+        for i in range(5):
+            self.frame[:] = 60
+            self.frame[10:105, 70+i%2:76+i%2] = 190
+            self.poll()
+        self.assertTrue(self.service.background.ready)
+        self.assertIsNotNone(self.service.background.pixel_thresholds)
+        for i in range(6):
+            self.frame[:] = 60
+            self.frame[10:105, 70+i%2:76+i%2] = 190
+            self.assertFalse(self.poll()['persisted'])
+        self.frame[50:75, 110:135] = 200
+        result = self.poll()
+        self.assertTrue(result['persisted'])
+        self.assertTrue(result['motion']['capture_policy']['motion_candidate'])
+
+    def test_exposure_can_settle_instead_of_failing_on_second_frame(self):
+        self.poll()
+        self.service.background_command('learn', confirmed_empty=True)
+        for level in (30, 110, 80, 100, 100):
+            self.frame[:] = level
+            self.poll()
+        self.assertEqual(self.service.background.phase, 'learning')
+        for _ in range(4):
+            self.frame[:] = 100
+            self.poll()
+        self.assertTrue(self.service.background.ready)
+
+    def test_persistent_exposure_instability_times_out_with_diagnostics(self):
+        self.poll()
+        self.service.background_command('learn', confirmed_empty=True)
+        for i in range(15):
+            self.frame[:] = 20 if i%2 else 180
+            self.poll()
+        self.assertFalse(self.service.background.ready)
+        self.assertEqual(self.service.background.phase, 'failed')
+        self.assertEqual(self.service.background.reason, 'calibration_exposure_still_settling')
+        self.assertGreater(self.service.background.learning_diagnostics['exposure_span'], 40)
+
+    def test_calibrated_noise_map_restores_with_reference(self):
+        self.calibrate()
+        thresholds = self.service.background.pixel_thresholds.copy()
+        self.service = self.make_service()
+        self.poll()
+        np.testing.assert_array_equal(self.service.background.pixel_thresholds, thresholds)
 
 
 if __name__ == '__main__':

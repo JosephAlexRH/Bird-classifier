@@ -238,6 +238,7 @@ def select_motion_crop(
     background: np.ndarray | None,
     static_roi: Any,
     config: MotionConfig = MotionConfig(),
+    pixel_thresholds: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Return a dynamic largest-blob crop or a strict static-ROI fallback."""
     gray = validate_gray(gray)
@@ -262,7 +263,12 @@ def select_motion_crop(
             if raw_threshold > config.maximum_threshold:
                 fallback_reason = "excessive_noise"
             else:
-                mask = residual >= raw_threshold
+                thresholds = raw_threshold
+                if pixel_thresholds is not None:
+                    if pixel_thresholds.shape != gray.shape or pixel_thresholds.dtype != np.uint8:
+                        raise ValueError('Background noise map shape or dtype does not match frame')
+                    thresholds = np.maximum(raw_threshold, pixel_thresholds)
+                mask = residual >= thresholds
                 search = np.zeros_like(mask)
                 search[top:bottom, left:right] = True
                 mask = _binary_morphology(mask & search) & search
@@ -271,6 +277,7 @@ def select_motion_crop(
                 search_area = (right - left) * (bottom - top)
                 detection.update({
                     "threshold": raw_threshold, "noise_sigma": sigma, "global_shift": global_shift,
+                    'calibrated_pixel_thresholds': pixel_thresholds is not None,
                     "changed_pixels": foreground, "component_count": len(components),
                 })
                 if not components or foreground == 0:

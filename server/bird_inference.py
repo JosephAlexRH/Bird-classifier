@@ -13,7 +13,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from types import SimpleNamespace
+from typing import Any, Callable, Sequence
 
 import numpy as np
 from PIL import Image
@@ -28,6 +29,11 @@ INFERENCE_SCHEMA_VERSION = 4
 DEFAULT_IMAGE_SIZE = 224
 CONTRACT_FILENAME = "inference_contract.json"
 DETECTOR_CONTRACT_FILENAME = "detector_contract.json"
+SPECIES_CONTRACT_FILENAME = "species_contract.json"
+ROI_LOCALIZER_CONTRACT_FILENAME = "esp32_detector_contract.json"
+SPECIES_BOX_GEOMETRY = "detector_box_square_context_crop_then_letterbox"
+SPECIES_MAX_BOXES = 5
+DEFAULT_LOCALIZER_MIN_SCORE = 0.05
 LETTERBOX_GEOMETRY = "letterbox"
 ROI_CROP_GEOMETRY = "roi_crop_then_letterbox"
 SELECTED_CROP_GEOMETRY = "selected_crop_then_letterbox"
@@ -63,10 +69,10 @@ def _interpreter_class():
     except ImportError as error:
         errors.append(f"tflite-runtime: {error}")
     try:
-        from tensorflow.lite import Interpreter
+        import tensorflow as tf
 
-        return Interpreter, "tensorflow"
-    except (ImportError, OSError) as error:
+        return tf.lite.Interpreter, "tensorflow"
+    except (ImportError, OSError, AttributeError) as error:
         errors.append(f"tensorflow: {error}")
     raise RuntimeError(
         "No usable TFLite interpreter is installed. Install ai-edge-litert or "
@@ -853,6 +859,255 @@ def decode_detector_outputs(
     return detections
 
 
+# ---- Bird-centred species crops ------------------------------------------------------------
+
+
+def clip_rect(
+    left: float, top: float, right: float, bottom: float, frame_width: int, frame_height: int, min_size: int = 8
+) -> tuple[int, int, int, int]:
+    """Float rectangle -> integer half-open rectangle inside the frame, shifted (not shrunk) when possible.
+
+    Identical to the species training notebook, so served crops match trained crops pixel for pixel.
+    """
+    width = min(max(right - left, min_size), frame_width)
+    height = min(max(bottom - top, min_size), frame_height)
+    left = min(max(left, 0), frame_width - width)
+    top = min(max(top, 0), frame_height - height)
+    return (
+        int(math.floor(left)),
+        int(math.floor(top)),
+        int(math.floor(left)) + int(round(width)),
+        int(math.floor(top)) + int(round(height)),
+    )
+
+
+def species_crop_bounds(
+    box: Sequence[float], frame_width: int, frame_height: int, *, context: float = 1.5, min_size: int = 48
+) -> tuple[int, int, int, int]:
+    """Square crop centred on a bird box: side = context x the box's long side, at least min_size px."""
+    left, top, right, bottom = (float(value) for value in box)
+    if not (right > left and bottom > top):
+        raise ValueError("Species box must have positive width and height.")
+    side = max(max(right - left, bottom - top) * float(context), float(min_size))
+    center_x, center_y = (left + right) / 2, (top + bottom) / 2
+    return clip_rect(
+        center_x - side / 2, center_y - side / 2, center_x + side / 2, center_y + side / 2,
+        frame_width, frame_height, min_size,
+    )
+
+
+def square_around(crop: Sequence[int], frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+    """Smallest square containing a crop's long side, centred on it and shifted inside the frame."""
+    left, top, right, bottom = (int(value) for value in crop)
+    side = min(max(right - left, bottom - top), frame_width, frame_height)
+    center_x, center_y = (left + right) / 2, (top + bottom) / 2
+    square_left = int(min(max(0, math.floor(center_x - side / 2)), frame_width - side))
+    square_top = int(min(max(0, math.floor(center_y - side / 2)), frame_height - side))
+    return square_left, square_top, square_left + side, square_top + side
+
+
+def _box_tuple(box: dict[str, float]) -> tuple[float, float, float, float]:
+    return float(box["left"]), float(box["top"]), float(box["right"]), float(box["bottom"])
+
+
+def _check_tensor_contract(data: dict[str, Any], model: Any, contract_path: Path) -> None:
+    """Shared input/output shape, dtype and quantization checks for classifier contracts."""
+    named = data.get("model_file", "the contract's model")
+    problems: list[str] = []
+    if "input_shape" in data:
+        actual = [int(value) for value in model.input["shape"]]
+        if actual != [int(value) for value in data["input_shape"]]:
+            problems.append(f"input shape {actual} != {data['input_shape']}")
+    for side, detail, quantization in (
+        ("input", model.input, model.input_quantization),
+        ("output", model.output, model.output_quantization),
+    ):
+        dtype_key, quant_key = f"{side}_dtype", f"{side}_quantization"
+        actual_dtype = np.dtype(detail["dtype"]).name
+        if dtype_key in data and actual_dtype != data[dtype_key]:
+            problems.append(f"{side} dtype {actual_dtype} != {data[dtype_key]}")
+        if quant_key in data and np.issubdtype(np.dtype(detail["dtype"]), np.integer):
+            scale, zero_point = (float(data[quant_key][0]), int(data[quant_key][1]))
+            if not (np.isclose(quantization[0], scale, rtol=1e-6, atol=0) and quantization[1] == zero_point):
+                problems.append(f"{side} quantization {list(quantization)} != {[scale, zero_point]}")
+    if problems:
+        raise ValueError(
+            f"{model.path.name} does not match {contract_path.name} (which describes {named}): " + "; ".join(problems)
+        )
+
+
+class SpeciesContract:
+    """``species_contract.json`` written beside a bird-crop species model by the v4.1 notebook."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path).expanduser().resolve()
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"{self.path} must contain a JSON object.")
+        self.data = data
+        self.sha256 = _sha256(self.path)
+        problems: list[str] = []
+        required = {
+            "geometry": SPECIES_BOX_GEOMETRY,
+            "geometry_location": "outside the model",
+            "color_order": "RGB",
+            "jpeg_decode_channels": 3,
+            "letterbox_padding_value": 0,
+            "resize_antialias": True,
+        }
+        for key, expected in required.items():
+            if data.get(key) != expected:
+                problems.append(f"{key}={data.get(key)!r} (receiver requires {expected!r})")
+        if "bilinear" not in str(data.get("resize_method", "")).lower():
+            problems.append("resize_method must be TensorFlow bilinear")
+        if "inside the model" not in str(data.get("numeric_scaling", "")):
+            problems.append("numeric_scaling must be embedded in the model")
+        rule = data.get("crop_rule") or {}
+        context, min_size = rule.get("context"), rule.get("min_size_px")
+        if not (isinstance(context, (int, float)) and not isinstance(context, bool) and math.isfinite(context) and context > 0):
+            problems.append("crop_rule.context must be a positive number")
+        if not (isinstance(min_size, int) and not isinstance(min_size, bool) and min_size >= 1):
+            problems.append("crop_rule.min_size_px must be a positive integer")
+        classes = data.get("classes")
+        if not (isinstance(classes, list) and classes and all(isinstance(c, str) and c.strip() for c in classes)):
+            problems.append("classes must be a non-empty list of names")
+        shape = data.get("input_shape")
+        if not (isinstance(shape, list) and len(shape) == 4 and shape[1] == shape[2] and shape[3] == 3):
+            problems.append("input_shape must be [1, size, size, 3]")
+        automation = data.get("automation")
+        if automation is not None and not isinstance(automation, dict):
+            problems.append("automation must be an object")
+        if problems:
+            raise ValueError(f"Unsupported species contract {self.path}: " + "; ".join(problems))
+        self.classes = [str(c).strip() for c in classes]
+        self.image_size = int(shape[1])
+        self.context = float(context)
+        self.min_size = int(min_size)
+        self.automation = automation or {}
+
+    @classmethod
+    def beside(cls, model_path: Path) -> "SpeciesContract | None":
+        candidate = Path(model_path).expanduser().resolve().with_name(SPECIES_CONTRACT_FILENAME)
+        return cls(candidate) if candidate.is_file() else None
+
+    def validate_labels(self, labels: Sequence[str]) -> None:
+        if list(labels) != self.classes:
+            raise ValueError(f"Species labels do not match {self.path.name} classes (order matters).")
+
+    def validate_model(self, model: "TFLiteModel") -> None:
+        _check_tensor_contract(self.data, model, self.path)
+
+    def crop(self, box: Sequence[float], frame_width: int, frame_height: int) -> tuple[int, int, int, int]:
+        return species_crop_bounds(box, frame_width, frame_height, context=self.context, min_size=self.min_size)
+
+    def describe(self) -> dict[str, Any]:
+        return {"path": str(self.path), "sha256": self.sha256, "geometry": SPECIES_BOX_GEOMETRY,
+                "context": self.context, "min_size_px": self.min_size, "classes": len(self.classes),
+                "automation": self.automation}
+
+
+class RoiLocalizer:
+    """The v3 ESP32 ROI detector, used on the hub only to find where the bird is.
+
+    It runs on a square around the Pi-selected crop (letterboxed on grey 114), exactly
+    as the species notebook ran it to build training crops.
+    """
+
+    def __init__(
+        self,
+        model_path: Path,
+        *,
+        contract_file: Path | None = None,
+        interpreter_factory: Callable[..., Any] | None = None,
+        num_threads: int | None = None,
+        min_score: float = DEFAULT_LOCALIZER_MIN_SCORE,
+    ) -> None:
+        self.path = Path(model_path).expanduser().resolve()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"Localizer TFLite model not found: {self.path}")
+        contract_path = (Path(contract_file) if contract_file is not None
+                         else self.path.with_name(ROI_LOCALIZER_CONTRACT_FILENAME)).expanduser().resolve()
+        if not contract_path.is_file():
+            raise FileNotFoundError(f"Localizer contract not found: {contract_path}")
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        problems: list[str] = []
+        if contract.get("schema_version") != 2:
+            problems.append("schema_version must be 2")
+        if contract.get("model_file") != self.path.name:
+            problems.append(f"model_file={contract.get('model_file')!r} but the model is {self.path.name!r}")
+        self.sha256 = _sha256(self.path)
+        if contract.get("model_sha256") and contract["model_sha256"] != self.sha256:
+            problems.append("model SHA-256 does not match the contract")
+        anchors = np.asarray(contract.get("anchors_normalized_wh") or [], np.float32)
+        if anchors.ndim != 2 or anchors.shape[1] != 2 or not len(anchors):
+            problems.append("anchors_normalized_wh must be a list of [w, h] pairs")
+        decode = contract.get("decode") or {}
+        if problems:
+            raise ValueError(f"Unsupported localizer contract {contract_path}: " + "; ".join(problems))
+        if interpreter_factory is None:
+            interpreter_factory, self.runtime = _interpreter_class()
+        else:
+            self.runtime = "injected"
+        kwargs = {"model_path": str(self.path)}
+        if num_threads is not None:
+            kwargs["num_threads"] = num_threads
+        self.interpreter = interpreter_factory(**kwargs)
+        self.interpreter.allocate_tensors()
+        inputs, outputs = self.interpreter.get_input_details(), self.interpreter.get_output_details()
+        if len(inputs) != 1 or len(outputs) != 2:
+            raise ValueError(f"{self.path.name} must have one input and two outputs.")
+        self.input = inputs[0]
+        shape = [int(v) for v in self.input["shape"]]
+        if len(shape) != 4 or shape[1] != shape[2] or shape[3] != 3:
+            raise ValueError(f"{self.path.name} input shape {shape} is not [1, S, S, 3].")
+        self.image_size = shape[1]
+        count = len(anchors)
+        try:
+            self._score = next(o for o in outputs if int(o["shape"][-1]) == count)
+            self._box = next(o for o in outputs if int(o["shape"][-1]) == 4 * count)
+        except StopIteration as error:
+            raise ValueError(f"{self.path.name} outputs do not match {count} anchors.") from error
+        grid = int(self._box["shape"][1])
+        self.padding_value = int((contract.get("pi_crop") or {}).get("pad_value", 114))
+        self.min_score = float(min_score)
+        # Boxes at or above this score count as birds; below it only the single best box is used.
+        self.deployment_threshold = float(decode.get("deployment_score_threshold", 0.5))
+        self._spec = SimpleNamespace(
+            box_spec={"shape": [1, grid, grid, count, 4]}, score_spec={"shape": [1, grid, grid, count, 1]},
+            anchors=anchors, candidate_threshold=float(decode.get("candidate_score_threshold", 0.05)),
+            image_size=self.image_size, max_detections=int(decode.get("max_detections", 5)),
+            nms_iou=float(decode.get("nms_iou", 0.45)),
+        )
+        self.contract_path = contract_path
+        self.contract_sha256 = _sha256(contract_path)
+        self._lock = threading.Lock()
+
+    def localise(self, rgb: np.ndarray, selected_crop: Sequence[int]) -> list[dict[str, Any]]:
+        """Detections (score, box in original-frame pixels) at or above ``min_score``, best first."""
+        height, width = int(rgb.shape[0]), int(rgb.shape[1])
+        crop = square_around(selected_crop, width, height)
+        left, top, right, bottom = crop
+        pixels = letterbox_array(rgb[top:bottom, left:right], self.image_size, padding_value=self.padding_value)
+        tensor = _quantize(pixels[np.newaxis, ...].astype(np.float32), self.input["dtype"],
+                           tuple(self.input.get("quantization", (0.0, 0))))
+        with self._lock:
+            self.interpreter.set_tensor(self.input["index"], tensor)
+            self.interpreter.invoke()
+            raw_box = np.asarray(self.interpreter.get_tensor(self._box["index"]))
+            raw_score = np.asarray(self.interpreter.get_tensor(self._score["index"]))
+        box = _dequantize(raw_box, tuple(self._box.get("quantization", (0.0, 0)))).reshape(self._spec.box_spec["shape"])
+        score = _dequantize(raw_score, tuple(self._score.get("quantization", (0.0, 0)))).reshape(self._spec.score_spec["shape"])
+        detections = decode_detector_outputs(box, score, self._spec, crop)  # type: ignore[arg-type]
+        return [d for d in detections if d["score"] >= self.min_score]
+
+    def describe(self) -> dict[str, Any]:
+        return {"filename": self.path.name, "path": str(self.path), "sha256": self.sha256, "runtime": self.runtime,
+                "contract": str(self.contract_path), "contract_sha256": self.contract_sha256,
+                "image_size": self.image_size, "min_score": self.min_score,
+                "deployment_threshold": self.deployment_threshold,
+                "geometry": "square_around_selected_crop_then_letterbox", "padding_value": self.padding_value}
+
+
 class InferenceContract:
     """The deployment contract a training notebook writes beside an is-bird model.
 
@@ -1024,6 +1279,10 @@ class BirdInferenceEngine:
         num_threads: int | None = None,
         interpreter_factory: Callable[..., Any] | None = None,
         species_enabled: bool = True,
+        localizer_model: Path | None = None,
+        localizer_contract_file: Path | None = None,
+        species_contract_file: Path | None = None,
+        species_min_localizer_score: float = DEFAULT_LOCALIZER_MIN_SCORE,
     ) -> None:
         is_bird_model = (
             Path(is_bird_model).expanduser().resolve() if is_bird_model is not None else None
@@ -1054,12 +1313,29 @@ class BirdInferenceEngine:
         self._species_threads = num_threads
         self._requested_top_k = top_k
         load_species = species_model is not None and species_enabled
-        if not species_enabled and detector_model is None:
-            raise ValueError("Optional species inference requires the bounding-box detector.")
+        if localizer_model is not None and detector_model is not None:
+            raise ValueError("The bounding-box detector already localises birds; do not also configure localizer_model.")
+        self.species_contract: SpeciesContract | None = None
+        if species_model is not None:
+            if species_contract_file is not None:
+                species_contract_path = Path(species_contract_file).expanduser().resolve()
+                if not species_contract_path.is_file():
+                    raise FileNotFoundError(f"Species contract not found: {species_contract_path}")
+                self.species_contract = SpeciesContract(species_contract_path)
+            else:
+                self.species_contract = SpeciesContract.beside(species_model)
+        self.species_min_localizer_score = float(species_min_localizer_score)
+        self.localizer: RoiLocalizer | None = (
+            RoiLocalizer(localizer_model, contract_file=localizer_contract_file, interpreter_factory=interpreter_factory,
+                         num_threads=num_threads, min_score=self.species_min_localizer_score)
+            if localizer_model is not None else None
+        )
         self.labels = ([line.strip() for line in species_labels.read_text(encoding="utf-8").splitlines() if line.strip()]
                        if load_species else [])
         if load_species and not self.labels:
             raise ValueError(f"Species label file is empty: {species_labels}")
+        if self.species_contract is not None and load_species:
+            self.species_contract.validate_labels(self.labels)
         if top_k < 1:
             raise ValueError("top_k must be positive.")
         self.top_k = min(top_k, len(self.labels))
@@ -1119,6 +1395,8 @@ class BirdInferenceEngine:
             if self.contract is not None:
                 self.contract.validate_model(self.is_bird)
             species_image_size = image_size
+        if self.species_contract is not None:
+            species_image_size = self.species_contract.image_size
         self._species_image_size = species_image_size
         self.species = TFLiteModel(
             species_model,
@@ -1127,6 +1405,8 @@ class BirdInferenceEngine:
             interpreter_factory=interpreter_factory,
             num_threads=num_threads,
         ) if load_species else None
+        if self.species is not None and self.species_contract is not None:
+            self.species_contract.validate_model(self.species)
 
         if detector_model is not None:
             self.species_labels_path = species_labels
@@ -1180,10 +1460,6 @@ class BirdInferenceEngine:
 
     def set_species_enabled(self, enabled: bool) -> None:
         """Caller holds the shared inference lock while changing model state."""
-        if self.detector is None:
-            if enabled != (self.species is not None):
-                raise ValueError("Species switching requires the bounding-box detector.")
-            return
         if not enabled:
             self.species = None
             return
@@ -1197,9 +1473,58 @@ class BirdInferenceEngine:
         model = TFLiteModel(self.species_model_path, output_size=len(labels),
                             image_size=self._species_image_size,
                             interpreter_factory=self._species_factory, num_threads=self._species_threads)
+        if self.species_contract is not None:
+            self.species_contract.validate_labels(labels)
+            self.species_contract.validate_model(model)
         self.labels = labels
         self.top_k = min(self._requested_top_k, len(labels))
         self.species = model
+
+    def _species_on_boxes(
+        self,
+        rgb: np.ndarray,
+        boxes: list[dict[str, Any]],
+        fallback_crop: tuple[int, int, int, int],
+        box_source: str,
+        box_threshold: float,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Run the bird-crop species model once per localised bird (best box first).
+
+        Every box scoring at least ``box_threshold`` is classified (up to SPECIES_MAX_BOXES). If none
+        does, the single best box at or above ``species_min_localizer_score`` is used; with no box at
+        all, the selected crop is used and the block records ``localised: false``.
+        Returns the inference ``species`` block and the top-k list of the best box.
+        """
+        assert self.species is not None and self.species_contract is not None
+        height, width = int(rgb.shape[0]), int(rgb.shape[1])
+        usable = sorted((b for b in boxes if float(b.get("score", 0.0)) >= self.species_min_localizer_score),
+                        key=lambda b: -float(b["score"]))
+        candidates = [b for b in usable if float(b["score"]) >= box_threshold][:SPECIES_MAX_BOXES] or usable[:1]
+        entries: list[dict[str, Any]] = []
+        jobs = ([(b, self.species_contract.crop(_box_tuple(b["box"]), width, height)) for b in candidates]
+                or [(None, tuple(int(v) for v in fallback_crop))])
+        for detection, crop in jobs:
+            left, top, right, bottom = crop
+            pixels = letterbox_array(rgb[top:bottom, left:right], self.species.image_size, padding_value=0)
+            scores = self.species.predict_pixels(pixels)
+            order = np.argsort(-scores, kind="stable")[: self.top_k]
+            entries.append({
+                "box": detection["box"] if detection is not None else None,
+                "localizer_score": float(detection["score"]) if detection is not None else None,
+                "crop": {"left": left, "top": top, "right": right, "bottom": bottom},
+                "probabilities": [float(v) for v in scores],
+                "top_k": [{"label": self.labels[int(k)], "probability": float(scores[int(k)])} for k in order],
+            })
+        block = {
+            "geometry": SPECIES_BOX_GEOMETRY,
+            "box_source": box_source if candidates else "selected_crop_fallback",
+            "localised": bool(candidates),
+            "box_threshold": float(box_threshold),
+            "labels": list(self.labels),
+            "boxes": entries,
+            "contract": self.species_contract.describe(),
+        }
+        return block, entries[0]["top_k"]
 
     def infer(
         self,
@@ -1238,7 +1563,8 @@ class BirdInferenceEngine:
                 self.detector.image_size,
                 padding_value=self.detector_contract.padding_value,
             )
-            species_pixels = letterbox_array(rgb, self.species.image_size) if self.species is not None else None
+            species_pixels = (letterbox_array(rgb, self.species.image_size)
+                              if self.species is not None and self.species_contract is None else None)
             preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
 
             detector_started = time.perf_counter()
@@ -1258,15 +1584,21 @@ class BirdInferenceEngine:
 
             species_top = []
             species_ms = 0.0
+            species_block = None
             if self.species is not None:
                 species_started = time.perf_counter()
-                species_scores = self.species.predict_pixels(species_pixels)
+                if self.species_contract is not None:
+                    if is_bird:  # species on a bird crop only; non-birds keep the detector record
+                        species_block, species_top = self._species_on_boxes(
+                            rgb, detections, (left, crop_top, right, bottom), "detector", self.bird_threshold)
+                else:
+                    species_scores = self.species.predict_pixels(species_pixels)
+                    order = np.argsort(-species_scores, kind="stable")[: self.top_k]
+                    species_top = [
+                        {"label": self.labels[int(index)], "probability": float(species_scores[int(index)])}
+                        for index in order
+                    ]
                 species_ms = (time.perf_counter() - species_started) * 1000
-                order = np.argsort(-species_scores, kind="stable")[: self.top_k]
-                species_top = [
-                    {"label": self.labels[int(index)], "probability": float(species_scores[int(index)])}
-                    for index in order
-                ]
             crop_provenance = {
                 "crop_source": crop_source,
                 "crop_coordinate_space": "original_decoded_frame_pixels",
@@ -1330,11 +1662,12 @@ class BirdInferenceEngine:
                         "crop": crop_provenance,
                     },
                     "species": {
-                        "method": LETTERBOX_GEOMETRY,
+                        "method": SPECIES_BOX_GEOMETRY if species_block is not None else LETTERBOX_GEOMETRY,
                         "size": self.species.image_size if self.species is not None else None,
                         "enabled": self.species is not None,
                         "crop": None,
-                        "source": "whole_original_frame",
+                        "source": (species_block["box_source"] if species_block is not None
+                                   else "whole_original_frame"),
                     },
                 },
                 "timing_ms": {
@@ -1344,6 +1677,8 @@ class BirdInferenceEngine:
                     "total": (time.perf_counter() - started) * 1000,
                 },
             }
+            if species_block is not None:
+                result["species"] = species_block
             result["classification"] = {
                 "is_bird": result["is_bird"],
                 "confidence": bird_probability,
@@ -1416,13 +1751,17 @@ class BirdInferenceEngine:
             }
         else:
             is_bird_rgb = rgb
+            left, top, right, bottom = 0, 0, int(rgb.shape[1]), int(rgb.shape[0])
+        selected_bounds = (left, top, right, bottom)
         bird_pixels = letterbox_array(is_bird_rgb, self.is_bird.image_size)
         # Never pass ROI-cropped pixels to the whole-frame species classifier.
-        species_pixels = (
-            bird_pixels
-            if geometry == LETTERBOX_GEOMETRY and self.species.image_size == self.is_bird.image_size
-            else letterbox_array(rgb, self.species.image_size)
-        )
+        species_pixels = None
+        if self.species is not None and self.species_contract is None:
+            species_pixels = (
+                bird_pixels
+                if geometry == LETTERBOX_GEOMETRY and self.species.image_size == self.is_bird.image_size
+                else letterbox_array(rgb, self.species.image_size)
+            )
         preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
 
         bird_started = time.perf_counter()
@@ -1435,14 +1774,27 @@ class BirdInferenceEngine:
         else:
             is_bird = bird_probability >= self.bird_threshold
 
+        localizer_ms = 0.0
+        localizations: list[dict[str, Any]] = []
+        species_block = None
+        top: list[dict[str, Any]] = []
         species_started = time.perf_counter()
-        species_scores = self.species.predict_pixels(species_pixels)
-        species_ms = (time.perf_counter() - species_started) * 1000
-        order = np.argsort(-species_scores, kind="stable")[: self.top_k]
-        top = [
-            {"label": self.labels[int(index)], "probability": float(species_scores[int(index)])}
-            for index in order
-        ]
+        if self.species is not None and self.species_contract is not None and is_bird:
+            if self.localizer is not None:
+                localizer_started = time.perf_counter()
+                localizations = self.localizer.localise(rgb, selected_bounds)
+                localizer_ms = (time.perf_counter() - localizer_started) * 1000
+            species_block, top = self._species_on_boxes(
+                rgb, localizations, selected_bounds, "localizer",
+                self.localizer.deployment_threshold if self.localizer is not None else 1.0)
+        elif self.species is not None and self.species_contract is None:
+            species_scores = self.species.predict_pixels(species_pixels)
+            order = np.argsort(-species_scores, kind="stable")[: self.top_k]
+            top = [
+                {"label": self.labels[int(index)], "probability": float(species_scores[int(index)])}
+                for index in order
+            ]
+        species_ms = (time.perf_counter() - species_started) * 1000 - localizer_ms
         result = {
             "schema_version": INFERENCE_SCHEMA_VERSION,
             "status": "complete",
@@ -1460,12 +1812,13 @@ class BirdInferenceEngine:
                 "raw_output_threshold": self.raw_output_threshold,
                 "threshold_source": self.threshold_source,
             },
-            "guess": top[0]["label"],
-            "species_probability": top[0]["probability"],
+            "guess": top[0]["label"] if top else None,
+            "species_probability": top[0]["probability"] if top else None,
             "species_top_k": top,
             "models": {
                 "is_bird": self.is_bird.describe(),
-                "species": self.species.describe(),
+                "species": self.species.describe() if self.species is not None else None,
+                "localizer": self.localizer.describe() if self.localizer is not None else None,
             },
             "contract": self.contract.describe() if self.contract is not None else None,
             "preprocessing": {
@@ -1485,24 +1838,31 @@ class BirdInferenceEngine:
                     "crop": crop_provenance,
                 },
                 "species": {
-                    "method": LETTERBOX_GEOMETRY,
-                    "size": self.species.image_size,
+                    "method": SPECIES_BOX_GEOMETRY if species_block is not None else LETTERBOX_GEOMETRY,
+                    "size": self.species.image_size if self.species is not None else None,
+                    "enabled": self.species is not None,
                     "crop": None,
-                    "source": "whole_original_frame",
+                    "source": species_block["box_source"] if species_block is not None else "whole_original_frame",
                 },
             },
             "timing_ms": {
                 "preprocess": preprocess_ms,
                 "is_bird": bird_ms,
+                "localizer": localizer_ms,
                 "species": species_ms,
                 "total": (time.perf_counter() - started) * 1000,
             },
         }
+        if species_block is not None:
+            result["species"] = species_block
+            result["localizer"] = {"detections": localizations,
+                                   "model": self.localizer.describe() if self.localizer is not None else None}
         result["classification"] = {
             "is_bird": result["is_bird"],
             "confidence": bird_probability,
-            "label": result["guess"],
         }
+        if result["guess"] is not None:
+            result["classification"]["label"] = result["guess"]
         return result
 
     def describe(self) -> dict[str, Any]:
@@ -1524,6 +1884,8 @@ class BirdInferenceEngine:
             "detector": self.detector.describe() if self.detector is not None else None,
             "is_bird": self.is_bird.describe() if self.is_bird is not None else None,
             "species": self.species.describe() if self.species is not None else None,
+            "species_contract": self.species_contract.describe() if self.species_contract is not None else None,
+            "localizer": self.localizer.describe() if self.localizer is not None else None,
         }
 
     def detector_record(self, *, top_score: float | None = None, box: Any = None, decision: Any = None) -> dict[str, Any] | None:

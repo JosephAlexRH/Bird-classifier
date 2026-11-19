@@ -30,17 +30,18 @@ def hub_page(review_html: str, *, remote: bool, initial_tab: str = "live") -> st
     page = page.replace("detector_threshold:Number($('hub-threshold').value)",
                         "detector_threshold:Number($('hub-threshold').value),motion_triggered:$('hub-motion-gate').checked,motion_threshold:Number($('motion-threshold').value),motion_minimum_area:Number($('motion-area').value),empty_sample_seconds:Number($('empty-interval').value)")
     page = page.replace('Motion background warming; detector uses the analysis area as fallback.',
-                        'Background not ready. Learn an empty scene; motion-gated events wait until ready.')
+                        'Background not ready. Detector candidates are saved without a motion gate; false positives may increase. Learn an empty scene to restore motion filtering.')
     return page
 
 
 BACKGROUND_PANEL = '''<div class="card"><h2>Motion background · selected camera</h2>
 <p id="background-state" class="explain" role="status">Waiting for camera status.</p>
+<p id="background-detail" class="caption"></p>
 <p class="caption">Refresh preview and check that the entire blue analysis area is empty of birds. Keep the camera still while five frames are learned. Calibration frames remain unreviewed.</p>
 <label><input id="confirm-empty" type="checkbox">I confirm the analysis area is empty now</label>
 <div class="actions spaced"><button id="learn-empty">Learn empty scene</button><button id="reset-background">Reset background</button></div></div>'''
 
-MOTION_SETTINGS = '''<div class="field"><label><input id="hub-motion-gate" type="checkbox">Require motion before bird detection</label><p>With Pi motion localization on, event mode waits for a ready background and changed pixels. Save all originals overrides this saving filter.</p></div>
+MOTION_SETTINGS = '''<div class="field"><label><input id="hub-motion-gate" type="checkbox">Require motion before bird detection</label><p>Filters quiet scenes when a background is ready. If unavailable, detector-only fallback preserves accepted bird candidates. Save all originals overrides this saving filter.</p></div>
 <div class="field"><label>Motion difference threshold <input id="motion-threshold" type="number" min="1" max="128" step="1" required></label><p>Higher values ignore smaller brightness differences. This is separate from bird confidence.</p></div>
 <div class="field"><label>Minimum changed area <input id="motion-area" type="number" min="1" max="1000000" step="1" required> pixels</label><p>Higher values ignore smaller changes; small birds may be missed. Measured at original image resolution.</p></div>
 <div class="field"><label>Quiet-scene sample interval <input id="empty-interval" type="number" min="0" max="86400" step="1" required> seconds</label><p>0 disables sampling. Samples remain unreviewed: a quiet scene can contain a stationary bird. Default 300 seconds.</p></div>'''
@@ -48,6 +49,7 @@ MOTION_SETTINGS = '''<div class="field"><label><input id="hub-motion-gate" type=
 MOTION_SCRIPT = '''
 function motionControls(){const p=S.health?.pipeline?.settings;if(!p)return;const s=S.health.motion_services?.[S.camera]||{},b=s.background_calibration||{};if(!S.settingsDirty){$('hub-motion-gate').checked=p.motion_triggered??true;$('motion-threshold').value=p.motion_threshold??20;$('motion-area').value=p.motion_minimum_area??100;$('empty-interval').value=p.empty_sample_seconds??300}
  $('background-state').textContent=`${b.phase||'Waiting for camera'}${b.phase==='learning'?` · ${b.learning_samples||0}/${b.required_samples||5} frames`:''} · ${(b.reason||'Enable automatic capture to initialize').replaceAll('_',' ')}`;
+ const d=b.diagnostics||{};$('background-detail').textContent=[b.phase==='learning'?`Attempt ${b.learning_attempts||0}/${b.maximum_learning_samples||15}`:'',d.variable_fraction!=null?`Variable area ${(100*d.variable_fraction).toFixed(1)}% (limit ${(100*d.allowed_variable_fraction).toFixed(0)}%)`:'',d.exposure_span!=null?`Brightness span ${d.exposure_span.toFixed(1)} (limit ${d.allowed_exposure_span})`:'',d.largest_compact_change_pixels?`Moving foreground ${d.largest_compact_change_pixels} pixels`:''].filter(Boolean).join(' · ');
  $('learn-empty').disabled=!s.running||b.phase==='learning'||S.streaming;$('reset-background').disabled=!s.running||S.streaming;
 }
 const previousSelectCamera=selectCamera;selectCamera=async function(id){$('confirm-empty').checked=false;return previousSelectCamera(id)};
