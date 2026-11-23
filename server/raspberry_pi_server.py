@@ -10,6 +10,7 @@ import shutil
 import os
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -43,6 +44,8 @@ try:
     from .fleet_monitor import FleetMonitor, register_fleet_routes
     from .hub_clock import HubClock, step_system_clock
     from .run_log import HubStatusLogger, RunLog
+    from .fleet_stats import KEEP_SECONDS as FLEET_KEEP_SECONDS, FleetStats, visit_totals
+    from .hub_specs import camera_specs, hub_specs
 except ImportError:  # Direct execution: python server/raspberry_pi_server.py
     from bird_inference import (
         BirdInferenceEngine,
@@ -68,6 +71,8 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
     from fleet_monitor import FleetMonitor, register_fleet_routes
     from hub_clock import HubClock, step_system_clock
     from run_log import HubStatusLogger, RunLog
+    from fleet_stats import KEEP_SECONDS as FLEET_KEEP_SECONDS, FleetStats, visit_totals
+    from hub_specs import camera_specs, hub_specs
 
 
 DEFAULT_SAVE_DIR = Path.home() / "bird_images"
@@ -325,6 +330,7 @@ def create_app(
     collection_mode: bool = False,
     deployment_id: str = "",
     visit_tracker: Any | None = None,
+    static_box_filter: bool = True,
 ) -> Flask:
     """Create the receiver/classifier app, with optional ESP32 camera controls."""
     app = Flask(__name__)
@@ -335,6 +341,23 @@ def create_app(
     app.config["UNIFIED_DASHBOARD"] = lambda: collection_page()
     app.config["MAX_CONTENT_LENGTH"] = MAX_JPEG_BYTES
     store = CaptureStore(save_dir)
+    hub_started = time.time()
+    fleet_stats = FleetStats(store.root / "fleet_stats.json")
+    last_capture_record: dict[str, dict[str, Any]] = {}  # per camera, for the specs view
+
+    def count_frame(destination: Path, capture: dict[str, Any] | None, inference: dict[str, Any] | None) -> None:
+        """Tally a saved frame for the Fleet tab; never let counting cost a capture."""
+        try:
+            record = capture
+            if record is None:
+                record = json.loads(destination.with_suffix(".json").read_text(encoding="utf-8"))
+            camera = record.get("camera_registry_id") or record.get("camera_id") or "unregistered"
+            if capture is not None and capture.get("source") != "background_calibration":
+                last_capture_record[str(camera)] = capture
+            fleet_stats.observe(str(camera), record.get("capture_id") or destination.stem, inference)
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
         from .hub_settings import HubSettings
     except ImportError:
@@ -576,6 +599,7 @@ def create_app(
             destination = pending.get()
             try:
                 classification, classification_error, inference = run_classifier(destination)
+                count_frame(destination, None, inference)
                 with state_lock:
                     if latest["path"] == destination:
                         latest["classification"] = classification
@@ -601,6 +625,7 @@ def create_app(
         capture: dict[str, Any],
         inference: dict[str, Any],
     ) -> None:
+        count_frame(destination, capture, inference)
         classification, _ = validate_classification(inference.get("classification"))
         with state_lock:
             if latest["path"] is not None and destination.stem < latest["path"].stem:
@@ -653,6 +678,7 @@ def create_app(
             motion_triggered=hub_settings.value['motion_triggered'],
             empty_sample_seconds=hub_settings.value['empty_sample_seconds'],
             **({"visit_tracker": visit_tracker} if visit_tracker is not None else {}),
+            **({"static_box_filter": False} if not static_box_filter else {}),
         )
         service.start()
         motion_services[camera["id"]] = service
@@ -1054,6 +1080,7 @@ def create_app(
             },
         )
         destination = store.root / record["filename"]
+        count_frame(destination, record, None)
         deferred = request.headers.get(CLASSIFICATION_HEADER, "").strip().lower() == "deferred"
         if deferred:
             with state_lock:
@@ -1080,6 +1107,7 @@ def create_app(
                 202,
             )
         classification, classification_error, inference = run_classifier(destination)
+        count_frame(destination, record, inference)
 
         # Classification is returned in live state/API. The immutable capture sidecar
         # records acquisition facts; inference systems can write their own versioned output.
@@ -1106,6 +1134,35 @@ def create_app(
         if path is None or not path.exists():
             return jsonify(error="No image has been uploaded yet."), 404
         return send_file(path, mimetype="image/jpeg", max_age=0)
+
+    visit_index: dict[str, Any] = {"key": None, "visits": {}}
+    visit_index_lock = threading.Lock()
+    visit_fields = ("visit_id", "captures", "species_frames", "start", "end", "duration_seconds", "result")
+
+    def closed_visits() -> dict[str, dict[str, Any]]:
+        """Closed visits from visits.jsonl, keyed by visit_id (re-read only when the file changes)."""
+        path = store.root / "visits.jsonl"
+        try:
+            stat = path.stat()
+        except OSError:
+            return {}
+        key = (stat.st_mtime_ns, stat.st_size)
+        with visit_index_lock:
+            if visit_index["key"] != key:
+                visits: dict[str, dict[str, Any]] = {}
+                try:
+                    with path.open("r", encoding="utf-8") as handle:
+                        for line in handle:
+                            try:
+                                record = json.loads(line)
+                            except ValueError:
+                                continue
+                            if isinstance(record, dict) and isinstance(record.get("visit_id"), str):
+                                visits[record["visit_id"]] = {k: record.get(k) for k in visit_fields}
+                except OSError:
+                    return {}
+                visit_index.update(key=key, visits=visits)
+            return visit_index["visits"]
 
     def capture_summary(path: Path) -> dict[str, Any]:
         sidecar_path = path.with_suffix(".json")
@@ -1144,6 +1201,8 @@ def create_app(
             "inference": inference,
             "review": review,
             "motion": motion,
+            "visit_result": closed_visits().get(
+                ((inference or {}).get("visit") or {}).get("visit_id") or ""),
             "image_url": f"/api/captures/{path.stem}/image",
             "metadata_url": f"/api/captures/{path.stem}/metadata",
             "inference_url": f"/api/captures/{path.stem}/inference",
@@ -1366,6 +1425,130 @@ def create_app(
             return jsonify(error="Motion record not found."), 404
         return jsonify(value) if isinstance(value, dict) else (jsonify(error="Invalid motion record."), 500)
 
+    def hub_local_midnight(now: float) -> float:
+        local = time.localtime(now)
+        return time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1))
+
+    def cpu_temperature() -> float | None:
+        try:
+            return round(int(Path("/sys/class/thermal/thermal_zone0/temp").read_text().strip()) / 1000, 1)
+        except (OSError, ValueError):
+            return None
+
+    @app.get("/api/hub/specs")
+    def specs() -> Response:
+        """Hub and camera hardware/software facts for the Fleet tab's Specs section."""
+        heartbeats = {item.get("camera_id"): item.get("last_heartbeat") for item in fleet.summary()}
+        cameras = []
+        for camera in registry.snapshot():
+            sidecar = last_capture_record.get(camera["id"])
+            if sidecar is None:
+                path = latest_camera_capture(camera["id"])
+                if path is not None:
+                    try:
+                        sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+                        last_capture_record[camera["id"]] = sidecar
+                    except (OSError, ValueError):
+                        sidecar = None
+            heartbeat = heartbeats.get(camera.get("hardware_camera_id") or (sidecar or {}).get("camera_id"))
+            cameras.append(camera_specs(camera, heartbeat, sidecar))
+        return jsonify(hub=hub_specs(store.root, models=inference_engine.describe() if inference_engine else None,
+                                     clock=hub_clock.state(), started_at=hub_started), cameras=cameras)
+
+    @app.get("/api/hub/fleet")
+    def fleet_status() -> Response:
+        """Per-camera health and today's counts for the Fleet tab (no capture-folder scan)."""
+        now = time.time()
+        try:
+            since = float(request.args.get("since", ""))
+            if not math.isfinite(since) or since > now:
+                raise ValueError
+        except ValueError:
+            since = hub_local_midnight(now)
+        since = max(since, now - FLEET_KEEP_SECONDS)
+        cameras = registry.snapshot()
+        with runtime_lock:
+            services = {camera_id: service.describe() for camera_id, service in motion_services.items()}
+        heartbeats = {item.get("camera_id"): item for item in fleet.summary()}
+        hardware_to_camera = {s.get("camera_id"): camera_id for camera_id, s in services.items() if s.get("camera_id")}
+        hardware_to_camera.update({c["hardware_camera_id"]: c["id"] for c in cameras if c.get("hardware_camera_id")})
+        totals = fleet_stats.totals(since)
+        visits = visit_totals(closed_visits().values(), since, lambda hardware: hardware_to_camera.get(hardware, hardware))
+        settings = hub_settings.snapshot()
+
+        def capture_state(camera: dict[str, Any], service: dict[str, Any]) -> str:
+            if camera.get("streaming"):
+                return "framing"
+            if service.get("last_capture_error") or service.get("last_analysis_error") or service.get("last_error"):
+                return "error"
+            if service.get("running"):
+                return "capturing"
+            if settings.get("capture_enabled") is False:
+                return "hub_paused"
+            return "paused"
+
+        def row(camera_id: str, camera: dict[str, Any] | None) -> dict[str, Any]:
+            camera = camera or {}
+            service = services.get(camera_id, {})
+            heartbeat = heartbeats.get(camera.get("hardware_camera_id") or service.get("camera_id"))
+            counts = totals.get(camera_id, {})
+            visit = visits.get(camera_id, {})
+            return {
+                "id": camera_id,
+                "name": camera.get("name") or camera_id,
+                "registered": bool(camera),
+                "url": camera.get("url"),
+                "sensor": (camera.get("sensor") or {}).get("model") or (camera.get("status") or {}).get("camera_model"),
+                "heartbeat": ({key: heartbeat.get(key) for key in (
+                    "status", "seconds_since_seen", "restarts_24h", "bad_restarts_24h", "crashes_24h", "ip")}
+                    if heartbeat else None),
+                "capture": capture_state(camera, service) if camera else "removed",
+                "last_capture_at": service.get("last_capture_at") or service.get("last_completed_at"),
+                "frames": counts.get("frames", 0),
+                "analysed": counts.get("analysed", 0),
+                "bird_frames": counts.get("bird_frames", 0),
+                "analysis_errors": counts.get("errors", 0),
+                "top_species": [{"label": label, "frames": n} for label, n in counts.get("labels", [])],
+                "mean_processing_ms": counts.get("mean_processing_ms"),
+                "visits": visit.get("visits", 0),
+                "visits_auto": visit.get("auto", 0),
+                "visits_review": visit.get("review", 0),
+                "failures_since_start": service.get("failures", 0),
+                "waiting": service.get("inference_waiting", 0),
+                "last_error": (service.get("last_capture_error") or service.get("last_analysis_error")
+                               or service.get("last_error")),
+            }
+
+        rows = [row(camera["id"], camera) for camera in cameras]
+        known = {camera["id"] for camera in cameras}
+        rows += [row(camera_id, None) for camera_id in sorted(set(totals) | set(visits)) if camera_id not in known]
+        models = inference_engine.describe() if inference_engine is not None else {}
+        disk = shutil.disk_usage(store.root)
+        try:
+            load = round(os.getloadavg()[0], 2)
+        except (AttributeError, OSError):
+            load = None
+        return jsonify(
+            since=since,
+            generated_at=now,
+            counted_since=fleet_stats.earliest(),
+            cameras=rows,
+            hub={
+                "storage_free_bytes": disk.free,
+                "storage_total_bytes": disk.total,
+                "uptime_seconds": round(now - hub_started),
+                "queue": pending.unfinished_tasks + sum(s.get("inference_waiting", 0) for s in services.values()),
+                "models": {"bird": bool(models.get("detector") or models.get("is_bird")),
+                           "localizer": bool(models.get("localizer")),
+                           "species": bool(models.get("species"))},
+                "capture_enabled": settings.get("capture_enabled", True),
+                "collection_mode": settings.get("collection_mode"),
+                "clock": hub_clock.state(),
+                "load_1m": load,
+                "cpu_temperature_c": cpu_temperature(),
+            },
+        )
+
     @app.get("/health")
     def health() -> Response:
         with state_lock:
@@ -1453,6 +1636,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visit-gap-seconds", type=float, default=120.0,
                         help="Captures from one camera closer than this form one visit (default: 120)")
     parser.add_argument("--no-visits", action="store_true", help="Do not track visits or write visits.jsonl")
+    parser.add_argument("--no-static-box-filter", action="store_true",
+                        help="Classify every localiser box, even ones that also appear on empty frames "
+                        "(scenery such as a shrub or the feeder tube); see server/static_boxes.py")
     parser.add_argument(
         "--species-model",
         type=Path,
@@ -1576,6 +1762,7 @@ if __name__ == "__main__":
         collection_mode=args.collection_mode,
         deployment_id=args.deployment_id,
         visit_tracker=visit_tracker,
+        static_box_filter=not args.no_static_box_filter,
     )
     try:
         from .hub_advertiser import start_hub_advertiser

@@ -10,12 +10,21 @@ Confirmation can come from either:
   as the backwards-compatible default when ``--annotations`` is not supplied.
 
 The annotation CSV locates images, while each same-stem capture JSON supplies
-the original metadata and optional SHA-256. Both files are copied or moved.
+the original metadata and optional SHA-256. Both files are copied or moved, together
+with any hub sidecars of the same capture (``.inference.json``, ``.motion.json`` and
+``.review.json``): the model output and motion record stay with the image they describe.
+
+With ``--update-dataset`` (annotation mode), the copied samples' annotation rows are
+merged into the destination's ``bird_annotations.csv`` (a sample's rows replace any
+older rows for it; paths are rewritten to the destination) and its inventory
+``ESP32Cam_confirmed_manifest.csv`` is updated. Both files are backed up first under
+``_manifest_backups/<UTC time>_copy_confirmed``.
 
 Usage (Windows):
     python copy_confirmed.py C:\\Users\\Joe\\Pictures\\ESP32Cam E:\\ESP32Cam_confirmed --annotations --dry-run
     python copy_confirmed.py C:\\Users\\Joe\\Pictures\\ESP32Cam E:\\ESP32Cam_confirmed --annotations --move --verify
     python copy_confirmed.py C:\\ESP32Cam E:\\ESP32Cam_confirmed --manual-labels
+    python copy_confirmed.py D:\\Datasets\\ESP32Cam_deployments\\run1\\bird_images D:\\Datasets\\ESP32Cam_confirmed --annotations D:\\Datasets\\ESP32Cam_deployments\\run1\\bird_images\\bird_annotations.csv --move --verify --update-dataset
 
 Options:
     --annotations [CSV]  use the detector annotation CSV; without a value, use
@@ -24,6 +33,8 @@ Options:
     --dry-run            list what robocopy would do, copy or move nothing
     --verify             re-hash destination images after the copy/move
     --move               delete source files after a successful copy (robocopy /MOV)
+    --update-dataset     merge the copied samples' rows into DEST's bird_annotations.csv
+                         and ESP32Cam_confirmed_manifest.csv (annotation mode only)
 """
 
 from __future__ import annotations
@@ -32,10 +43,14 @@ import argparse
 import csv
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
@@ -44,6 +59,16 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".
 CONFIRMED_REVIEW_STATES = frozenset({"boxed", "no_bird"})
 DEFAULT_ANNOTATIONS = Path(__file__).with_name("bird_annotations.csv")
 MAX_ARG_CHARS = 20000
+# Hub sidecars written next to a capture since Nov 2026; they travel with the image.
+COMPANION_SUFFIXES = (".inference.json", ".motion.json", ".review.json")
+# Hub files that are JSON but not capture sidecars.
+NON_CAPTURE_JSON = frozenset({"manifest.json", "hub_settings.json", "camera_registry.json"})
+DATASET_ANNOTATIONS = "bird_annotations.csv"
+DATASET_INVENTORY = "ESP32Cam_confirmed_manifest.csv"
+INVENTORY_FIELDS = (
+    "sample_id", "image_filename", "sidecar_filename", "image_sha256", "sidecar_sha256", "image_bytes",
+    "width_px", "height_px", "review_state", "annotation_rows", "box_count", "species_names",
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +76,8 @@ class ConfirmedCapture:
     image_path: Path
     sidecar_path: Path
     expected_sha256: str
+    companions: tuple[Path, ...] = ()
+    sample_id: str = ""
 
 
 @dataclass
@@ -65,6 +92,8 @@ class DiscoveryResult:
     annotation_rows: int = 0
     duplicate_annotation_rows: int = 0
     ignored_annotation_rows: int = 0
+    rows_by_sample: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    annotation_fields: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -106,6 +135,21 @@ def read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("the JSON root must be an object")
     return value
+
+
+def is_companion_json(path: Path) -> bool:
+    """True for hub sidecars such as ``capture_x.inference.json`` (not capture metadata)."""
+    return path.name.casefold().endswith(COMPANION_SUFFIXES)
+
+
+def companion_files(image_path: Path) -> tuple[Path, ...]:
+    """The hub sidecars that exist beside ``image_path`` (same capture stem)."""
+    found = []
+    for suffix in COMPANION_SUFFIXES:
+        path = image_path.with_name(image_path.stem + suffix)
+        if path.is_file():
+            found.append(path)
+    return tuple(found)
 
 
 def has_manual_label(data: dict[str, Any]) -> bool:
@@ -221,6 +265,7 @@ def discover_confirmed_from_annotations(
         reader = csv.DictReader(input_file)
         if reader.fieldnames is None:
             raise ValueError(f"Annotation CSV has no header: {annotations}")
+        result.annotation_fields = list(reader.fieldnames)
         required = {"sample_id", "review_state", "image_path", "relative_path"}
         missing = sorted(required.difference(reader.fieldnames))
         if missing:
@@ -239,6 +284,7 @@ def discover_confirmed_from_annotations(
             if not sample_id:
                 raise ValueError(f"{annotations}:{line_number}: missing sample_id")
             key = sample_id.casefold()
+            result.rows_by_sample.setdefault(key, []).append(dict(row))
             identity = (
                 (row.get("relative_path") or "").strip().casefold(),
                 (row.get("image_path") or "").strip().casefold(),
@@ -287,6 +333,8 @@ def discover_confirmed_from_annotations(
                     image_path=image_path,
                     sidecar_path=sidecar_path,
                     expected_sha256=expected_sha256.strip().casefold(),
+                    companions=companion_files(image_path),
+                    sample_id=sample_id,
                 )
             )
 
@@ -404,7 +452,7 @@ def discover_confirmed(source_root: Path, excluded_root: Path | None = None) -> 
     for sidecar_path in sidecars:
         if excluded_root is not None and is_within(sidecar_path, excluded_root):
             continue
-        if sidecar_path.name.casefold() == "manifest.json":
+        if sidecar_path.name.casefold() in NON_CAPTURE_JSON or is_companion_json(sidecar_path):
             continue
 
         result.sidecars_scanned += 1
@@ -431,9 +479,127 @@ def discover_confirmed(source_root: Path, excluded_root: Path | None = None) -> 
                 image_path=image_path,
                 sidecar_path=sidecar_path,
                 expected_sha256=expected_sha256.strip().lower(),
+                companions=companion_files(image_path),
+                sample_id=image_path.stem,
             )
         )
     return result
+
+
+@dataclass(frozen=True)
+class DatasetUpdate:
+    samples: int
+    rows_written: int
+    rows_replaced: int
+    inventory_rows: int
+    dropped_columns: tuple[str, ...]
+    backup_dir: Path | None
+
+
+def _row_order(row: Mapping[str, str]) -> tuple[str, int, str]:
+    box = (row.get("box_id") or "").strip()
+    return ((row.get("sample_id") or "").casefold(), int(box) if box.isdigit() else -1,
+            row.get("annotation_id") or "")
+
+
+def _read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return list(reader.fieldnames or []), [dict(row) for row in reader]
+
+
+def _write_csv_atomic(path: Path, fields: Iterable[str], rows: Iterable[Mapping[str, str]]) -> None:
+    """Write a UTF-8-with-BOM, LF-terminated CSV (the dataset's format) by atomic replace."""
+    fields = list(fields)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fields, extrasaction="ignore", lineterminator="\n")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({name: row.get(name, "") for name in fields})
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def inventory_row(sample_id: str, image: Path, sidecar: Path, rows: list[dict[str, str]]) -> dict[str, str]:
+    """One ESP32Cam_confirmed_manifest.csv row for a capture already at its destination."""
+    boxed = [row for row in rows if (row.get("xmin") or "").strip()]
+    states = {(row.get("review_state") or "").strip() for row in rows}
+    species = sorted({(row.get("species_name") or "").strip() for row in boxed} - {""})
+    first = rows[0] if rows else {}
+    return {
+        "sample_id": sample_id, "image_filename": image.name, "sidecar_filename": sidecar.name,
+        "image_sha256": sha256_of(image), "sidecar_sha256": sha256_of(sidecar),
+        "image_bytes": str(image.stat().st_size),
+        "width_px": first.get("width_px", ""), "height_px": first.get("height_px", ""),
+        "review_state": "boxed" if "boxed" in states else "no_bird",
+        "annotation_rows": str(len(rows)), "box_count": str(len(boxed)), "species_names": "|".join(species),
+    }
+
+
+def update_dataset(
+    dest_root: Path,
+    source_root: Path,
+    discovery: DiscoveryResult,
+    *,
+    dry_run: bool = False,
+    now: datetime | None = None,
+) -> DatasetUpdate:
+    """Merge the copied samples' annotation rows and inventory rows into the destination dataset.
+
+    A sample's rows replace every older row with the same ``sample_id`` (relabelling wins).
+    ``image_path`` and ``relative_path`` are rewritten to the destination. Rows are kept
+    sorted by sample, then box. The previous CSVs are backed up before anything is written.
+    """
+    dest_root = Path(dest_root)
+    annotations_path = dest_root / DATASET_ANNOTATIONS
+    inventory_path = dest_root / DATASET_INVENTORY
+    copied: dict[str, tuple[ConfirmedCapture, Path, Path]] = {}
+    for capture in discovery.captures:
+        relative_dir = capture.image_path.parent.relative_to(source_root)
+        image = dest_root / relative_dir / capture.image_path.name
+        sidecar = dest_root / relative_dir / capture.sidecar_path.name
+        if not dry_run and not (image.is_file() and sidecar.is_file()):
+            raise FileNotFoundError(f"Copied capture is not at the destination: {image}")
+        copied[(capture.sample_id or capture.image_path.stem).casefold()] = (capture, image, sidecar)
+
+    existing_fields, existing_rows = (_read_csv(annotations_path) if annotations_path.is_file()
+                                      else (list(discovery.annotation_fields), []))
+    fields = existing_fields or list(discovery.annotation_fields)
+    dropped = tuple(name for name in discovery.annotation_fields if name not in fields)
+    new_rows: list[dict[str, str]] = []
+    for key, (capture, image, _sidecar) in copied.items():
+        relative = image.relative_to(dest_root).as_posix()
+        for row in discovery.rows_by_sample.get(key, []):
+            new_rows.append({**row, "image_path": str(image), "relative_path": relative})
+    kept = [row for row in existing_rows if (row.get("sample_id") or "").casefold() not in copied]
+    merged = sorted(kept + new_rows, key=_row_order)
+
+    inventory_fields, inventory = (_read_csv(inventory_path) if inventory_path.is_file()
+                                   else (list(INVENTORY_FIELDS), []))
+    inventory_fields = inventory_fields or list(INVENTORY_FIELDS)
+    inventory = [row for row in inventory if (row.get("sample_id") or "").casefold() not in copied]
+    backup_dir = None
+    if not dry_run:
+        for key, (capture, image, sidecar) in copied.items():
+            rows = [row for row in new_rows if (row.get("sample_id") or "").casefold() == key]
+            inventory.append(inventory_row(capture.sample_id or image.stem, image, sidecar, rows))
+        stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+        backup_dir = dest_root / "_manifest_backups" / f"{stamp}_copy_confirmed"
+        for path in (annotations_path, inventory_path):
+            if path.is_file():
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, backup_dir / path.name)
+        _write_csv_atomic(annotations_path, fields, merged)
+        _write_csv_atomic(inventory_path, inventory_fields,
+                          sorted(inventory, key=lambda row: (row.get("sample_id") or "").casefold()))
+    return DatasetUpdate(
+        samples=len(copied), rows_written=len(new_rows), rows_replaced=len(existing_rows) - len(kept),
+        inventory_rows=len(inventory), dropped_columns=dropped, backup_dir=backup_dir,
+    )
 
 
 def main() -> None:
@@ -462,7 +628,14 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--move", action="store_true")
+    parser.add_argument(
+        "--update-dataset",
+        action="store_true",
+        help="merge the copied samples into DEST's bird_annotations.csv and ESP32Cam_confirmed_manifest.csv",
+    )
     args = parser.parse_args()
+    if args.update_dataset and args.annotations is None:
+        sys.exit("--update-dataset needs --annotations: the rows come from the annotation CSV.")
 
     source_root = Path(args.source).expanduser().resolve()
     dest_root = Path(args.dest).expanduser().resolve()
@@ -511,16 +684,32 @@ def main() -> None:
     # Group files by (source dir, destination dir) so each robocopy call covers one folder.
     groups: dict[tuple[Path, Path], list[str]] = defaultdict(list)
     copied_images: list[tuple[Path, str]] = []
+    copied_companions: list[Path] = []
     for capture in confirmed:
         relative_dir = capture.sidecar_path.parent.relative_to(source_root)
         dest_dir = dest_root / relative_dir
         groups[(capture.image_path.parent, dest_dir)].append(capture.image_path.name)
         groups[(capture.sidecar_path.parent, dest_dir)].append(capture.sidecar_path.name)
+        for companion in capture.companions:
+            groups[(companion.parent, dest_dir)].append(companion.name)
+            copied_companions.append(dest_dir / companion.name)
 
         expected_sha256 = capture.expected_sha256
         if args.verify and not expected_sha256:
             expected_sha256 = sha256_of(capture.image_path)
         copied_images.append((dest_dir / capture.image_path.name, expected_sha256))
+
+    # The same capture ID with different image bytes is a conflict, never an overwrite.
+    conflicts = [
+        destination for destination, _expected in copied_images
+        if destination.is_file()
+        and sha256_of(destination) != sha256_of(next(c.image_path for c in confirmed
+                                                     if c.image_path.name == destination.name))
+    ]
+    if conflicts:
+        for path in conflicts[:20]:
+            print(f"!! destination already holds a different image with this name: {path}")
+        sys.exit(f"{len(conflicts)} capture ID conflict(s); nothing was copied. Resolve them first.")
 
     failed = False
     for (src_dir, dest_dir), names in groups.items():
@@ -542,6 +731,7 @@ def main() -> None:
     print("\n--- Summary ---")
     print(f"Confirmed pairs:       {len(confirmed)}")
     print(f"Images queued:         {len(copied_images)}")
+    print(f"Hub sidecars queued:   {len(copied_companions)}  (.inference/.motion/.review.json)")
     print(f"Missing images:        {len(discovery.missing_images)}")
     print(f"Missing sidecars:      {len(discovery.missing_sidecars)}")
     print(f"Invalid sidecars:      {discovery.invalid_sidecars}")
@@ -553,6 +743,10 @@ def main() -> None:
         print(f"  invalid sidecar: {path}")
 
     if args.dry_run:
+        if args.update_dataset:
+            plan = update_dataset(dest_root, source_root, discovery, dry_run=True)
+            print(f"Dataset update (dry run): {plan.samples} samples, {plan.rows_written} rows "
+                  f"({plan.rows_replaced} older rows would be replaced) into {dest_root / DATASET_ANNOTATIONS}")
         print("\nDry run only - nothing was copied.")
         if failed:
             sys.exit(1)
@@ -567,11 +761,27 @@ def main() -> None:
             elif sha256_of(path) != expected:
                 bad += 1
                 print(f"  hash mismatch:      {path}")
-        print(f"Verification:          {len(copied_images) - bad} ok, {bad} bad")
-        failed = failed or bad > 0
+        missing_companions = [path for path in copied_companions if not path.is_file()]
+        for path in missing_companions[:20]:
+            print(f"  hub sidecar not at destination: {path}")
+        print(f"Verification:          {len(copied_images) - bad} ok, {bad} bad, "
+              f"{len(missing_companions)} hub sidecars missing")
+        failed = failed or bad > 0 or bool(missing_companions)
 
     if failed:
         sys.exit(1)
+
+    if args.update_dataset:
+        try:
+            update = update_dataset(dest_root, source_root, discovery)
+        except (OSError, ValueError) as error:
+            sys.exit(f"Files were copied, but the dataset CSVs were not updated: {error}")
+        print(f"Dataset updated:       {update.samples} samples, {update.rows_written} annotation rows "
+              f"({update.rows_replaced} older rows replaced); inventory now {update.inventory_rows} rows")
+        if update.dropped_columns:
+            print(f"  columns not in the dataset CSV were dropped: {', '.join(update.dropped_columns)}")
+        if update.backup_dir is not None:
+            print(f"  previous CSVs backed up to {update.backup_dir}")
 
 
 if __name__ == "__main__":

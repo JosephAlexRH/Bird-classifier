@@ -32,10 +32,13 @@ try:
     from .motion_crop import (
         MotionConfig,
         RunningMedianBackground,
+        final_crop_bounds,
+        normalized_roi_bounds,
         rgb_to_gray,
         select_motion_crop,
         should_admit_background,
     )
+    from .static_boxes import DEFAULT_REFERENCE_INTERVAL_SECONDS, StaticBoxMemory
 except ImportError:  # Direct execution support.
     from bird_inference import (
         LETTERBOX_GEOMETRY,
@@ -54,10 +57,13 @@ except ImportError:  # Direct execution support.
     from motion_crop import (
         MotionConfig,
         RunningMedianBackground,
+        final_crop_bounds,
+        normalized_roi_bounds,
         rgb_to_gray,
         select_motion_crop,
         should_admit_background,
     )
+    from static_boxes import DEFAULT_REFERENCE_INTERVAL_SECONDS, StaticBoxMemory
 
 
 FetchFrame = Callable[..., tuple[bytes, str | None]]
@@ -111,6 +117,8 @@ class MotionService:
         motion_triggered: bool = False,
         empty_sample_seconds: float = 0,
         visit_tracker: "VisitTracker | None" = None,
+        static_box_filter: bool = True,
+        empty_reference_seconds: float = DEFAULT_REFERENCE_INTERVAL_SECONDS,
     ) -> None:
         if poll_seconds <= 0 or timeout_seconds <= 0:
             raise ValueError("Motion polling interval and timeout must be positive")
@@ -118,6 +126,9 @@ class MotionService:
         self.store = store
         self.engine = inference_engine
         self.visit_tracker = visit_tracker
+        # Where the localiser fires on confidently empty frames (scenery); see static_boxes.py.
+        self.static_boxes = StaticBoxMemory() if static_box_filter else None
+        self.empty_reference_seconds = float(empty_reference_seconds)
         self.poll_seconds = float(poll_seconds)
         self.timeout_seconds = float(timeout_seconds)
         self.config = config
@@ -170,7 +181,8 @@ class MotionService:
         )
         return getattr(contract, "geometry", LETTERBOX_GEOMETRY)
 
-    def _infer(self, path: Path, static_roi: Any, motion: dict[str, Any]) -> dict[str, Any]:
+    def _infer(self, path: Path, static_roi: Any, motion: dict[str, Any],
+               frame_shape: tuple[int, ...] | None = None) -> dict[str, Any]:
         if not self.detector_enabled:
             return {"status": "skipped", "reason": "analysis_disabled", "is_bird": None,
                     "bird_probability": None, "classification": None,
@@ -184,8 +196,23 @@ class MotionService:
                 "selected_crop": {key: bounds[key] for key in ("left", "top", "right", "bottom")},
                 "crop_source": SELECTED_CROP_SOURCE,
             }
+            if self.static_boxes is not None and getattr(self.engine, "supports_static_boxes", False):
+                camera = self.camera_id or ""
+                memory = self.static_boxes
+                kwargs["box_filter"] = lambda detections: memory.annotate(camera, detections)
+                if frame_shape is not None and memory.due(camera, self.empty_reference_seconds):
+                    height, width = int(frame_shape[0]), int(frame_shape[1])
+                    reference = final_crop_bounds(
+                        normalized_roi_bounds(static_roi, width, height), width, height,
+                        margin_fraction=self.config.margin_fraction, minimum_size=self.config.minimum_crop_size)
+                    kwargs["empty_reference_crop"] = dict(zip(("left", "top", "right", "bottom"), reference))
         with self.inference_lock:
-            return self.engine.infer(path, **kwargs)
+            result = self.engine.infer(path, **kwargs)
+        localizer = result.get("localizer") if isinstance(result, dict) else None
+        if (self.static_boxes is not None and isinstance(localizer, dict)
+                and localizer.get("role") == "empty_reference" and result.get("status") == "complete"):
+            self.static_boxes.remember(self.camera_id or "", localizer.get("detections") or [])
+        return result
 
     def process_once(self, captured: tuple | None = None) -> dict[str, Any]:
         with self._process_lock:
@@ -241,6 +268,8 @@ class MotionService:
                 cache_path=self.store.root / 'backgrounds' / key / 'reference.npz')
             self.camera_id, self.boot_id = camera_id, boot_id
             self.scene_signature = None
+            if self.static_boxes is not None:
+                self.static_boxes.clear()
 
         temporary_path: Path | None = None
         try:
@@ -259,6 +288,8 @@ class MotionService:
                 camera_id, boot_id, gray.shape,
                 json.dumps(static_roi, sort_keys=True, separators=(",", ":")), config_hash,
             )
+            if self.static_boxes is not None and self.scene_signature not in (None, signature):
+                self.static_boxes.clear()  # camera settings or ROI changed: the scenery boxes are stale
             self.background.configure_scene(signature)
             self.scene_signature = signature
             if self.background.phase == 'learning':
@@ -320,7 +351,7 @@ class MotionService:
                     inference = {'status': 'skipped', 'reason': 'no_motion' if quiet else 'scene_change',
                                  'is_bird': None, 'bird_probability': None}
                 else:
-                    inference = self._infer(temporary_path, static_roi, motion)
+                    inference = self._infer(temporary_path, static_roi, motion, frame_shape=gray.shape)
             except Exception as error:
                 inference = {
                     "schema_version": INFERENCE_SCHEMA_VERSION,

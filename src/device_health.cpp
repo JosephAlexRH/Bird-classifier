@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <esp_arduino_version.h>
 #include <esp_core_dump.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
@@ -326,6 +327,25 @@ String deviceHealthJson() {
   doc["ip"] = WiFi.localIP().toString();
   doc["uptime_s"] = static_cast<uint32_t>(esp_timer_get_time() / 1000000);
   doc["time_source"] = deviceTimeSource();
+
+  // Fixed facts about the board, for the hub's Specs view. All are cheap reads.
+  JsonObject hardware = doc["hardware"].to<JsonObject>();
+#ifdef ARDUINO_BOARD
+  hardware["board"] = ARDUINO_BOARD;
+#endif
+  hardware["chip_model"] = ESP.getChipModel();
+  hardware["chip_revision"] = ESP.getChipRevision();
+  hardware["cpu_cores"] = ESP.getChipCores();
+  hardware["cpu_mhz"] = ESP.getCpuFreqMHz();
+  hardware["flash_bytes"] = ESP.getFlashChipSize();
+  hardware["psram_bytes"] = ESP.getPsramSize();
+  hardware["mac"] = WiFi.macAddress();
+  hardware["sdk"] = ESP.getSdkVersion();
+  char arduinoCore[16];
+  snprintf(arduinoCore, sizeof(arduinoCore), "%d.%d.%d", ESP_ARDUINO_VERSION_MAJOR,
+           ESP_ARDUINO_VERSION_MINOR, ESP_ARDUINO_VERSION_PATCH);
+  hardware["arduino_core"] = arduinoCore;
+  hardware["firmware_built"] = __DATE__ " " __TIME__;
 
   JsonObject boot = doc["boot"].to<JsonObject>();
   boot["number_since_power_on"] = persistent.bootCount;

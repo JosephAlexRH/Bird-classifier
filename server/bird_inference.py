@@ -34,6 +34,9 @@ ROI_LOCALIZER_CONTRACT_FILENAME = "esp32_detector_contract.json"
 SPECIES_BOX_GEOMETRY = "detector_box_square_context_crop_then_letterbox"
 SPECIES_MAX_BOXES = 5
 DEFAULT_LOCALIZER_MIN_SCORE = 0.05
+# A frame counts as confidently empty (for an empty-scene localiser reference) at or below
+# min(this, half the bird threshold): the same rule that admits frames to the motion background.
+EMPTY_REFERENCE_MAX_PROBABILITY = 0.25
 LETTERBOX_GEOMETRY = "letterbox"
 ROI_CROP_GEOMETRY = "roi_crop_then_letterbox"
 SELECTED_CROP_GEOMETRY = "selected_crop_then_letterbox"
@@ -1263,6 +1266,9 @@ class BirdInferenceEngine:
     overrides both and always uses the probability rule.
     """
 
+    # infer() accepts box_filter / empty_reference_crop (see server/static_boxes.py).
+    supports_static_boxes = True
+
     def __init__(
         self,
         is_bird_model: Path | None,
@@ -1497,7 +1503,8 @@ class BirdInferenceEngine:
         """
         assert self.species is not None and self.species_contract is not None
         height, width = int(rgb.shape[0]), int(rgb.shape[1])
-        usable = sorted((b for b in boxes if float(b.get("score", 0.0)) >= self.species_min_localizer_score),
+        usable = sorted((b for b in boxes if float(b.get("score", 0.0)) >= self.species_min_localizer_score
+                         and not b.get("static")),
                         key=lambda b: -float(b["score"]))
         candidates = [b for b in usable if float(b["score"]) >= box_threshold][:SPECIES_MAX_BOXES] or usable[:1]
         entries: list[dict[str, Any]] = []
@@ -1520,6 +1527,7 @@ class BirdInferenceEngine:
             "box_source": box_source if candidates else "selected_crop_fallback",
             "localised": bool(candidates),
             "box_threshold": float(box_threshold),
+            "static_boxes_skipped": sum(1 for b in boxes if b.get("static")),
             "labels": list(self.labels),
             "boxes": entries,
             "contract": self.species_contract.describe(),
@@ -1534,8 +1542,16 @@ class BirdInferenceEngine:
         roi_source: str | None = None,
         selected_crop: Any | None = None,
         crop_source: str | None = None,
+        box_filter: Callable[[list[dict[str, Any]]], tuple[list[dict[str, Any]], dict[str, Any]]] | None = None,
+        empty_reference_crop: Any | None = None,
     ) -> dict[str, Any]:
         """Infer one capture, optionally using its normalized motion ROI.
+
+        With a localiser and species contract, ``box_filter`` (see ``static_boxes``) may mark
+        localiser boxes ``static`` before species runs; static boxes are never classified.
+        ``empty_reference_crop``: if the frame is confidently empty, also localise this crop
+        and record the boxes under ``localizer`` with role ``empty_reference``, so the caller
+        can learn where the localiser fires on scenery.
 
         Crop-aware is-bird contracts require both keyword arguments.  The species
         model intentionally remains a whole-frame letterbox model: its training
@@ -1779,11 +1795,15 @@ class BirdInferenceEngine:
         species_block = None
         top: list[dict[str, Any]] = []
         species_started = time.perf_counter()
+        static_summary: dict[str, Any] | None = None
+        empty_reference: dict[str, Any] | None = None
         if self.species is not None and self.species_contract is not None and is_bird:
             if self.localizer is not None:
                 localizer_started = time.perf_counter()
                 localizations = self.localizer.localise(rgb, selected_bounds)
                 localizer_ms = (time.perf_counter() - localizer_started) * 1000
+                if box_filter is not None and localizations:
+                    localizations, static_summary = box_filter(localizations)
             species_block, top = self._species_on_boxes(
                 rgb, localizations, selected_bounds, "localizer",
                 self.localizer.deployment_threshold if self.localizer is not None else 1.0)
@@ -1794,6 +1814,17 @@ class BirdInferenceEngine:
                 {"label": self.labels[int(index)], "probability": float(species_scores[int(index)])}
                 for index in order
             ]
+        elif (empty_reference_crop is not None and self.localizer is not None and not is_bird
+              and bird_probability <= min(EMPTY_REFERENCE_MAX_PROBABILITY, 0.5 * self.bird_threshold)):
+            reference = validate_selected_crop(empty_reference_crop, int(rgb.shape[1]), int(rgb.shape[0]))
+            localizer_started = time.perf_counter()
+            empty_reference = {
+                "role": "empty_reference",
+                "crop": dict(zip(("left", "top", "right", "bottom"), (int(v) for v in reference))),
+                "detections": self.localizer.localise(rgb, reference),
+                "model": self.localizer.describe(),
+            }
+            localizer_ms = (time.perf_counter() - localizer_started) * 1000
         species_ms = (time.perf_counter() - species_started) * 1000 - localizer_ms
         result = {
             "schema_version": INFERENCE_SCHEMA_VERSION,
@@ -1855,8 +1886,12 @@ class BirdInferenceEngine:
         }
         if species_block is not None:
             result["species"] = species_block
-            result["localizer"] = {"detections": localizations,
+            result["localizer"] = {"role": "bird_frame", "detections": localizations,
                                    "model": self.localizer.describe() if self.localizer is not None else None}
+            if static_summary is not None:
+                result["localizer"]["static_filter"] = static_summary
+        elif empty_reference is not None:
+            result["localizer"] = empty_reference
         result["classification"] = {
             "is_bird": result["is_bird"],
             "confidence": bird_probability,

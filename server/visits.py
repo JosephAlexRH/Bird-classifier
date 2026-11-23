@@ -27,6 +27,9 @@ from typing import Any, Iterable, Sequence
 
 VISIT_SCHEMA_VERSION = 1
 DEFAULT_GAP_SECONDS = 120.0
+# A visit needs at least this many species-scored frames before it is auto-labelled; a single frame
+# is one look at one box and stays in review. A contract can override it with "min_frames_for_auto".
+DEFAULT_MIN_FRAMES_FOR_AUTO = 2
 LEGACY_CAMERA_KEY = "legacy"
 _CAPTURE_ID = re.compile(r"^capture_(\d{8}T\d{6})_(\d{6})Z_")
 
@@ -104,11 +107,14 @@ def mean_probabilities(rows: Sequence[Sequence[float]]) -> list[float]:
     return [sum(row[k] for row in rows) / len(rows) for k in range(width)]
 
 
-def decide(mean_probs: Sequence[float], labels: Sequence[str], automation: dict[str, Any] | None) -> dict[str, Any]:
+def decide(mean_probs: Sequence[float], labels: Sequence[str], automation: dict[str, Any] | None,
+           n_frames: int | None = None) -> dict[str, Any]:
     """Apply a species contract's automation block to a visit's mean probabilities.
 
     Returns decision "species" (auto-labelled), "group" (auto-labelled to a species group)
-    or "review", plus the top species and top group with their confidences.
+    or "review", plus the top species and top group with their confidences. With ``n_frames``
+    (the number of species-scored frames averaged), a visit with fewer than
+    ``min_frames_for_auto`` frames (default DEFAULT_MIN_FRAMES_FOR_AUTO) is never auto-labelled.
     """
     if not mean_probs:
         return {"decision": "review", "reason": "no_species_scores"}
@@ -128,6 +134,9 @@ def decide(mean_probs: Sequence[float], labels: Sequence[str], automation: dict[
     species_min = automation.get("species_min_confidence")
     group_min = automation.get("group_min_confidence")
     auto_species = set(automation.get("auto_species") or [])
+    min_frames = automation.get("min_frames_for_auto", DEFAULT_MIN_FRAMES_FOR_AUTO)
+    if n_frames is not None and isinstance(min_frames, int) and n_frames < min_frames:
+        return {"decision": "review", "label": None, "reason": "too_few_frames", "species_frames": n_frames, **out}
     if isinstance(species_min, (int, float)) and species in auto_species and confidence >= species_min:
         return {"decision": "species", "label": species, **out}
     if isinstance(group_min, (int, float)) and group_scores[top_group] >= group_min:
@@ -216,7 +225,8 @@ class VisitTracker:
             "captures": len(visit.captures), "capture_ids": visit.captures,
             "species_frames": len(visit.species_rows),
             "species_labels": list(visit.labels or ()), "species_mean_probabilities": mean,
-            "result": decide(mean, list(visit.labels or ()), self.automation) if mean else {"decision": "review", "reason": "no_species_scores"},
+            "result": (decide(mean, list(visit.labels or ()), self.automation, n_frames=len(visit.species_rows))
+                       if mean else {"decision": "review", "reason": "no_species_scores"}),
             "gap_seconds": self.gap_seconds, "source": "live",
         }
 

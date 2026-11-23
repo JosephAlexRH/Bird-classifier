@@ -85,11 +85,14 @@ class ManifestLoaderTests(unittest.TestCase):
         generated = self.directory / "manifests" / "crops"
         generated.mkdir(parents=True)
         Image.new("RGB", (5, 5)).save(generated / "old_crop.jpg")
+        (self.directory / "nested").mkdir()
+        Image.new("RGB", (20, 10)).save(self.directory / "nested" / "second.jpg")
 
         recursive, _ = bbox_data.load_image_directory(self.directory)
         top_level, _ = bbox_data.load_image_directory(self.directory, recursive=False)
 
-        self.assertEqual([item.relative_path for item in recursive], ["capture.jpg", "manifests/crops/old_crop.jpg"])
+        # Hub-derived folders (crops, review_crops, backgrounds) are never captures.
+        self.assertEqual([item.relative_path for item in recursive], ["capture.jpg", "nested/second.jpg"])
         self.assertEqual([item.relative_path for item in top_level], ["capture.jpg"])
 
     def test_generated_inaturalist_csv_retains_only_compact_metadata(self) -> None:

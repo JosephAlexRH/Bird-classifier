@@ -220,8 +220,8 @@ class HubControlTests(unittest.TestCase):
         for route in ('/','/fleet','/legacy'):
             html=self.client.get(route).get_data(as_text=True)
             self.assertIn('<title>Bird hub</title>',html)
-            self.assertIn('id="pane-live"',html)
-            self.assertIn('id="pane-review"',html)
+            self.assertIn('id="pane-cameras"',html)
+            self.assertIn('id="pane-fleet"',html)
             self.assertIn('id="pane-settings"',html)
             self.assertNotIn('legacy dashboard (full config)',html)
         class IDs(HTMLParser):

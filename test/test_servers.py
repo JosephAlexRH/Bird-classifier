@@ -830,16 +830,18 @@ class RaspberryPiServerTests(unittest.TestCase):
     def test_dashboard_has_roi_controls_and_unconfigured_proxy_is_503(self) -> None:
         dashboard = self.client.get("/").get_data(as_text=True)
         self.assertIn("Bird hub", dashboard)
-        self.assertIn("Confirm empty", dashboard)
+        self.assertIn("Birds guessed", dashboard)  # read-only review tab
+        self.assertNotIn("Confirm empty", dashboard)
         dashboard = self.client.get("/legacy").get_data(as_text=True)
         self.assertIn('id="camera-tabs"', dashboard)
         self.assertIn('role="tablist"', dashboard)
         self.assertIn("onboard_motion_detection", dashboard)
         self.assertIn('id="roi-overlay"', dashboard)
         self.assertIn("pointerdown", dashboard)
-        self.assertIn("Load current ROI", dashboard)
-        self.assertIn("Reset full frame", dashboard)
-        self.assertIn("Save ROI", dashboard)
+        for control in ('id="edit-roi"', 'id="reset-roi"', 'id="save-roi"', 'id="load-roi"'):
+            self.assertIn(control, dashboard)
+        self.assertIn("motion_roi", dashboard)
+        self.assertIn("INITIAL_TAB='settings'", dashboard)
         self.assertEqual(self.client.get("/camera/capture").status_code, 503)
         health = self.client.get("/health").get_json()
         self.assertFalse(health["camera_configured"])

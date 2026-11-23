@@ -232,5 +232,67 @@ class EngineSpeciesCropTests(unittest.TestCase):
                 RoiLocalizer(bundle.localizer, interpreter_factory=make_fake())
 
 
+class StaticBoxEngineTests(unittest.TestCase):
+    """The engine skips localiser boxes a box_filter marks static, and records empty-scene references."""
+
+    def test_static_boxes_are_recorded_but_never_classified(self):
+        def all_static(detections):
+            return [{**d, "static": True} for d in detections], {"applied": True, "suppressed": len(detections)}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Bundle(Path(temporary))
+            engine = BirdInferenceEngine(bundle.binary, bundle.species, localizer_model=bundle.localizer,
+                                         interpreter_factory=make_fake())
+            result = engine.infer(bundle.image, box_filter=all_static)
+        species = result["species"]
+        self.assertFalse(species["localised"])
+        self.assertEqual(species["box_source"], "selected_crop_fallback")
+        self.assertEqual(species["static_boxes_skipped"], 1)
+        self.assertEqual(species["boxes"][0]["crop"], {"left": 0, "top": 0, "right": 640, "bottom": 480})
+        self.assertEqual(result["localizer"]["role"], "bird_frame")
+        self.assertTrue(result["localizer"]["detections"][0]["static"])
+        self.assertEqual(result["localizer"]["static_filter"], {"applied": True, "suppressed": 1})
+
+    def test_non_static_boxes_are_classified_as_before(self):
+        def none_static(detections):
+            return [{**d, "static": False} for d in detections], {"applied": True, "suppressed": 0}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Bundle(Path(temporary))
+            engine = BirdInferenceEngine(bundle.binary, bundle.species, localizer_model=bundle.localizer,
+                                         interpreter_factory=make_fake())
+            result = engine.infer(bundle.image, box_filter=none_static)
+        self.assertTrue(result["species"]["localised"])
+        self.assertEqual(result["species"]["static_boxes_skipped"], 0)
+
+    def test_confident_empty_frame_records_an_empty_scene_reference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Bundle(Path(temporary))
+            fake = make_fake(bird=0.1)
+            engine = BirdInferenceEngine(bundle.binary, bundle.species, localizer_model=bundle.localizer,
+                                         interpreter_factory=fake)
+            crop = {"left": 0, "top": 0, "right": 640, "bottom": 480}
+            result = engine.infer(bundle.image, empty_reference_crop=crop)
+        self.assertFalse(result["is_bird"])
+        self.assertNotIn("species", result)
+        self.assertEqual(fake.species_inputs, [])
+        self.assertEqual(result["localizer"]["role"], "empty_reference")
+        self.assertEqual(result["localizer"]["crop"], crop)
+        self.assertEqual(len(result["localizer"]["detections"]), 1)
+        self.assertGreater(result["timing_ms"]["localizer"], 0)
+
+    def test_uncertain_non_bird_and_bird_frames_take_no_empty_reference(self):
+        crop = {"left": 0, "top": 0, "right": 640, "bottom": 480}
+        with tempfile.TemporaryDirectory() as temporary:
+            bundle = Bundle(Path(temporary))
+            uncertain = BirdInferenceEngine(bundle.binary, bundle.species, localizer_model=bundle.localizer,
+                                            interpreter_factory=make_fake(bird=0.4)).infer(
+                bundle.image, empty_reference_crop=crop)
+            bird = BirdInferenceEngine(bundle.binary, bundle.species, localizer_model=bundle.localizer,
+                                       interpreter_factory=make_fake()).infer(bundle.image, empty_reference_crop=crop)
+        self.assertNotIn("localizer", uncertain)  # 0.4 is not confidently empty (limit 0.25)
+        self.assertEqual(bird["localizer"]["role"], "bird_frame")
+
+
 if __name__ == "__main__":
     unittest.main()

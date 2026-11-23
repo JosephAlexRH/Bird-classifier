@@ -60,7 +60,9 @@ def register_pi_bridge(app, config_path: Path, pi_url: str | None = None) -> Non
         # browser's image links to an arbitrary upstream supplied URL.
         query = {key: request.args[key] for key in ("order", "limit", "after", "before", "camera_id", "camera_registry_id")
                  if key in request.args}
-        if endpoint != "/api/captures":
+        if endpoint == "/api/hub/fleet":
+            query = {key: request.args[key] for key in ("since",) if key in request.args}
+        elif endpoint != "/api/captures":
             query = {}
         data = None
         headers = {}
@@ -137,6 +139,14 @@ def register_pi_bridge(app, config_path: Path, pi_url: str | None = None) -> Non
     @app.get("/api/pi/captures")
     def pi_captures():
         return proxy("/api/captures")
+
+    @app.get("/api/pi/hub/specs")
+    def pi_specs():
+        return proxy("/api/hub/specs")
+
+    @app.get("/api/pi/hub/fleet")
+    def pi_fleet():
+        return proxy("/api/hub/fleet")
 
     @app.get("/api/pi/collection/export.csv")
     def pi_export():

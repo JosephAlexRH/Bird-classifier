@@ -5,10 +5,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
 
+from server.bird_inference import SELECTED_CROP_GEOMETRY
 from server.capture_storage import CaptureStore
 from server.motion_crop import MotionConfig
 from server.pi_motion import MotionService
@@ -217,6 +219,54 @@ class PiMotionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "identity mismatch"):
                 service.process_once()
+
+
+class StaticBoxEngine(FakeEngine):
+    supports_static_boxes = True
+    contract = SimpleNamespace(geometry=SELECTED_CROP_GEOMETRY)
+
+
+def detection(left, top, right, bottom, score):
+    return {"box": {"left": left, "top": top, "right": right, "bottom": bottom}, "score": score}
+
+
+class StaticBoxServiceTests(unittest.TestCase):
+    def test_empty_references_feed_the_box_filter_for_later_bird_frames(self):
+        frame = np.full((120, 160, 3), 50, np.uint8)
+        empty = {"status": "complete", "is_bird": False, "bird_probability": .05, "bird_threshold": .8,
+                 "localizer": {"role": "empty_reference", "detections": [detection(10, 10, 40, 40, .6)]}}
+        bird = {"status": "complete", "is_bird": True, "bird_probability": .95, "bird_threshold": .8}
+        engine = StaticBoxEngine([empty, bird])
+        with tempfile.TemporaryDirectory() as temporary:
+            service = MotionService(
+                "http://camera", CaptureStore(Path(temporary)), engine,
+                fetcher=lambda *_a, **_k: (jpeg(frame), metadata()), monotonic=lambda: 0,
+            )
+            service.process_once()
+            service.process_once()
+        (_, first), (_, second) = engine.calls
+        self.assertEqual(first["empty_reference_crop"], {"left": 0, "top": 0, "right": 160, "bottom": 120})
+        self.assertIn("box_filter", first)
+        self.assertNotIn("empty_reference_crop", second)  # the next reference is not due for a minute
+        boxes, summary = second["box_filter"]([detection(12, 10, 42, 40, .62), detection(100, 60, 130, 90, .9)])
+        self.assertEqual([b["static"] for b in boxes], [True, False])
+        self.assertEqual(summary["reference_frames"], 1)
+
+    def test_filter_can_be_switched_off_and_plain_engines_are_untouched(self):
+        frame = np.full((120, 160, 3), 50, np.uint8)
+        result = {"status": "complete", "is_bird": True, "bird_probability": .95, "bird_threshold": .8}
+        with tempfile.TemporaryDirectory() as temporary:
+            off = StaticBoxEngine([result])
+            MotionService("http://camera", CaptureStore(Path(temporary)), off, static_box_filter=False,
+                          fetcher=lambda *_a, **_k: (jpeg(frame), metadata()), monotonic=lambda: 0).process_once()
+            plain = FakeEngine([result])
+            plain.contract = SimpleNamespace(geometry=SELECTED_CROP_GEOMETRY)
+            MotionService("http://camera", CaptureStore(Path(temporary)), plain,
+                          fetcher=lambda *_a, **_k: (jpeg(frame), metadata()), monotonic=lambda: 0).process_once()
+        for engine in (off, plain):
+            kwargs = engine.calls[0][1]
+            self.assertNotIn("box_filter", kwargs)
+            self.assertNotIn("empty_reference_crop", kwargs)
 
 
 if __name__ == "__main__":

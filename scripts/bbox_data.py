@@ -21,6 +21,8 @@ from typing import Iterable, Iterator, Mapping, Sequence
 
 
 REVIEW_STATES = frozenset({"boxed", "no_bird", "unusable", "skipped"})
+# Folders the Pi hub writes beside captures; they hold derived images, never captures.
+HUB_DERIVED_DIRECTORIES = frozenset({"crops", "review_crops", "backgrounds"})
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"})
 LEGACY_GROUND_TRUTH_FIELDS = (
     "source_id",
@@ -551,13 +553,16 @@ def load_image_directory(
 
     ``recursive=False`` limits discovery to files directly inside ``path``.  This
     is useful for capture directories that also contain generated crops or other
-    derived images in subdirectories.
+    derived images in subdirectories. The hub's own derived folders (``crops``,
+    ``review_crops``, ``backgrounds``) are skipped even when recursive.
     """
 
     root = Path(path).expanduser().resolve(strict=True)
     candidates = root.rglob("*") if recursive else root.iterdir()
     images = sorted(
-        (item for item in candidates if item.is_file() and item.suffix.casefold() in IMAGE_EXTENSIONS),
+        (item for item in candidates if item.is_file() and item.suffix.casefold() in IMAGE_EXTENSIONS
+         and not HUB_DERIVED_DIRECTORIES.intersection(
+             part.casefold() for part in item.relative_to(root).parts[:-1])),
         key=lambda item: item.relative_to(root).as_posix().casefold(),
     )
     records: list[ImageRecord] = []

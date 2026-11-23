@@ -226,5 +226,25 @@ class MotionServiceVisitTests(unittest.TestCase):
             self.assertNotIn("visit", sidecar)  # visits never touch acquisition records
 
 
+class MinimumFramesTests(unittest.TestCase):
+    def test_single_frame_visit_is_not_auto_labelled(self):
+        result = decide([0.9, 0.05, 0.05], LABELS, AUTOMATION, n_frames=1)
+        self.assertEqual((result["decision"], result["reason"]), ("review", "too_few_frames"))
+        self.assertEqual(result["species"], "House Sparrow")
+        self.assertEqual(decide([0.9, 0.05, 0.05], LABELS, AUTOMATION, n_frames=2)["decision"], "species")
+
+    def test_contract_can_change_the_minimum(self):
+        relaxed = {**AUTOMATION, "min_frames_for_auto": 1}
+        self.assertEqual(decide([0.9, 0.05, 0.05], LABELS, relaxed, n_frames=1)["decision"], "species")
+        strict = {**AUTOMATION, "min_frames_for_auto": 3}
+        self.assertEqual(decide([0.9, 0.05, 0.05], LABELS, strict, n_frames=2)["decision"], "review")
+
+    def test_tracker_applies_the_minimum_to_live_visits(self):
+        tracker = VisitTracker(None, automation=AUTOMATION)
+        tracker.observe(ref(0), species_inference([0.9, 0.05, 0.05]))
+        (single,) = tracker.close_all()
+        self.assertEqual((single["species_frames"], single["result"]["decision"]), (1, "review"))
+
+
 if __name__ == "__main__":
     unittest.main()
