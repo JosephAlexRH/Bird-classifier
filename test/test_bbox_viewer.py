@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 import bbox_viewer
-from bbox_data import BBox, BBoxDataset, GroundTruthRecord, ImageRecord
+from bbox_data import BBox, BBoxDataset, GroundTruthRecord, ImageRecord, SourceBox
 
 
 def record(index: int, *, box: bool = True, status: str = "detected") -> ImageRecord:
@@ -99,6 +99,75 @@ class DirectoryReviewTests(unittest.TestCase):
         self.assertEqual(reviews["current-id"].relative_path, "bird.jpg")
         self.assertEqual(reviews["current-id"].species, "Robin")
         self.assertEqual(reviews["current-id"].bboxes, [BBox(1, 2, 30, 20)])
+
+    def test_recognized_capture_bundle_excludes_mismatched_sidecars(self) -> None:
+        import hashlib
+        import json
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            image = directory / "capture.jpg"
+            Image.new("RGB", (100, 80)).save(image)
+            image_hash = hashlib.sha256(image.read_bytes()).hexdigest()
+            image.with_suffix(".json").write_text(json.dumps({
+                "capture_id": "capture", "filename": "capture.jpg", "sha256": image_hash,
+            }), encoding="utf-8")
+            image.with_suffix(".inference.json").write_text(json.dumps({
+                "capture_id": "other",
+                "image": {"filename": "other.jpg", "sha256": "0" * 64},
+            }), encoding="utf-8")
+            image.with_suffix(".motion.json").write_text(json.dumps({
+                "capture": {
+                    "capture_id": "capture", "filename": "capture.jpg",
+                    "image_sha256": image_hash,
+                },
+            }), encoding="utf-8")
+
+            paths = bbox_viewer.recognized_capture_bundle_paths(image)
+
+            self.assertEqual(
+                [path.name for path in paths],
+                ["capture.jpg", "capture.json", "capture.motion.json"],
+            )
+
+
+class CameraDisplayTests(unittest.TestCase):
+    def test_camera_details_hide_model_output_until_requested(self) -> None:
+        source = ImageRecord(
+            "capture:1",
+            "esp32_capture",
+            "capture:1",
+            "capture.jpg",
+            width=640,
+            height=480,
+            captured_at="2026-11-20T15:23:45Z",
+            camera_id="esp32cam-test",
+            camera_name="Feeder left",
+            camera_model="OV5640",
+            event_id="event-test",
+            deployment_id="garden-test",
+            inference_status="complete",
+            predicted_is_bird=True,
+            predicted_species="Nuthatch",
+            prediction_confidence=0.98,
+            predicted_bird_count=1,
+            source_boxes=(SourceBox(BBox(10, 20, 30, 40), 0.75, "Nuthatch"),),
+            motion_bbox=BBox(5, 6, 100, 120),
+            motion_source="dynamic_motion_blob",
+        )
+
+        hidden = bbox_viewer.record_details(source, "unreviewed", (640, 480))
+        shown = bbox_viewer.record_details(
+            source, "unreviewed", (640, 480), show_source_output=True
+        )
+
+        self.assertIn("Camera: Feeder left", hidden)
+        self.assertIn("Camera/model output hidden", hidden)
+        self.assertNotIn("Nuthatch", hidden)
+        self.assertIn("Species guess: Nuthatch", shown)
+        self.assertIn("Model boxes: 1", shown)
+        self.assertIn("Motion crop: dynamic_motion_blob", shown)
 
 
 class EditingGeometryTests(unittest.TestCase):
@@ -198,6 +267,27 @@ class ReviewSessionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "image_id"):
             bbox_viewer.validate_review_identities(self.dataset, bad)
+
+    def test_blind_search_does_not_use_prediction_species_or_status(self) -> None:
+        predicted = ImageRecord(
+            "capture:prediction",
+            "esp32_capture",
+            "prediction",
+            "capture.jpg",
+            width=100,
+            height=80,
+            camera_name="Feeder",
+            inference_status="complete",
+            predicted_species="Secret Robin Guess",
+            prediction_confidence=0.99,
+        )
+        session = bbox_viewer.ReviewSession(
+            BBoxDataset((predicted,), Path("images"), "image_directory"), {}
+        )
+
+        session.apply_filters(query="secret robin")
+
+        self.assertEqual(session.filtered, ())
 
     def test_decoded_dimensions_may_correct_stale_manifest_dimensions(self) -> None:
         corrected = dict(self.reviews)
@@ -546,6 +636,69 @@ class TkWorkflowTests(unittest.TestCase):
         self.assertEqual(app.draft_bboxes, [])
         self.assertEqual(app.image_canvas.find_withtag("source-box"), ())
 
+    def test_camera_source_overlays_are_opt_in_and_never_become_draft_boxes(self) -> None:
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        Image.new("RGB", (100, 80)).save(directory / "capture.jpg")
+        source = ImageRecord(
+            "capture:1",
+            "esp32_capture",
+            "capture:1",
+            "capture.jpg",
+            width=100,
+            height=80,
+            camera_id="esp32cam-test",
+            inference_status="complete",
+            source_boxes=(SourceBox(BBox(10, 12, 30, 20), 0.8, "Robin"),),
+            motion_bbox=BBox(5, 6, 60, 50),
+            motion_source="dynamic_motion_blob",
+        )
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(
+            BBoxDataset((source,), directory, "image_directory", directory), {}
+        )
+
+        app.load_current()
+        app._render()
+        self.assertEqual(app.draft_bboxes, [])
+        self.assertEqual(app.image_canvas.find_withtag("source-box"), ())
+        self.assertEqual(app.image_canvas.find_withtag("motion-box"), ())
+
+        app.show_source_output_var.set(True)
+        app._source_output_changed()
+        app._render()
+
+        self.assertEqual(app.draft_bboxes, [])
+        self.assertGreater(len(app.image_canvas.find_withtag("source-box")), 0)
+        self.assertGreater(len(app.image_canvas.find_withtag("motion-box")), 0)
+
+    def test_source_output_reveal_resets_when_navigating_to_another_capture(self) -> None:
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        records = []
+        for index in (1, 2):
+            Image.new("RGB", (100, 80)).save(directory / f"capture{index}.jpg")
+            records.append(ImageRecord(
+                f"capture:{index}", "esp32_capture", f"capture:{index}",
+                f"capture{index}.jpg", width=100, height=80,
+                camera_id="esp32cam-test", inference_status="complete",
+                source_boxes=(SourceBox(BBox(10, 12, 30, 20), 0.8, "Robin"),),
+            ))
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(
+            BBoxDataset(tuple(records), directory, "image_directory", directory), {}
+        )
+
+        app.load_current()
+        app.show_source_output_var.set(True)
+        self.assertTrue(app.session.navigate(1))
+        app.load_current()
+
+        self.assertFalse(app.show_source_output_var.get())
+        self.assertIn("hidden for blind review", app.details_var.get())
+
     def test_unusable_review_round_trips_without_boxes(self) -> None:
         from bbox_data import load_ground_truth
 
@@ -600,7 +753,7 @@ class TkWorkflowTests(unittest.TestCase):
         self.assertEqual(app.draft_bboxes, boxes[:1])
         self.assertEqual(app.active_box_index, 0)
 
-    def test_delete_picture_removes_image_json_and_advances_without_confirmation(self) -> None:
+    def test_delete_picture_confirms_bundle_removal_and_advances(self) -> None:
         from unittest import mock
         from PIL import Image
 
@@ -608,9 +761,17 @@ class TkWorkflowTests(unittest.TestCase):
         first_image = directory / "first.jpg"
         second_image = directory / "second.jpg"
         first_json = directory / "first.json"
+        first_inference = directory / "first.inference.json"
+        first_motion = directory / "first.motion.json"
+        first_review = directory / "first.review.json"
+        unrelated = directory / "first.notes.json"
         Image.new("RGB", (100, 80)).save(first_image)
         Image.new("RGB", (100, 80)).save(second_image)
         first_json.write_text('{"filename": "first.jpg"}', encoding="utf-8")
+        first_inference.write_text("{}", encoding="utf-8")
+        first_motion.write_text("{}", encoding="utf-8")
+        first_review.write_text("{}", encoding="utf-8")
+        unrelated.write_text("{}", encoding="utf-8")
         first = ImageRecord("capture:1", "capture", "1", "first.jpg", width=100, height=80)
         second = ImageRecord("capture:2", "capture", "2", "second.jpg", width=100, height=80)
         dataset = BBoxDataset(
@@ -622,18 +783,26 @@ class TkWorkflowTests(unittest.TestCase):
         app.draft_bboxes = [BBox(1, 2, 3, 4)]
         app.draft_dirty = True
 
-        with mock.patch("bbox_viewer.messagebox.askyesno") as confirmation:
+        with mock.patch("bbox_viewer.messagebox.askyesno", return_value=True) as confirmation:
             self.assertTrue(app.delete_picture())
 
-        confirmation.assert_not_called()
+        confirmation.assert_called_once()
+        prompt = confirmation.call_args.args[1]
+        for name in ("first.jpg", "first.json", "first.inference.json", "first.motion.json"):
+            self.assertIn(name, prompt)
         self.assertFalse(first_image.exists())
         self.assertFalse(first_json.exists())
+        self.assertFalse(first_inference.exists())
+        self.assertFalse(first_motion.exists())
+        self.assertFalse(first_review.exists())
+        self.assertTrue(unrelated.exists())
         self.assertTrue(second_image.exists())
         self.assertEqual([item.source_id for item in app.session.dataset], ["capture:2"])
         self.assertEqual(app.session.current.source_id, "capture:2")
         self.assertFalse(app.draft_dirty)
 
     def test_delete_picture_removes_saved_review_from_review_file(self) -> None:
+        from unittest import mock
         from PIL import Image
         from bbox_data import load_ground_truth, save_ground_truth
 
@@ -656,11 +825,97 @@ class TkWorkflowTests(unittest.TestCase):
         app.session = bbox_viewer.ReviewSession(dataset, {source.source_id: review})
         app.load_current()
 
-        self.assertTrue(app.delete_picture())
+        with mock.patch("bbox_viewer.messagebox.askyesno", return_value=True):
+            self.assertTrue(app.delete_picture())
 
         self.assertEqual(load_ground_truth(output), {})
         self.assertEqual(app.session.reviews, {})
         self.assertIsNone(app.session.current)
+
+    def test_delete_unreviewed_picture_removes_detector_manifest_row(self) -> None:
+        import csv
+        from unittest import mock
+        from PIL import Image
+        from bbox_data import save_detector_manifest
+
+        directory = Path(self.temporary.name)
+        first_image = directory / "first.jpg"
+        second_image = directory / "second.jpg"
+        Image.new("RGB", (100, 80)).save(first_image)
+        Image.new("RGB", (100, 80)).save(second_image)
+        first = ImageRecord("capture:1", "capture", "1", "first.jpg", width=100, height=80)
+        second = ImageRecord("capture:2", "capture", "2", "second.jpg", width=100, height=80)
+        dataset = BBoxDataset((first, second), directory, "image_directory", directory)
+        output = directory / "bird_annotations.csv"
+        save_detector_manifest(output, dataset, {})
+        app = bbox_viewer.BBoxViewerApp(self.root, ground_truth_path=output)
+        app.ground_truth_path = output
+        app.ground_truth_signature = bbox_viewer.file_signature(output)
+        app.detector_manifest_mode = True
+        app.session = bbox_viewer.ReviewSession(dataset, {})
+        app.load_current()
+
+        with mock.patch("bbox_viewer.messagebox.askyesno", return_value=True):
+            self.assertTrue(app.delete_picture())
+
+        with output.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual([row["sample_id"] for row in rows], ["capture:2"])
+
+    def test_delete_picture_cancellation_leaves_bundle_and_session_unchanged(self) -> None:
+        from unittest import mock
+        from PIL import Image
+
+        directory = Path(self.temporary.name)
+        image = directory / "bird.jpg"
+        Image.new("RGB", (100, 80)).save(image)
+        image.with_suffix(".json").write_text("{}", encoding="utf-8")
+        source = ImageRecord("capture:1", "capture", "1", "bird.jpg", width=100, height=80)
+        app = bbox_viewer.BBoxViewerApp(self.root)
+        app.session = bbox_viewer.ReviewSession(
+            BBoxDataset((source,), directory, "image_directory", directory), {}
+        )
+        app.load_current()
+
+        with mock.patch("bbox_viewer.messagebox.askyesno", return_value=False):
+            self.assertFalse(app.delete_picture())
+
+        self.assertTrue(image.exists())
+        self.assertTrue(image.with_suffix(".json").exists())
+        self.assertEqual(app.session.current.source_id, source.source_id)
+
+    def test_delete_picture_rolls_back_files_and_session_on_manifest_conflict(self) -> None:
+        from unittest import mock
+        from PIL import Image
+        from bbox_data import save_ground_truth
+
+        directory = Path(self.temporary.name)
+        image = directory / "bird.jpg"
+        Image.new("RGB", (100, 80)).save(image)
+        image.with_suffix(".json").write_text("{}", encoding="utf-8")
+        source = ImageRecord("capture:1", "capture", "1", "bird.jpg", width=100, height=80)
+        review = GroundTruthRecord.from_image_record(source, "no_bird")
+        output = directory / "reviews.csv"
+        save_ground_truth(output, [review])
+        app = bbox_viewer.BBoxViewerApp(self.root, ground_truth_path=output)
+        app.ground_truth_path = output
+        app.ground_truth_signature = bbox_viewer.file_signature(output)
+        app.session = bbox_viewer.ReviewSession(
+            BBoxDataset((source,), directory, "image_directory", directory),
+            {source.source_id: review},
+        )
+        app.load_current()
+        output.write_text("changed externally", encoding="utf-8")
+
+        with mock.patch("bbox_viewer.messagebox.askyesno", return_value=True), \
+                mock.patch("bbox_viewer.messagebox.showerror") as error:
+            self.assertFalse(app.delete_picture())
+
+        error.assert_called_once()
+        self.assertTrue(image.exists())
+        self.assertTrue(image.with_suffix(".json").exists())
+        self.assertEqual(app.session.current.source_id, source.source_id)
+        self.assertEqual(app.session.reviews, {source.source_id: review})
 
     def test_review_file_lock_rejects_a_concurrent_writer(self) -> None:
         if bbox_viewer.os.name != "nt":

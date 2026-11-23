@@ -11,7 +11,8 @@ PowerShell examples::
 
 Drag empty space to add a box. Drag inside a box to move it and drag a corner
 handle to resize it. Shift-drag adds an overlapping box. Machine/source boxes
-are deliberately hidden so they cannot bias the review;
+are hidden by default so they cannot bias the review, with an explicit read-only
+toggle available when comparison is needed;
 cyan rectangles are tight human-review boxes and dashed orange rectangles show
 their configurable context regions. When boxes are carried onto an image with
 saved boxes, those old annotations remain visible as dashed pink rectangles.
@@ -21,9 +22,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
 import os
+import shutil
 import sys
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import chain
@@ -55,6 +59,8 @@ REVIEW_FILTERS = ("all", "unreviewed", "boxed", "no_bird", "unusable", "skipped"
 SOURCE_BOX_FILTERS = ("all", "with box", "without box")
 SORT_KEYS = (
     "source_id",
+    "captured_at",
+    "camera_name",
     "image_id",
     "path",
     "status",
@@ -121,6 +127,61 @@ def file_signature(path: Path) -> tuple[int, int, str] | None:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return stat.st_mtime_ns, stat.st_size, digest.hexdigest()
+
+
+def _json_mapping(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def recognized_capture_bundle_paths(image_path: Path) -> list[Path]:
+    """Return existing same-capture files without claiming mismatched sidecars."""
+
+    paths = [image_path] if image_path.exists() else []
+    acquisition_path = image_path.with_suffix(".json")
+    acquisition = _json_mapping(acquisition_path) if acquisition_path.exists() else None
+    if acquisition is not None:
+        capture_id = str(acquisition.get("capture_id") or "").strip()
+        filename = str(acquisition.get("filename") or "").strip()
+        expected_hash = str(acquisition.get("sha256") or "").strip().casefold()
+        try:
+            signature = file_signature(image_path) if image_path.exists() and expected_hash else None
+        except OSError:
+            signature = None
+        if ((not capture_id or capture_id == image_path.stem)
+                and (not filename or filename == image_path.name)
+                and (not expected_hash or (signature is not None and signature[2] == expected_hash))):
+            paths.append(acquisition_path)
+        else:
+            acquisition = None
+
+    expected_hash = str((acquisition or {}).get("sha256") or "").strip().casefold()
+    for suffix in (".inference.json", ".motion.json", ".review.json"):
+        sidecar_path = image_path.with_suffix(suffix)
+        if not sidecar_path.exists():
+            continue
+        sidecar = _json_mapping(sidecar_path)
+        if sidecar is None:
+            continue
+        capture = sidecar.get("capture") if isinstance(sidecar.get("capture"), dict) else {}
+        image = sidecar.get("image") if isinstance(sidecar.get("image"), dict) else {}
+        capture_id = str(sidecar.get("capture_id") or capture.get("capture_id") or "").strip()
+        filename = str(image.get("filename") or capture.get("filename") or "").strip()
+        observed_hash = str(
+            image.get("sha256") or capture.get("image_sha256") or ""
+        ).strip().casefold()
+        if capture_id and capture_id != image_path.stem:
+            continue
+        if filename and filename != image_path.name:
+            continue
+        if expected_hash and observed_hash and expected_hash != observed_hash:
+            continue
+        paths.append(sidecar_path)
+    return paths
 
 
 @contextmanager
@@ -325,6 +386,64 @@ def parse_context_percent(value: object) -> float:
     return result
 
 
+def record_details(
+    record: ImageRecord,
+    review_state: str,
+    image_size: tuple[int, int] | None,
+    *,
+    show_source_output: bool = False,
+) -> str:
+    """Build the right-panel summary without exposing model output by default."""
+
+    lines = [f"Path: {record.relative_path}"]
+    if record.camera_name or record.camera_id:
+        lines.extend((
+            f"Camera: {record.camera_name or '—'}",
+            f"Camera ID: {record.camera_id or '—'}",
+            f"Camera model: {record.camera_model or '—'}",
+            f"Captured: {record.captured_at or '—'}",
+            f"Event: {record.event_id or '—'}",
+            f"Deployment: {record.deployment_id or '—'}",
+        ))
+    else:
+        confidence = "—" if record.confidence is None else f"{record.confidence:.4f}"
+        lines.extend((
+            f"Class: {record.class_name or '—'}",
+            f"Source status: {record.bbox_status or '—'}",
+            f"Source: {record.bbox_source or '—'}",
+            f"Confidence: {confidence}",
+            f"Bird count: {record.bird_count if record.bird_count is not None else '—'}",
+        ))
+    lines.append(f"Review: {review_state}")
+    lines.append(
+        f"Image: {image_size[0]} × {image_size[1]}" if image_size else "Image unavailable"
+    )
+    if record.camera_name or record.camera_id:
+        if show_source_output:
+            bird = (
+                "bird" if record.predicted_is_bird is True
+                else "no bird" if record.predicted_is_bird is False
+                else "unknown"
+            )
+            probability = (
+                "—" if record.prediction_confidence is None
+                else f"{record.prediction_confidence:.4f}"
+            )
+            lines.extend((
+                "",
+                "Camera/model output (read-only):",
+                f"Inference: {record.inference_status or '—'} · {bird}",
+                f"Bird probability: {probability}",
+                f"Species guess: {record.predicted_species or '—'}",
+                f"Model boxes: {len(record.source_boxes)}",
+                f"Guessed birds: {record.predicted_bird_count if record.predicted_bird_count is not None else '—'}",
+                f"Motion crop: {record.motion_source or '—'}",
+            ))
+        else:
+            lines.extend(("", "Camera/model output hidden for blind review."))
+    return "\n".join(lines)
+
+
 @dataclass(slots=True)
 class ReviewSession:
     """Review-aware filtering and navigation independent of Tk."""
@@ -400,6 +519,12 @@ class ReviewSession:
                     record.relative_path,
                     record.class_name,
                     record.bbox_status,
+                    record.camera_id,
+                    record.camera_name,
+                    record.camera_model,
+                    record.event_id,
+                    record.deployment_id,
+                    record.captured_at,
                     state,
                 )
             ):
@@ -544,6 +669,8 @@ class BBoxViewerApp:
         self.species_var = tk.StringVar()
         self.keep_species_var = tk.BooleanVar(value=False)
         self.keep_boxes_var = tk.BooleanVar(value=False)
+        self.show_source_output_var = tk.BooleanVar(value=False)
+        self.loaded_source_id: str | None = None
         self.mixed_species_var = tk.BooleanVar(value=False)
         self.active_species_var = tk.StringVar()
         self.bird_count_var = tk.StringVar(value="Bird count: 0")
@@ -586,7 +713,7 @@ class BBoxViewerApp:
         search.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 5))
         self.search_entry = search
         ttk.Label(filters, text="Review").grid(row=2, column=0, sticky=tk.W)
-        ttk.Label(filters, text="Source box").grid(row=2, column=1, sticky=tk.W)
+        ttk.Label(filters, text="Manifest box").grid(row=2, column=1, sticky=tk.W)
         review_filter = ttk.Combobox(
             filters, textvariable=self.review_filter_var, values=REVIEW_FILTERS,
             state="readonly", width=13,
@@ -634,6 +761,13 @@ class BBoxViewerApp:
         ttk.Label(right, textvariable=self.box_var, justify=tk.LEFT, wraplength=290).pack(
             fill=tk.X, pady=(8, 4)
         )
+        self.show_source_output_check = ttk.Checkbutton(
+            right,
+            text="Show camera/model output",
+            variable=self.show_source_output_var,
+            command=self._source_output_changed,
+        )
+        self.show_source_output_check.pack(fill=tk.X, pady=(0, 4))
         labels = ttk.LabelFrame(right, text="Bird labels", padding=8)
         labels.pack(fill=tk.X, pady=(4, 8))
         ttk.Label(labels, text="Species (all birds)").grid(row=0, column=0, sticky=tk.W)
@@ -715,7 +849,7 @@ class BBoxViewerApp:
         self.delete_button.pack(fill=tk.X, pady=2)
         self.delete_picture_button = ttk.Button(
             right,
-            text="Delete Picture + JSON  [Shift+Del]",
+            text="Delete Capture Bundle  [Shift+Del]",
             command=self.delete_picture,
         )
         self.delete_picture_button.pack(fill=tk.X, pady=2)
@@ -985,7 +1119,8 @@ class BBoxViewerApp:
             }.get(state, "·")
             count = review.bird_count if review else record.bird_count
             count_text = f"  ({count} bird{'s' if count != 1 else ''})" if count is not None else ""
-            label = f"{marker}  {record.source_id}{count_text}"
+            camera_text = f"  ·  {record.camera_name}" if record.camera_name else ""
+            label = f"{marker}  {record.source_id}{camera_text}{count_text}"
             self.record_canvas.create_text(
                 7, top + ROW_HEIGHT / 2, text=label, anchor=tk.W,
                 fill="#111111", tags=tags,
@@ -1014,6 +1149,12 @@ class BBoxViewerApp:
             self.record_canvas.yview_moveto(max(row_bottom - viewport, 0) / total)
 
     def load_current(self) -> None:
+        current_source_id = (
+            self.session.current.source_id if self.session and self.session.current else None
+        )
+        if current_source_id != self.loaded_source_id:
+            self.show_source_output_var.set(False)
+            self.loaded_source_id = current_source_id
         repeat_mixed_species = bool(
             self.keep_species_var.get()
             and self.mixed_species_var.get()
@@ -1121,20 +1262,14 @@ class BBoxViewerApp:
         finally:
             self.loading_label_controls = False
 
-        confidence = "—" if record.confidence is None else f"{record.confidence:.4f}"
         review_state = review.review_state if review else "unreviewed"
         self.title_var.set(record.source_id)
-        self.details_var.set(
-            f"Path: {record.relative_path}\n"
-            f"Class: {record.class_name or '—'}\n"
-            f"Source status: {record.bbox_status or '—'}\n"
-            f"Source: {record.bbox_source or '—'}\n"
-            f"Confidence: {confidence}\n"
-            f"Bird count: {review.bird_count if review else record.bird_count if record.bird_count is not None else '—'}\n"
-            f"Review: {review_state}\n"
-            f"Image: {self.image_size[0]} × {self.image_size[1]}" if self.image_size else
-            f"Path: {record.relative_path}\nReview: {review_state}\nImage unavailable"
-        )
+        self.details_var.set(record_details(
+            record,
+            review_state,
+            self.image_size,
+            show_source_output=self.show_source_output_var.get(),
+        ))
         if repeated_boxes and self.draft_bboxes:
             if self.saved_bboxes:
                 status = "Carried box draft; saved boxes are shown dashed pink"
@@ -1145,6 +1280,8 @@ class BBoxViewerApp:
         else:
             status = (
                 f"Loaded saved {review_state} review" if review else
+                "Source camera/model output shown read-only"
+                if self.show_source_output_var.get() else
                 "Ready for blind review; source predictions are hidden"
             )
         self.status_var.set(status)
@@ -1181,6 +1318,59 @@ class BBoxViewerApp:
             self.photo_image = ImageTk.PhotoImage(displayed)
             self.rendered_size = display_size
         canvas.create_image(width / 2, height / 2, image=self.photo_image)
+
+        record = self.session.current if self.session else None
+        if record is not None and self.show_source_output_var.get():
+            if record.motion_bbox is not None:
+                rendered_motion = self.transform.image_bbox_to_canvas(record.motion_bbox)
+                if rendered_motion:
+                    canvas.create_rectangle(
+                        rendered_motion.x,
+                        rendered_motion.y,
+                        rendered_motion.right,
+                        rendered_motion.bottom,
+                        outline="#ffd54f",
+                        width=2,
+                        dash=(9, 4),
+                        tags="motion-box",
+                    )
+                    canvas.create_text(
+                        rendered_motion.x + 4,
+                        rendered_motion.y + 4,
+                        text=f"motion: {record.motion_source or 'selected crop'}",
+                        anchor=tk.NW,
+                        fill="#ffd54f",
+                        font=("TkDefaultFont", 9, "bold"),
+                        tags="motion-box",
+                    )
+            for index, source_box in enumerate(record.source_boxes, 1):
+                rendered_source = self.transform.image_bbox_to_canvas(source_box.bbox)
+                if not rendered_source:
+                    continue
+                canvas.create_rectangle(
+                    rendered_source.x,
+                    rendered_source.y,
+                    rendered_source.right,
+                    rendered_source.bottom,
+                    outline="#7c4dff",
+                    width=2,
+                    dash=(4, 3),
+                    tags="source-box",
+                )
+                pieces = [f"model {index}"]
+                if source_box.label:
+                    pieces.append(source_box.label)
+                if source_box.score is not None:
+                    pieces.append(f"{source_box.score:.3f}")
+                canvas.create_text(
+                    rendered_source.x + 4,
+                    rendered_source.y + 4,
+                    text=" · ".join(pieces),
+                    anchor=tk.NW,
+                    fill="#b39ddb",
+                    font=("TkDefaultFont", 9, "bold"),
+                    tags="source-box",
+                )
 
         for saved_box in self.saved_bboxes:
             rendered_saved = self.transform.image_bbox_to_canvas(saved_box)
@@ -1429,6 +1619,17 @@ class BBoxViewerApp:
         self.draft_dirty = True
         self._schedule_render()
 
+    def _source_output_changed(self) -> None:
+        if self.session and self.session.current:
+            review = self.session.current_review
+            self.details_var.set(record_details(
+                self.session.current,
+                review.review_state if review else "unreviewed",
+                self.image_size,
+                show_source_output=self.show_source_output_var.get(),
+            ))
+        self._schedule_render()
+
     def _update_label_control_states(self) -> None:
         editable = bool(self.session and self.session.current and not self.read_only)
         mixed = editable and self.mixed_species_var.get()
@@ -1459,6 +1660,11 @@ class BBoxViewerApp:
         self.delete_picture_button.configure(
             state=tk.NORMAL if current and not self.read_only else tk.DISABLED
         )
+        self.show_source_output_check.configure(
+            state=tk.NORMAL
+            if current and (current.source_boxes or current.motion_bbox is not None or current.inference_status)
+            else tk.DISABLED
+        )
         self.clear_button.configure(
             state=tk.NORMAL
             if current and not self.read_only and current.source_id in self.session.reviews
@@ -1488,65 +1694,114 @@ class BBoxViewerApp:
         self._render()
 
     def delete_picture(self) -> bool:
-        """Immediately delete the current image and same-stem JSON sidecar."""
+        """Confirm and transactionally delete the current recognized capture bundle."""
 
         if self.read_only or not self.session or not self.session.current:
             return False
 
         record = self.session.current
         image_path = self.session.dataset.resolve_image_path(record)
-        sidecar_path = image_path.with_suffix(".json")
-        sidecar_deleted = False
-        errors: list[str] = []
-
-        try:
-            image_path.unlink()
-        except FileNotFoundError:
-            # A stale manifest row can still be removed from the live session.
-            pass
-        except OSError as error:
-            messagebox.showerror(
-                "Could not delete picture",
-                f"{image_path}\n\n{error}",
-                parent=self.root,
-            )
+        bundle_paths = recognized_capture_bundle_paths(image_path)
+        names = "\n".join(f"• {path.name}" for path in bundle_paths) or "• manifest row only"
+        if not messagebox.askyesno(
+            "Permanently delete capture bundle?",
+            f"Permanently delete this capture and remove its review row?\n\n{names}\n\n"
+            "This cannot be undone. Keep the verified deployment archive immutable.",
+            parent=self.root,
+        ):
             return False
 
         try:
-            if sidecar_path.exists():
-                sidecar_path.unlink()
-                sidecar_deleted = True
+            stage_dir = Path(
+                tempfile.mkdtemp(prefix=f".{image_path.stem}.delete-", dir=image_path.parent)
+            )
         except OSError as error:
-            errors.append(f"Could not delete {sidecar_path}: {error}")
-
-        previous_review = self.session.reviews.get(record.source_id)
-        if previous_review is not None:
-            self.session.reviews.pop(record.source_id, None)
-            if self.ground_truth_path is not None:
+            messagebox.showerror(
+                "Could not stage capture deletion", f"{image_path.parent}\n\n{error}", parent=self.root
+            )
+            return False
+        staged: list[tuple[Path, Path]] = []
+        previous_dataset = self.session.dataset
+        previous_reviews = self.session.reviews.copy()
+        previous_filtered = self.session.filtered
+        previous_position = self.session.position
+        previous_counts = (
+            self.session._counts_cache.copy() if self.session._counts_cache is not None else None
+        )
+        previous_review = self.session.reviews.pop(record.source_id, None)
+        manifest_saved = False
+        try:
+            for path in bundle_paths:
+                staged_path = stage_dir / path.name
+                path.replace(staged_path)
+                staged.append((path, staged_path))
+            self.session.remove_record(record.source_id)
+            if self.ground_truth_path is not None and (
+                previous_review is not None or self.detector_manifest_mode
+            ):
+                with review_file_lock(self.ground_truth_path):
+                    if file_signature(self.ground_truth_path) != self.ground_truth_signature:
+                        raise OSError(
+                            "the ground-truth CSV changed outside this application; "
+                            "reload the dataset before saving"
+                        )
+                    self._save_records()
+                manifest_saved = True
+        except (OSError, ValueError) as error:
+            self.session.dataset = previous_dataset
+            self.session.reviews = previous_reviews
+            self.session.filtered = previous_filtered
+            self.session.position = previous_position
+            self.session._counts_cache = previous_counts
+            restore_errors = []
+            for original, staged_path in reversed(staged):
                 try:
-                    with review_file_lock(self.ground_truth_path):
-                        if file_signature(self.ground_truth_path) != self.ground_truth_signature:
-                            raise OSError(
-                                "the ground-truth CSV changed outside this application; "
-                                "reload the dataset before saving"
-                            )
-                        self._save_records()
-                    self.ground_truth_signature = file_signature(self.ground_truth_path)
-                except (OSError, ValueError) as error:
-                    self.session.reviews[record.source_id] = previous_review
-                    errors.append(f"Could not remove the saved review: {error}")
+                    if staged_path.exists():
+                        staged_path.replace(original)
+                except OSError as restore_error:
+                    restore_errors.append(f"Could not restore {original}: {restore_error}")
+            try:
+                stage_dir.rmdir()
+            except OSError:
+                pass
+            detail = f"{error}"
+            if restore_errors:
+                detail += "\n\n" + "\n".join(restore_errors)
+            messagebox.showerror("Could not delete capture bundle", detail, parent=self.root)
+            return False
 
-        self.session.remove_record(record.source_id)
+        signature_error: OSError | None = None
+        if manifest_saved and self.ground_truth_path is not None:
+            try:
+                self.ground_truth_signature = file_signature(self.ground_truth_path)
+            except OSError as error:
+                self.ground_truth_signature = None
+                signature_error = error
+        cleanup_error: OSError | None = None
+        try:
+            shutil.rmtree(stage_dir)
+        except OSError as error:
+            cleanup_error = error
         self.draft_dirty = False
         self._refresh_after_filter()
         self.load_current()
-        sidecar_note = " and its JSON" if sidecar_deleted else ""
+        sidecar_count = max(len(bundle_paths) - (1 if image_path in bundle_paths else 0), 0)
+        sidecar_note = f" and {sidecar_count} sidecar{'s' if sidecar_count != 1 else ''}"
         self.status_var.set(f"Deleted {image_path.name}{sidecar_note}")
-
-        if errors:
+        if cleanup_error is not None or signature_error is not None:
+            details = []
+            if signature_error is not None:
+                details.append(
+                    "The manifest was updated, but its new signature could not be read. "
+                    f"Reload before saving another review.\n\n{signature_error}"
+                )
+            if cleanup_error is not None:
+                details.append(
+                    f"Temporary files remain in:\n{stage_dir}\n\n{cleanup_error}"
+                )
             messagebox.showerror(
-                "Picture deleted with errors",
-                "\n\n".join(errors),
+                "Capture deleted with a follow-up error",
+                "\n\n".join(details),
                 parent=self.root,
             )
         return True

@@ -1,8 +1,57 @@
-# ESP32-CAM servers
+# Bird Hub servers and deployment
 
-The firmware sends raw JPEG bytes to `POST /upload` with the content type
+The `server/` directory contains the laptop receiver, Raspberry Pi Bird Hub,
+inference pipeline, collection and review APIs, and monitoring tools used by the
+ESP32 bird-classifier system.
+
+The firmware sends raw JPEG bytes to `POST /upload` with content type
 `image/jpeg`. Capture metadata is sent in the optional
-`X-ESP32-Camera-Metadata` JSON header.
+`X-ESP32-Camera-Metadata` JSON header. The receivers store the original JPEG and
+acquisition sidecar before motion, inference, visit, or review records are
+created.
+
+## Choose a server
+
+| Component | Use it for | Default dashboard |
+|---|---|---|
+| `laptop_test_server.py` | Camera setup, live preview, calibration captures, and LAN testing | `http://127.0.0.1:5000` |
+| `raspberry_pi_server.py` | Pi-owned motion detection, inference, visits, field collection, and the deployed Bird Hub | `http://PI_ADDRESS:5000` |
+| `camera_monitor.py` | Multi-camera status and configuration monitoring without inference | `http://127.0.0.1:5051` |
+| `pi_monitor.py` | Read-only laptop monitoring and optional mirroring of a deployed Pi | `http://127.0.0.1:5050` |
+
+All services are unauthenticated and are intended for a trusted LAN or the
+private Raspberry Pi hotspot.
+
+## Quick start
+
+Install the shared Python dependencies from the repository root:
+
+```powershell
+python -m pip install -r .\server\requirements.txt
+```
+
+For a laptop camera test:
+
+```powershell
+python .\server\laptop_test_server.py --camera-url http://CAMERA_IP
+```
+
+For an interactive Pi receiver test:
+
+```bash
+python3 server/raspberry_pi_server.py --camera-url http://CAMERA_IP
+```
+
+The Pi additionally needs a supported TFLite runtime. For unattended use,
+install the supplied `birdhub.service` instead of maintaining a hand-written
+systemd unit:
+
+```bash
+sudo bash deploy/install_pi_hub.sh
+```
+
+Camera firmware setup is documented in
+[`docs/camera-firmware.md`](../docs/camera-firmware.md).
 
 ## Multiple cameras
 
@@ -122,6 +171,8 @@ records include `camera_id`, `camera_registry_id`, `camera_name`, and
 
 
 
+## Upload classification response
+
 The Raspberry Pi server validates its classifier output and returns this
 contract to the ESP32:
 
@@ -203,7 +254,7 @@ review status is `unreviewed`. The collector deliberately does **not** add a
 Keep these candidates in their own directory and review them before training:
 
 ```powershell
-python .\image_labeler.py E:\Datasets\ESP32_environment
+python .\scripts\image_labeler.py E:\Datasets\ESP32_environment
 ```
 
 `image_labeler.py` now opens the combined label and bounding-box editor (the
@@ -213,7 +264,7 @@ on the first save. You can also open the current detector annotation CSV
 directly to edit it in place:
 
 ```powershell
-python .\bbox_viewer.py .\Models\Multi_Object_Detector\runs\RUN_NAME\joined_bird_detector_annotations.csv
+python .\scripts\bbox_viewer.py .\Models\Multi_Object_Detector\runs\RUN_NAME\joined_bird_detector_annotations.csv
 ```
 
 For one species across all boxes, enter the shared species (for example
@@ -442,6 +493,12 @@ export is 224x224 (the exact model in
 model is still the float32 `letterbox_224_20261009_131631/model_float32.tflite`,
 with `labels.txt` beside it.
 
+The repository also contains an optional binary bird/not-bird export in
+`Models/deploy_20261119_float/isbird_float`, with a matching crop-aware species
+export in `Models/deploy_20261119_float/species_float`. Select that pipeline
+explicitly with `--is-bird-model`, `--contract-file`, `--species-model`, and
+`--species-contract`; it does not replace the detector defaults above.
+
 ```bash
 python3 server/raspberry_pi_server.py \
   --camera-url http://192.168.1.84 \
@@ -513,8 +570,8 @@ sudo bash deploy/install_pi_hub.sh -- --save-dir /mnt/usb/bird_images
 Arguments live in `/etc/default/birdhub`; edit that file and run
 `sudo systemctl restart birdhub`. Follow the output with
 `journalctl -u birdhub -f`. The service does not wait for internet, so it comes
-up at a site that has none. It replaces the hand-written `bird-pi.service`
-below (the installer disables that one if it is enabled).
+up at a site that has none. The installer also disables the older hand-written
+`bird-pi.service` if it is enabled.
 
 **Wi-Fi hotspot (no router at the site).** The Pi can be its own Wi-Fi network
 that the cameras join directly:
@@ -576,36 +633,24 @@ It prints, per camera, the share of time it was reachable, the gaps, restarts by
 cause, crashes, Wi-Fi signal and memory lows, and for the hub its restarts,
 clock corrections, power warnings and lowest free disk.
 
-### Start the Pi receiver at boot
+### Service management
 
-After verifying the command interactively, create `/etc/systemd/system/bird-pi.service`
-and adjust the user, working directory, camera address, and model paths:
+`deploy/install_pi_hub.sh` installs and enables `birdhub.service`, creates the
+project virtual environment, installs the shared requirements, and stores the
+receiver arguments in `/etc/default/birdhub`. This is the supported startup
+path; it replaces the older hand-written `bird-pi.service` setup.
 
-```ini
-[Unit]
-Description=ESP32-CAM bird inference receiver
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/opt/esp32-classifier
-ExecStart=/opt/esp32-classifier/.venv/bin/python server/raspberry_pi_server.py --host 0.0.0.0 --port 5000 --camera-url http://192.168.1.84 --save-dir /home/pi/bird_images --detector-model /opt/bird-models/detector/bird_detector_motion_crop_stride16_float32.tflite --species-model /opt/bird-models/species/model_float32.tflite --num-threads 1
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable it with:
+Useful commands:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now bird-pi.service
-sudo systemctl status bird-pi.service
+sudo systemctl status birdhub
+sudo systemctl restart birdhub
+journalctl -u birdhub -f
 ```
+
+After editing `/etc/default/birdhub`, restart the service. Re-running the
+installer is safe and keeps the existing arguments unless new arguments are
+supplied after `--`.
 
 ## Laptop polling monitor for a deployed Pi
 
@@ -643,9 +688,7 @@ clients:
 These endpoints, like the rest of the receiver, have no authentication. Keep
 them on a trusted LAN and do not forward port 5000 from the public internet.
 
-## Automated checks
-
-### Detector-only field collection and Pi review
+## Detector-only field collection and Pi review
 
 Use `--collection-mode` on the Pi for dataset collection. This skips loading and
 running the species model. Camera acquisition runs independently from detector
@@ -687,11 +730,6 @@ not install Python packages. The service override is
 and reloading/restarting systemd restores the previous service arguments.
 The code backup path is printed during transfer.
 
-The Pi root page is the unified **Bird hub**. Live & capture, Review data and
-Settings share one camera selection and visual layout. Old `/fleet` and `/legacy`
-bookmarks display the same interface (`/legacy` initially selects Settings).
-The laptop proxy also uses this interface when connected to a Pi. On the laptop, launch:
-
 No laptop server is needed in the field: join the Pi's hotspot and open
 `http://10.42.0.1:5000`. The same hub page runs locally on the Pi
 without internet or external web assets. Live & capture includes previews,
@@ -703,6 +741,11 @@ NetworkManager hotspot setup. Cameras must join that hotspot too; keep
 `server_host: birdhub.local` and use `server_ip: 10.42.0.1` as fallback.
 Opening the dashboard offers the laptop/phone time through the hub clock API;
 when the OS clock cannot be set, the existing clock-offset logging applies.
+
+The Pi root page is the unified **Bird Hub**. **Live & capture**, **Review data**,
+and **Settings** share one camera selection and visual layout. Old `/fleet` and
+`/legacy` bookmarks display the same interface (`/legacy` initially selects
+Settings). To access the same review interface through the laptop proxy, run:
 
 ```powershell
 python .\server\laptop_test_server.py --pi-url http://192.168.7.128:5000 --no-advertise
@@ -740,6 +783,31 @@ downloads original metadata and available crops with checksum verification.
 Reviews made after a historical frame was mirrored need to be re-synced; the
 live collection review page always reads current Pi records.
 
+## Camera monitor without inference
+
+Run the standalone monitor when you need fleet visibility and configuration
+inspection without image classification:
+
+```powershell
+python .\server\camera_monitor.py
+```
+
+Open `http://127.0.0.1:5051`, then add each ESP32-CAM by name and base URL. The
+monitor persists its registry in `~/.esp32-camera-monitor/cameras.json`, polls
+each camera's `/status` and `/config` endpoints concurrently, and keeps the last
+successful values visible during temporary failures. Use `--registry-file`,
+`--poll-seconds`, and `--timeout-seconds` to override the defaults.
+
+The management API provides `GET`/`POST /api/cameras`,
+`DELETE /api/cameras/<id>`, `POST /api/cameras/poll`, and
+`POST /api/cameras/<id>/poll`. Cached endpoint values are available from
+`/api/cameras/<id>/status` and `/api/cameras/<id>/config`.
+
+Like the firmware, this monitor has no authentication. Bind it to the default
+loopback address or keep it on a trusted LAN.
+
+## Automated checks
+
 From the project root:
 
 ```powershell
@@ -761,3 +829,13 @@ Latest received motion image:
 ```text
 http://SERVER_IP:5000/latest.jpg
 ```
+
+The `/health` response also reports camera poll counts, background readiness,
+persistence and inference state, model readiness, the most recent crop
+selection, and the latest polling error.
+
+## Related documentation
+
+- [Project overview](../README.md)
+- [Camera firmware guide](../docs/camera-firmware.md)
+- [Dataset and deployment utilities](../scripts/README.md)

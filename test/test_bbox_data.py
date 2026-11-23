@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -94,6 +95,193 @@ class ManifestLoaderTests(unittest.TestCase):
         # Hub-derived folders (crops, review_crops, backgrounds) are never captures.
         self.assertEqual([item.relative_path for item in recursive], ["capture.jpg", "nested/second.jpg"])
         self.assertEqual([item.relative_path for item in top_level], ["capture.jpg"])
+
+    def test_camera_capture_bundle_loads_provenance_predictions_and_motion_separately(self) -> None:
+        from PIL import Image
+
+        capture_id = "capture_20261120T152345_650817Z_test0001"
+        image_path = self.directory / f"{capture_id}.jpg"
+        Image.new("RGB", (640, 480)).save(image_path)
+        image_path.with_suffix(".json").write_text(json.dumps({
+            "capture_id": capture_id,
+            "filename": image_path.name,
+            "received_at": "2026-11-20T15:23:45.650+00:00",
+            "camera_id": "esp32cam-test",
+            "camera_name": "Feeder left",
+            "camera_model": "OV5640",
+            "event_id": "event-test",
+            "deployment_id": "garden-test",
+            "camera": {"observed": {"capture": {"width": 640, "height": 480}}},
+        }), encoding="utf-8")
+        image_path.with_suffix(".inference.json").write_text(json.dumps({
+            "capture_id": capture_id,
+            "image": {"filename": image_path.name},
+            "status": "complete",
+            "is_bird": True,
+            "bird_probability": 0.98,
+            "classification": {"label": "White-breasted Nuthatch"},
+            "species": {"boxes": [{
+                "box": {"left": 405, "top": 315, "right": 505, "bottom": 389},
+                "localizer_score": 0.64,
+                "top_k": [{"label": "White-breasted Nuthatch", "probability": 0.59}],
+            }]},
+        }), encoding="utf-8")
+        image_path.with_suffix(".motion.json").write_text(json.dumps({
+            "capture": {"capture_id": capture_id, "filename": image_path.name},
+            "selection": {
+                "source": "dynamic_motion_blob",
+                "final_bounds_px": {"left": 390, "top": 280, "right": 550, "bottom": 440},
+            },
+        }), encoding="utf-8")
+
+        dataset, reviews = bbox_data.load_image_directory(self.directory, recursive=False)
+
+        self.assertEqual(reviews, {})
+        self.assertEqual(len(dataset), 1)
+        record = dataset[0]
+        self.assertEqual(record.source_id, capture_id)
+        self.assertEqual(record.source_dataset, "esp32_capture")
+        self.assertEqual(record.camera_name, "Feeder left")
+        self.assertEqual(record.camera_id, "esp32cam-test")
+        self.assertEqual(record.camera_model, "OV5640")
+        self.assertEqual(record.event_id, "event-test")
+        self.assertEqual(record.deployment_id, "garden-test")
+        self.assertEqual(record.captured_at, "2026-11-20T15:23:45.650+00:00")
+        self.assertIs(record.predicted_is_bird, True)
+        self.assertEqual(record.prediction_confidence, 0.98)
+        self.assertEqual(record.predicted_species, "White-breasted Nuthatch")
+        self.assertEqual(record.predicted_bird_count, 1)
+        self.assertEqual(record.class_name, "")
+        self.assertIsNone(record.bbox)
+        self.assertEqual(record.source_boxes, (
+            bbox_data.SourceBox(
+                bbox_data.BBox(405, 315, 100, 74), 0.64, "White-breasted Nuthatch"
+            ),
+        ))
+        self.assertEqual(record.motion_bbox, bbox_data.BBox(390, 280, 160, 160))
+        self.assertEqual(record.motion_source, "dynamic_motion_blob")
+
+    def test_camera_bundle_skipped_inference_and_bad_optional_sidecars_are_nonfatal(self) -> None:
+        from PIL import Image
+
+        capture_id = "capture_20261120T145729_272297Z_test0002"
+        image_path = self.directory / f"{capture_id}.jpg"
+        Image.new("RGB", (320, 240)).save(image_path)
+        image_path.with_suffix(".json").write_text(json.dumps({
+            "capture_id": capture_id,
+            "filename": image_path.name,
+            "camera_id": "esp32cam-test",
+        }), encoding="utf-8")
+        image_path.with_suffix(".inference.json").write_text(json.dumps({
+            "status": "skipped", "reason": "background_calibration", "is_bird": None,
+        }), encoding="utf-8")
+        image_path.with_suffix(".motion.json").write_text("not json", encoding="utf-8")
+
+        dataset, _ = bbox_data.load_image_directory(self.directory, recursive=False)
+
+        record = dataset[0]
+        self.assertEqual(record.inference_status, "skipped")
+        self.assertIsNone(record.predicted_is_bird)
+        self.assertIsNone(record.predicted_bird_count)
+        self.assertEqual(record.source_boxes, ())
+        self.assertIsNone(record.motion_bbox)
+
+    def test_camera_bundle_ignores_mismatched_hashes_and_legacy_review_labels(self) -> None:
+        from PIL import Image
+
+        capture_id = "capture_20261120T145729_272297Z_test0003"
+        image_path = self.directory / f"{capture_id}.jpg"
+        Image.new("RGB", (320, 240)).save(image_path)
+        image_path.with_suffix(".json").write_text(json.dumps({
+            "capture_id": capture_id,
+            "filename": image_path.name,
+            "sha256": "correct-image-hash",
+            "camera_id": "esp32cam-test",
+        }), encoding="utf-8")
+        image_path.with_suffix(".inference.json").write_text(json.dumps({
+            "capture_id": capture_id,
+            "image": {"filename": image_path.name, "sha256": "different-image-hash"},
+            "status": "complete",
+            "is_bird": True,
+            "classification": {"label": "Robin"},
+        }), encoding="utf-8")
+        image_path.with_suffix(".motion.json").write_text(json.dumps({
+            "capture": {
+                "capture_id": capture_id,
+                "filename": image_path.name,
+                "image_sha256": "different-image-hash",
+            },
+            "selection": {
+                "source": "dynamic_motion_blob",
+                "final_bounds_px": {"left": 10, "top": 20, "right": 100, "bottom": 120},
+            },
+        }), encoding="utf-8")
+        image_path.with_suffix(".review.json").write_text(json.dumps({
+            "decision": "boxed",
+            "species_name": "Robin",
+            "boxes": [{"left": 10, "top": 20, "right": 100, "bottom": 120}],
+        }), encoding="utf-8")
+
+        dataset, reviews = bbox_data.load_image_directory(self.directory, recursive=False)
+
+        record = dataset[0]
+        self.assertEqual(reviews, {})
+        self.assertEqual(record.inference_status, "")
+        self.assertIsNone(record.predicted_is_bird)
+        self.assertEqual(record.predicted_species, "")
+        self.assertEqual(record.source_boxes, ())
+        self.assertIsNone(record.motion_bbox)
+        self.assertEqual(record.class_name, "")
+
+    def test_camera_bundle_rejects_acquisition_when_jpeg_bytes_do_not_match_hash(self) -> None:
+        import hashlib
+        from PIL import Image
+
+        capture_id = "capture_20261120T145729_272297Z_test0004"
+        image_path = self.directory / f"{capture_id}.jpg"
+        Image.new("RGB", (320, 240)).save(image_path)
+        different_hash = hashlib.sha256(b"different image bytes").hexdigest()
+        image_path.with_suffix(".json").write_text(json.dumps({
+            "capture_id": capture_id,
+            "filename": image_path.name,
+            "sha256": different_hash,
+            "camera_id": "esp32cam-test",
+            "manual_label": {"bird_present": True, "species": "Robin"},
+        }), encoding="utf-8")
+        image_path.with_suffix(".inference.json").write_text(json.dumps({
+            "capture_id": capture_id,
+            "image": {"filename": image_path.name, "sha256": different_hash},
+            "status": "complete",
+            "is_bird": True,
+            "classification": {"label": "Robin"},
+        }), encoding="utf-8")
+
+        dataset, reviews = bbox_data.load_image_directory(self.directory, recursive=False)
+
+        record = dataset[0]
+        self.assertEqual(record.source_dataset, "image_directory")
+        self.assertEqual(record.camera_id, "")
+        self.assertIsNone(record.predicted_is_bird)
+        self.assertIsNone(record.is_bird)
+        self.assertEqual(record.class_name, "")
+        self.assertEqual(reviews, {})
+
+    def test_mismatched_acquisition_identity_cannot_supply_manual_label(self) -> None:
+        from PIL import Image
+
+        image_path = self.directory / "capture_current.jpg"
+        Image.new("RGB", (320, 240)).save(image_path)
+        image_path.with_suffix(".json").write_text(json.dumps({
+            "capture_id": "capture_other",
+            "filename": "capture_other.jpg",
+            "manual_label": {"bird_present": True, "species": "Robin"},
+        }), encoding="utf-8")
+
+        dataset, reviews = bbox_data.load_image_directory(self.directory, recursive=False)
+
+        self.assertIsNone(dataset[0].is_bird)
+        self.assertEqual(dataset[0].class_name, "")
+        self.assertEqual(reviews, {})
 
     def test_generated_inaturalist_csv_retains_only_compact_metadata(self) -> None:
         path = self.write_csv(

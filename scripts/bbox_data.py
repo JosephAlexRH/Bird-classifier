@@ -10,6 +10,7 @@ or :meth:`BBoxDataset.resolve_image_path` is called.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -174,6 +175,21 @@ class BBox:
         return BBox(left, top, right - left, bottom - top)
 
 
+@dataclass(frozen=True, slots=True)
+class SourceBox:
+    """A read-only camera/model box kept separate from human annotations."""
+
+    bbox: BBox
+    score: float | None = None
+    label: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.bbox.is_valid:
+            raise ValueError("source bounding box must be valid")
+        if self.score is not None and not math.isfinite(self.score):
+            raise ValueError("source bounding-box score must be finite")
+
+
 def bbox_with_context(
     box: BBox,
     image_width: float,
@@ -266,6 +282,20 @@ class ImageRecord:
     is_bird: bool | None = None
     mixed_species: bool = False
     bird_count: int | None = None
+    captured_at: str = ""
+    camera_id: str = ""
+    camera_name: str = ""
+    camera_model: str = ""
+    event_id: str = ""
+    deployment_id: str = ""
+    inference_status: str = ""
+    predicted_is_bird: bool | None = None
+    predicted_species: str = ""
+    prediction_confidence: float | None = None
+    predicted_bird_count: int | None = None
+    source_boxes: tuple[SourceBox, ...] = ()
+    motion_bbox: BBox | None = None
+    motion_source: str = ""
 
     def __post_init__(self) -> None:
         if not self.source_id:
@@ -278,6 +308,10 @@ class ImageRecord:
             raise ValueError("height must be positive when present")
         if self.bird_count is not None and self.bird_count < 0:
             raise ValueError("bird_count must not be negative")
+        if self.predicted_bird_count is not None and self.predicted_bird_count < 0:
+            raise ValueError("predicted_bird_count must not be negative")
+        if self.prediction_confidence is not None and not math.isfinite(self.prediction_confidence):
+            raise ValueError("prediction_confidence must be finite when present")
 
     @property
     def has_bbox(self) -> bool:
@@ -530,20 +564,256 @@ def load_cub_directory(
     return BBoxDataset(tuple(records), root, "cub_raw", chosen_root)
 
 
-def _sidecar_manual_label(path: Path) -> tuple[bool | None, str]:
-    sidecar = path.with_suffix(".json")
-    if not sidecar.is_file():
-        return None, ""
+def _load_json_object(path: Path) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
     try:
-        with sidecar.open("r", encoding="utf-8-sig") as handle:
+        with path.open("r", encoding="utf-8-sig") as handle:
             data = json.load(handle)
     except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _sidecar_manual_label(
+    path: Path, data: Mapping[str, object] | None = None
+) -> tuple[bool | None, str]:
+    if data is None:
+        data = _load_json_object(path.with_suffix(".json"))
+    if data is None:
         return None, ""
-    label = data.get("manual_label") if isinstance(data, dict) else None
+    label = data.get("manual_label")
     if not isinstance(label, dict) or type(label.get("bird_present")) is not bool:
         return None, ""
     species = label.get("species")
     return label["bird_present"], species.strip() if isinstance(species, str) else ""
+
+
+def _sha256_file(path: Path) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _acquisition_matches_image(image_path: Path, acquisition: Mapping[str, object]) -> bool:
+    """Bind acquisition metadata and any manual label to the selected image."""
+
+    capture_id = _nonempty_text(acquisition.get("capture_id"))
+    filename = _nonempty_text(acquisition.get("filename"))
+    if (capture_id and capture_id != image_path.stem) or (filename and filename != image_path.name):
+        return False
+    expected_hash = _nonempty_text(acquisition.get("sha256")).casefold()
+    if not expected_hash:
+        return True
+    actual_hash = _sha256_file(image_path)
+    return actual_hash is not None and actual_hash.casefold() == expected_hash
+
+
+def _mapping(value: object) -> Mapping[str, object] | None:
+    return value if isinstance(value, dict) else None
+
+
+def _nonempty_text(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _sidecar_hash_matches(
+    acquisition: Mapping[str, object], sidecar_hash: object
+) -> bool:
+    """Accept absent hashes, but reject a sidecar that names different image bytes."""
+
+    expected = _nonempty_text(acquisition.get("sha256")).casefold()
+    observed = _nonempty_text(sidecar_hash).casefold()
+    return not expected or not observed or expected == observed
+
+
+def _box_from_edges(value: object, width: int | None, height: int | None) -> BBox | None:
+    data = _mapping(value)
+    if data is None:
+        return None
+    left = parse_optional_float(data.get("left"))
+    top = parse_optional_float(data.get("top"))
+    right = parse_optional_float(data.get("right"))
+    bottom = parse_optional_float(data.get("bottom"))
+    if None in (left, top, right, bottom):
+        return None
+    assert left is not None and top is not None and right is not None and bottom is not None
+    box = BBox(left, top, right - left, bottom - top)
+    if not box.is_valid:
+        return None
+    if width is not None and height is not None:
+        return box.clipped(width, height)
+    return box
+
+
+@dataclass(frozen=True, slots=True)
+class _CameraCaptureData:
+    capture_id: str
+    width: int | None
+    height: int | None
+    captured_at: str = ""
+    camera_id: str = ""
+    camera_name: str = ""
+    camera_model: str = ""
+    event_id: str = ""
+    deployment_id: str = ""
+    inference_status: str = ""
+    predicted_is_bird: bool | None = None
+    predicted_species: str = ""
+    prediction_confidence: float | None = None
+    predicted_bird_count: int | None = None
+    source_boxes: tuple[SourceBox, ...] = ()
+    motion_bbox: BBox | None = None
+    motion_source: str = ""
+
+
+def _camera_capture_data(
+    image_path: Path,
+    acquisition: Mapping[str, object] | None,
+    decoded_width: int | None,
+    decoded_height: int | None,
+) -> _CameraCaptureData | None:
+    """Read a Pi camera capture bundle without treating model output as a label."""
+
+    if acquisition is None:
+        return None
+    capture_id = _nonempty_text(acquisition.get("capture_id"))
+    filename = _nonempty_text(acquisition.get("filename"))
+    if not capture_id or capture_id != image_path.stem or (filename and filename != image_path.name):
+        return None
+
+    camera = _mapping(acquisition.get("camera")) or {}
+    observed = _mapping(camera.get("observed")) or {}
+    observed_capture = _mapping(observed.get("capture")) or {}
+    width = decoded_width or parse_optional_int(observed_capture.get("width"))
+    height = decoded_height or parse_optional_int(observed_capture.get("height"))
+
+    inference = _load_json_object(image_path.with_suffix(".inference.json"))
+    if inference is not None:
+        inference_capture_id = _nonempty_text(inference.get("capture_id"))
+        image = _mapping(inference.get("image")) or {}
+        inference_filename = _nonempty_text(image.get("filename"))
+        if ((inference_capture_id and inference_capture_id != capture_id)
+                or (inference_filename and inference_filename != image_path.name)
+                or not _sidecar_hash_matches(acquisition, image.get("sha256"))):
+            inference = None
+
+    predicted_is_bird: bool | None = None
+    prediction_confidence: float | None = None
+    predicted_species = ""
+    inference_status = ""
+    source_boxes: list[SourceBox] = []
+    if inference is not None:
+        inference_status = _nonempty_text(inference.get("status"))
+        if type(inference.get("is_bird")) is bool:
+            predicted_is_bird = bool(inference["is_bird"])
+        classification = _mapping(inference.get("classification")) or {}
+        if predicted_is_bird is None and type(classification.get("is_bird")) is bool:
+            predicted_is_bird = bool(classification["is_bird"])
+        prediction_confidence = parse_optional_float(inference.get("bird_probability"))
+        if prediction_confidence is None:
+            prediction_confidence = parse_optional_float(classification.get("confidence"))
+        predicted_species = _nonempty_text(classification.get("label")) or _nonempty_text(
+            inference.get("guess")
+        )
+        top_k = inference.get("species_top_k")
+        if not predicted_species and isinstance(top_k, list) and top_k:
+            predicted_species = _nonempty_text((_mapping(top_k[0]) or {}).get("label"))
+
+        # Species entries are the accepted localizer boxes and preserve each box's guess.
+        species = _mapping(inference.get("species")) or {}
+        species_boxes = species.get("boxes")
+        if predicted_is_bird is True and isinstance(species_boxes, list):
+            for entry in species_boxes:
+                item = _mapping(entry) or {}
+                box = _box_from_edges(item.get("box"), width, height)
+                if box is None:
+                    continue
+                entry_top_k = item.get("top_k")
+                label = ""
+                if isinstance(entry_top_k, list) and entry_top_k:
+                    label = _nonempty_text((_mapping(entry_top_k[0]) or {}).get("label"))
+                source_boxes.append(SourceBox(
+                    box,
+                    parse_optional_float(item.get("localizer_score")),
+                    label,
+                ))
+
+        # Fall back to thresholded localizer output when species inference is absent.
+        if predicted_is_bird is True and not source_boxes:
+            localizer = _mapping(inference.get("localizer")) or {}
+            localizer_model = _mapping(localizer.get("model")) or {}
+            threshold = parse_optional_float(localizer_model.get("deployment_threshold"))
+            if threshold is None:
+                threshold = 0.0
+            detections = localizer.get("detections")
+            if isinstance(detections, list):
+                for entry in detections:
+                    item = _mapping(entry) or {}
+                    score = parse_optional_float(item.get("score"))
+                    if score is None or score < threshold:
+                        continue
+                    box = _box_from_edges(item.get("box"), width, height)
+                    if box is not None:
+                        source_boxes.append(SourceBox(box, score, predicted_species))
+
+        # Compatibility with the older detector block used by previous Pi deployments.
+        if predicted_is_bird is True and not source_boxes:
+            detector = _mapping(inference.get("detector")) or {}
+            threshold = parse_optional_float(detector.get("threshold")) or 0.0
+            detections = detector.get("detections")
+            if isinstance(detections, list):
+                for entry in detections:
+                    item = _mapping(entry) or {}
+                    score = parse_optional_float(item.get("score"))
+                    if score is None or score < threshold:
+                        continue
+                    box = _box_from_edges(item.get("box"), width, height)
+                    if box is not None:
+                        source_boxes.append(SourceBox(box, score, predicted_species))
+
+    motion = _load_json_object(image_path.with_suffix(".motion.json"))
+    if motion is not None:
+        capture = _mapping(motion.get("capture")) or {}
+        motion_capture_id = _nonempty_text(capture.get("capture_id"))
+        motion_filename = _nonempty_text(capture.get("filename"))
+        if ((motion_capture_id and motion_capture_id != capture_id)
+                or (motion_filename and motion_filename != image_path.name)
+                or not _sidecar_hash_matches(acquisition, capture.get("image_sha256"))):
+            motion = None
+    selection = _mapping(motion.get("selection")) if motion is not None else None
+    motion_bbox = _box_from_edges(selection.get("final_bounds_px"), width, height) if selection else None
+    motion_source = _nonempty_text(selection.get("source")) if selection else ""
+
+    predicted_bird_count = (
+        len(source_boxes) if predicted_is_bird is True
+        else 0 if predicted_is_bird is False
+        else None
+    )
+    return _CameraCaptureData(
+        capture_id=capture_id,
+        width=width,
+        height=height,
+        captured_at=_nonempty_text(acquisition.get("received_at")),
+        camera_id=_nonempty_text(acquisition.get("camera_id")),
+        camera_name=_nonempty_text(acquisition.get("camera_name")),
+        camera_model=_nonempty_text(acquisition.get("camera_model")),
+        event_id=_nonempty_text(acquisition.get("event_id")),
+        deployment_id=_nonempty_text(acquisition.get("deployment_id")),
+        inference_status=inference_status,
+        predicted_is_bird=predicted_is_bird,
+        predicted_species=predicted_species,
+        prediction_confidence=prediction_confidence,
+        predicted_bird_count=predicted_bird_count,
+        source_boxes=tuple(source_boxes),
+        motion_bbox=motion_bbox,
+        motion_source=motion_source,
+    )
 
 
 def load_image_directory(
@@ -571,10 +841,6 @@ def load_image_directory(
     for index, image_path in enumerate(images, 1):
         relative_path = image_path.relative_to(root).as_posix()
         image_id = image_path.stem
-        source_id = image_id
-        if source_id in source_ids:
-            source_id = f"image:{index}:{relative_path}"
-        source_ids.add(source_id)
         width: int | None = None
         height: int | None = None
         try:
@@ -583,10 +849,25 @@ def load_image_directory(
                 width, height = image.size
         except (OSError, ValueError):
             pass
-        is_bird, species = _sidecar_manual_label(image_path)
+        acquisition = _load_json_object(image_path.with_suffix(".json"))
+        label_acquisition = acquisition
+        if acquisition is not None and not _acquisition_matches_image(image_path, acquisition):
+            acquisition = None
+            label_acquisition = {}
+        capture = _camera_capture_data(image_path, acquisition, width, height)
+        source_id = capture.capture_id if capture else image_id
+        if source_id in source_ids:
+            if capture:
+                raise ValueError(f"duplicate camera capture_id {source_id!r} in {root}")
+            source_id = f"image:{index}:{relative_path}"
+        source_ids.add(source_id)
+        if capture:
+            image_id = capture.capture_id
+            width, height = capture.width, capture.height
+        is_bird, species = _sidecar_manual_label(image_path, label_acquisition)
         record = ImageRecord(
             source_id=source_id,
-            source_dataset="image_directory",
+            source_dataset="esp32_capture" if capture else "image_directory",
             image_id=image_id,
             relative_path=relative_path,
             stored_path=str(image_path),
@@ -595,6 +876,20 @@ def load_image_directory(
             class_name=species,
             is_bird=is_bird,
             bird_count=0 if is_bird is False else None,
+            captured_at=capture.captured_at if capture else "",
+            camera_id=capture.camera_id if capture else "",
+            camera_name=capture.camera_name if capture else "",
+            camera_model=capture.camera_model if capture else "",
+            event_id=capture.event_id if capture else "",
+            deployment_id=capture.deployment_id if capture else "",
+            inference_status=capture.inference_status if capture else "",
+            predicted_is_bird=capture.predicted_is_bird if capture else None,
+            predicted_species=capture.predicted_species if capture else "",
+            prediction_confidence=capture.prediction_confidence if capture else None,
+            predicted_bird_count=capture.predicted_bird_count if capture else None,
+            source_boxes=capture.source_boxes if capture else (),
+            motion_bbox=capture.motion_bbox if capture else None,
+            motion_source=capture.motion_source if capture else "",
         )
         records.append(record)
         if is_bird is not None and width and height:
@@ -763,6 +1058,9 @@ def filter_records(
             for value in (
                 record.source_id, record.image_id, record.relative_path,
                 record.class_id, record.class_name, record.bbox_status,
+                record.camera_id, record.camera_name, record.camera_model,
+                record.event_id, record.deployment_id, record.captured_at,
+                record.inference_status, record.predicted_species,
             )
         ):
             continue
@@ -790,6 +1088,9 @@ def sort_records(
     fields = {
         "source_id", "source_dataset", "image_id", "relative_path", "bbox_status",
         "class_id", "class_name", "split", "confidence", "detection_count",
+        "captured_at", "camera_id", "camera_name", "camera_model", "event_id",
+        "deployment_id", "inference_status", "predicted_species", "prediction_confidence",
+        "predicted_bird_count",
     }
     if field not in fields:
         raise ValueError(f"unsupported record sort key: {key}")
@@ -1322,6 +1623,7 @@ __all__ = [
     "ImageRecord",
     "REVIEW_STATES",
     "ReviewRecord",
+    "SourceBox",
     "bbox_with_context",
     "filter_records",
     "load_bbox_dataset",
