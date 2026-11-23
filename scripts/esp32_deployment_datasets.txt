@@ -1,0 +1,15 @@
+final confirmed dataset 
+D:\Datasets\ESP32Cam_confirmed
+
+1.
+D:\Datasets\ESP32Cam_deployments\2026-11-16_garden-feeder_preupdate_rescue\captures
+2.
+D:\Datasets\ESP32Cam_deployments\garden-feeder-20261116-20261116T164920Z\bird_images
+3.
+D:\Datasets\ESP32Cam_deployments\garden-feeder-20261116-final-20261116T185129Z\bird_images
+4.
+D:\Datasets\ESP32Cam_deployments\garden-feeder-sd-retained-20261116T193750Z\bird_images
+5.
+D:\Datasets\ESP32Cam_deployments\bird_images.completed-garden-feeder-20261117-run1-20261117T135948Z
+6.
+D:\Datasets\ESP32Cam_deployments\bird_images

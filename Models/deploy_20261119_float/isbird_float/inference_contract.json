@@ -1,0 +1,40 @@
+{
+  "model_file": "model_float32.tflite",
+  "task": "binary bird/not-bird classification of the Pi-selected crop",
+  "labels": {
+    "0": "not_bird",
+    "1": "bird"
+  },
+  "positive_output": "bird_probability",
+  "bird_probability_threshold": 0.90234375,
+  "input_shape": [
+    1,
+    224,
+    224,
+    3
+  ],
+  "input_dtype": "float32",
+  "output_dtype": "float32",
+  "color_order": "RGB",
+  "jpeg_decode_channels": 3,
+  "geometry": "selected_crop_then_letterbox",
+  "geometry_location": "outside the model",
+  "crop_source": "capture_motion_record.selection.final_bounds_px",
+  "crop_coordinate_space": "original_decoded_frame_pixels",
+  "crop_bounds_semantics": "half_open_left_top_right_bottom",
+  "crop_is_final": true,
+  "additional_runtime_margin": 0,
+  "resize_method": "TensorFlow bilinear",
+  "resize_antialias": true,
+  "letterbox_padding_value": 0,
+  "numeric_scaling": "[0,255] to [-1,1] inside the model",
+  "trained_crop_types": [
+    "static_roi",
+    "bird_blob",
+    "static_roi_empty",
+    "random_blob_empty",
+    "same_scene_bird_free"
+  ],
+  "threshold_selection": "max validation recall with FPR <= 0.1 over all validation crop types (uint8 TFLite)",
+  "note": "float32 twin of the v4 isBird uint8 model for Pis whose TFLite runtime runs uint8 slowly; same probability threshold"
+}

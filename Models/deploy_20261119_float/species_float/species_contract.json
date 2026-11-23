@@ -1,0 +1,170 @@
+{
+  "model_file": "model_float32.tflite",
+  "float_model_file": "model_float32.tflite",
+  "labels_file": "labels.txt",
+  "task": "species of one localised bird",
+  "arm": "esp32_plus_outside",
+  "classes": [
+    "American Crow",
+    "American Goldfinch",
+    "American Robin",
+    "American Tree Sparrow",
+    "Black-capped Chickadee",
+    "Blue Jay",
+    "Brown-headed Cowbird",
+    "Carolina Wren",
+    "Chipping Sparrow",
+    "Common Grackle",
+    "Dark-eyed Junco",
+    "Downy Woodpecker",
+    "European Starling",
+    "Gray Catbird",
+    "Hairy Woodpecker",
+    "House Finch",
+    "House Sparrow",
+    "Mourning Dove",
+    "Northern Cardinal",
+    "Northern Flicker",
+    "Northern Mockingbird",
+    "Pine Siskin",
+    "Purple Finch",
+    "Red-bellied Woodpecker",
+    "Red-breasted Nuthatch",
+    "Red-winged Blackbird",
+    "Rock Pigeon",
+    "Song Sparrow",
+    "Tufted Titmouse",
+    "White-breasted Nuthatch",
+    "White-throated Sparrow"
+  ],
+  "camera_trained_classes": [
+    "American Crow",
+    "Black-capped Chickadee",
+    "Blue Jay",
+    "Downy Woodpecker",
+    "House Sparrow",
+    "Mourning Dove",
+    "Northern Cardinal",
+    "Red-bellied Woodpecker",
+    "Song Sparrow",
+    "Tufted Titmouse",
+    "White-breasted Nuthatch"
+  ],
+  "outside_only_classes": [
+    "American Goldfinch",
+    "American Robin",
+    "American Tree Sparrow",
+    "Brown-headed Cowbird",
+    "Carolina Wren",
+    "Chipping Sparrow",
+    "Common Grackle",
+    "Dark-eyed Junco",
+    "European Starling",
+    "Gray Catbird",
+    "Hairy Woodpecker",
+    "House Finch",
+    "Northern Flicker",
+    "Northern Mockingbird",
+    "Pine Siskin",
+    "Purple Finch",
+    "Red-breasted Nuthatch",
+    "Red-winged Blackbird",
+    "Rock Pigeon",
+    "White-throated Sparrow"
+  ],
+  "input_shape": [
+    1,
+    224,
+    224,
+    3
+  ],
+  "input_dtype": "float32",
+  "output_dtype": "float32",
+  "output": "softmax probabilities in labels.txt order",
+  "geometry": "detector_box_square_context_crop_then_letterbox",
+  "geometry_location": "outside the model",
+  "box_source": "localiser / detector box in original frame pixels (fallback: the isBird selected crop)",
+  "crop_rule": {
+    "context": 1.5,
+    "min_size_px": 48,
+    "shape": "square, centred, shifted inside the frame"
+  },
+  "color_order": "RGB",
+  "jpeg_decode_channels": 3,
+  "resize_method": "TensorFlow bilinear",
+  "resize_antialias": true,
+  "letterbox_padding_value": 0,
+  "numeric_scaling": "[0,255] to [-1,1] inside the model",
+  "visit_aggregation": {
+    "gap_seconds": 120,
+    "rule": "mean probability of the best-localised bird per capture"
+  },
+  "automation": {
+    "species_min_confidence": 0.7699999809265137,
+    "group_min_confidence": null,
+    "auto_species": [
+      "Black-capped Chickadee",
+      "Blue Jay",
+      "House Sparrow",
+      "Mourning Dove",
+      "Northern Cardinal",
+      "White-breasted Nuthatch"
+    ],
+    "groups": {
+      "sparrow-like": [
+        "House Sparrow",
+        "Song Sparrow",
+        "White-throated Sparrow",
+        "Chipping Sparrow",
+        "American Tree Sparrow",
+        "Dark-eyed Junco",
+        "House Finch",
+        "Purple Finch",
+        "American Goldfinch",
+        "Pine Siskin"
+      ],
+      "dove/pigeon": [
+        "Mourning Dove",
+        "Rock Pigeon"
+      ],
+      "jay/crow": [
+        "Blue Jay",
+        "American Crow"
+      ],
+      "chickadee/titmouse": [
+        "Black-capped Chickadee",
+        "Tufted Titmouse"
+      ],
+      "nuthatch": [
+        "White-breasted Nuthatch",
+        "Red-breasted Nuthatch"
+      ],
+      "woodpecker": [
+        "Downy Woodpecker",
+        "Hairy Woodpecker",
+        "Red-bellied Woodpecker",
+        "Northern Flicker"
+      ],
+      "cardinal": [
+        "Northern Cardinal"
+      ],
+      "blackbird-like": [
+        "Common Grackle",
+        "Red-winged Blackbird",
+        "Brown-headed Cowbird",
+        "European Starling"
+      ],
+      "other songbird": [
+        "Carolina Wren",
+        "American Robin",
+        "Northern Mockingbird",
+        "Gray Catbird"
+      ]
+    },
+    "target_precision": 0.95,
+    "selected_on": "4-fold out-of-fold visit tracks",
+    "note": "Song Sparrow removed from auto_species after the run: all its visits come from one day (legacy camera, 2026-10-07), and both wrong test auto-labels were that day's visit predicted as Song Sparrow. Rule now in the notebook as MIN_DAYS_FOR_AUTO = 2."
+  },
+  "localizer": "esp32_roi_v3",
+  "localizer_model_sha256_prefix": "a41d82e461f3"
+}

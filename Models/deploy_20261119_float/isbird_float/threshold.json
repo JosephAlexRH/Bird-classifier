@@ -1,0 +1,18 @@
+{
+  "bird_probability_threshold": 0.90234375,
+  "selected_on": "validation scenes, uint8 TFLite",
+  "validation": {
+    "raw_threshold": 231.0,
+    "n": 1285.0,
+    "birds": 686.0,
+    "tp": 663.0,
+    "fp": 58.0,
+    "fn": 23.0,
+    "tn": 541.0,
+    "recall": 0.9664723032069971,
+    "false_positive_rate": 0.09682804674457429,
+    "precision": 0.9195561719833565,
+    "accuracy": 0.9369649805447471
+  },
+  "note": "probability rule for the float32 model"
+}
