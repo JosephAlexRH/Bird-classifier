@@ -29,6 +29,8 @@
   "wait_for_classification": false,
   "burst_count": 3,
   "burst_interval_ms": 150,
+  "idle_power_down_s": 30,
+  "status_led": "boot",
   "keep_reference_after_trigger": true,
   "max_consecutive_triggers": 10,
   "buffer_uploads_to_sd": false,

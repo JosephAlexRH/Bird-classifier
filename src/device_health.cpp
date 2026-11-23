@@ -193,7 +193,9 @@ void sendHeartbeat() {
 
   HTTPClient http;
   http.setConnectTimeout(2000);
-  http.setTimeout(3000);
+  // A busy Pi Zero hub (polling + inference) often takes 2-4 s to answer. This
+  // runs in the health task, so waiting longer blocks nothing else.
+  http.setTimeout(8000);
   if (!http.begin(url)) {
     ++heartbeatsFailed;
     lastHeartbeatHttpCode = -1;
@@ -464,5 +466,23 @@ void rebootDevice(const char *reason) {
   delay(200);
   ESP.restart();
   while (true) {
+  }
+}
+
+HubLinkState getHubLinkState() {
+  if (heartbeatsOk == 0 && heartbeatsFailed == 0) return HubLinkState::Unknown;
+  return (lastHeartbeatOk && heartbeatsOk > 0) ? HubLinkState::Reachable : HubLinkState::Unreachable;
+}
+
+bool didLastResetFail() {
+  switch (bootResetReason) {
+    case ESP_RST_PANIC:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+    case ESP_RST_BROWNOUT:
+      return true;
+    default:
+      return false;
   }
 }

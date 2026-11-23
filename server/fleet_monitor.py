@@ -40,7 +40,11 @@ SAVE_EVERY_SECONDS = 10
 CAMERA_REQUEST_TIMEOUT_SECONDS = 4
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FIRMWARE_ELF = REPO_ROOT / ".pio" / "build" / "esp32cam" / "firmware.elf"
+# One firmware.elf per PlatformIO environment (esp32cam, freenove_s3, ...).
+# A crash is decoded with whichever build's SHA matches the crashing camera.
+FIRMWARE_BUILD_DIR = REPO_ROOT / ".pio" / "build"
+DEFAULT_FIRMWARE_ELF = FIRMWARE_BUILD_DIR / "esp32cam" / "firmware.elf"
+_AUTO = object()
 BAD_RESET_REASONS = {"crash", "interrupt_watchdog", "task_watchdog", "other_watchdog", "brownout"}
 
 
@@ -48,61 +52,92 @@ def _utc_iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds")
 
 
-def find_addr2line(explicit: str | None = None) -> str | None:
-    """Locate the Xtensa addr2line that PlatformIO installed, if any."""
+def find_addr2line(explicit: str | None = None, chip: str = "esp32") -> str | None:
+    """Locate the Xtensa addr2line PlatformIO installed for ``chip`` (esp32 or esp32s3)."""
     candidates = [explicit, os.environ.get("ESP32_ADDR2LINE")]
-    candidates.append(shutil.which("xtensa-esp32-elf-addr2line"))
-    toolchain = Path.home() / ".platformio" / "packages" / "toolchain-xtensa-esp32" / "bin"
-    candidates += [
-        str(toolchain / "xtensa-esp32-elf-addr2line.exe"),
-        str(toolchain / "xtensa-esp32-elf-addr2line"),
-    ]
+    # Both chips are Xtensa, so the other toolchain's addr2line is a usable fallback.
+    for name in dict.fromkeys([chip, "esp32", "esp32s3"]):
+        candidates.append(shutil.which(f"xtensa-{name}-elf-addr2line"))
+        toolchain = Path.home() / ".platformio" / "packages" / f"toolchain-xtensa-{name}" / "bin"
+        candidates += [
+            str(toolchain / f"xtensa-{name}-elf-addr2line.exe"),
+            str(toolchain / f"xtensa-{name}-elf-addr2line"),
+        ]
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return candidate
     return None
 
 
+def _chip_for_build(elf: Path) -> str:
+    """Guess the chip from the PlatformIO environment directory name."""
+    return "esp32s3" if "s3" in elf.parent.name.lower() else "esp32"
+
+
 class CrashDecoder:
-    """Turns crash PCs into function names using the firmware ELF, when it matches."""
+    """Turns crash PCs into function names using the firmware ELF, when it matches.
+
+    By default every ``.pio/build/<env>/firmware.elf`` is a candidate, so a fleet
+    mixing AI Thinker and ESP32-S3 cameras decodes crashes from either build.
+    Pass one ``firmware_elf`` to pin a single build, or None to disable decoding.
+    """
 
     def __init__(
         self,
-        firmware_elf: Path | None = DEFAULT_FIRMWARE_ELF,
+        firmware_elf: Path | None | object = _AUTO,
         addr2line: str | None = None,
         runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     ) -> None:
-        self.firmware_elf = Path(firmware_elf) if firmware_elf else None
+        self._auto = firmware_elf is _AUTO
+        self._explicit_elf = None if self._auto or firmware_elf is None else Path(firmware_elf)
+        self._explicit_addr2line = addr2line
         self.addr2line = find_addr2line(addr2line)
         self._runner = runner
-        self._sha_cache: tuple[float, str] | None = None
+        self._sha_cache: dict[Path, tuple[float, str]] = {}
 
-    def _elf_sha16(self) -> str | None:
-        if self.firmware_elf is None or not self.firmware_elf.is_file():
-            return None
-        mtime = self.firmware_elf.stat().st_mtime
-        if self._sha_cache is None or self._sha_cache[0] != mtime:
-            digest = hashlib.sha256(self.firmware_elf.read_bytes()).hexdigest()
-            self._sha_cache = (mtime, digest[:16])
-        return self._sha_cache[1]
+    def candidates(self) -> list[Path]:
+        if self._explicit_elf is not None:
+            return [self._explicit_elf] if self._explicit_elf.is_file() else []
+        if not self._auto:
+            return []
+        return sorted(p for p in FIRMWARE_BUILD_DIR.glob("*/firmware.elf") if p.is_file())
+
+    @property
+    def firmware_elf(self) -> Path | None:
+        """First available build (kept for the status endpoint and older callers)."""
+        found = self.candidates()
+        return found[0] if found else self._explicit_elf
+
+    def _elf_sha16(self, elf: Path) -> str:
+        mtime = elf.stat().st_mtime
+        cached = self._sha_cache.get(elf)
+        if cached is None or cached[0] != mtime:
+            cached = (mtime, hashlib.sha256(elf.read_bytes()).hexdigest()[:16])
+            self._sha_cache[elf] = cached
+        return cached[1]
 
     def decode(self, crash: dict[str, Any]) -> dict[str, Any]:
         """Return {"status": ..., "frames": [...]} for a last_crash heartbeat block."""
         if self.addr2line is None:
             return {"status": "no_addr2line", "frames": []}
-        local_sha = self._elf_sha16()
-        if local_sha is None:
+        builds = self.candidates()
+        if not builds:
             return {"status": "no_firmware_elf", "frames": []}
         crash_sha = str(crash.get("firmware_elf_sha256") or "")[:16]
-        if crash_sha != local_sha:
-            return {"status": "firmware_mismatch", "frames": [], "local_elf_sha256": local_sha}
+        shas = {elf: self._elf_sha16(elf) for elf in builds}
+        elf = next((path for path, sha in shas.items() if sha == crash_sha), None)
+        if elf is None:
+            return {"status": "firmware_mismatch", "frames": [],
+                    "local_elf_sha256": shas[builds[0]],
+                    "local_builds": {path.parent.name: sha for path, sha in shas.items()}}
         addresses = [crash.get("pc")] + list(crash.get("backtrace") or [])
         addresses = [str(a) for a in addresses if isinstance(a, str) and a.startswith("0x")]
         if not addresses:
             return {"status": "no_addresses", "frames": []}
+        tool = find_addr2line(self._explicit_addr2line, _chip_for_build(elf)) or self.addr2line
         try:
             result = self._runner(
-                [self.addr2line, "-pfiaC", "-e", str(self.firmware_elf), *addresses],
+                [tool, "-pfiaC", "-e", str(elf), *addresses],
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -110,7 +145,7 @@ class CrashDecoder:
         except (OSError, subprocess.SubprocessError) as error:
             return {"status": f"addr2line_failed: {error}", "frames": []}
         frames = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        return {"status": "decoded", "frames": frames}
+        return {"status": "decoded", "frames": frames, "build": elf.parent.name}
 
 
 class FleetMonitor:
@@ -486,6 +521,7 @@ def register_fleet_routes(
             crash_decoding={
                 "addr2line": fleet.decoder.addr2line,
                 "firmware_elf": str(fleet.decoder.firmware_elf) if fleet.decoder.firmware_elf else None,
+                "firmware_builds": [str(path) for path in fleet.decoder.candidates()],
             },
         )
 

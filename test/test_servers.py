@@ -1167,6 +1167,100 @@ class RaspberryPiServerTests(unittest.TestCase):
         self.assertNotIn(camera["id"], app.config["MOTION_SERVICES"])
         app.config["CLEANUP"]()
 
+    def test_remove_camera_drops_registry_entry_and_bridge_forwards_deletes(self) -> None:
+        from email.message import Message as _Message
+        from flask import Flask
+        from server.pi_bridge import register_pi_bridge
+        registry = CameraRegistry(self.save_dir / "remove-registry.json")
+        camera = registry.add("Old feeder", "http://old.local")
+        app = create_pi_app(self.save_dir / "remove", camera_registry=registry)
+        self.assertEqual(app.test_client().delete(f"/api/cameras/{camera['id']}").status_code, 200)
+        self.assertIsNone(registry.resolve(camera["id"]))
+        self.assertEqual(app.test_client().delete(f"/api/cameras/{camera['id']}").status_code, 404)
+
+        laptop = Flask(__name__)
+        register_pi_bridge(laptop, self.save_dir / "pi.json", "http://pi.local:5000")
+        class Upstream:
+            status = 200
+            headers = _Message()
+            headers["Content-Type"] = "application/json"
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self, *_): return b'{"status":"removed"}'
+        with patch("server.pi_bridge.urlopen", return_value=Upstream()) as opener:
+            client = laptop.test_client()
+            self.assertEqual(client.delete("/api/pi/cameras/abc123").status_code, 200)
+            sent = opener.call_args.args[0]
+            self.assertEqual((sent.full_url, sent.get_method()), ("http://pi.local:5000/api/cameras/abc123", "DELETE"))
+            self.assertEqual(client.delete("/api/pi/fleet/esp32cam-0011aabb").status_code, 200)
+            self.assertEqual(opener.call_args.args[0].full_url, "http://pi.local:5000/api/fleet/esp32cam-0011aabb")
+            self.assertEqual(client.delete("/api/pi/fleet/bad%20id").status_code, 404)
+
+    def test_camera_rename_and_colour_reach_the_fleet_table(self) -> None:
+        registry = CameraRegistry(self.save_dir / "colour-registry.json")
+        camera = registry.add("Feeder", "http://feeder.local")
+        app = create_pi_app(self.save_dir / "colour", camera_registry=registry)
+        client = app.test_client()
+        response = client.patch(f"/api/cameras/{camera['id']}", json={"name": "Oak", "color": "#AA3300"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(client.patch(f"/api/cameras/{camera['id']}", json={"color": "blue"}).status_code, 422)
+        row = client.get("/api/hub/fleet").get_json()["cameras"][0]
+        self.assertEqual((row["name"], row["color"], row["parked"]), ("Oak", "#aa3300", False))
+
+    def test_bridge_patch_only_allows_name_and_colour(self) -> None:
+        from email.message import Message as _Message
+        from flask import Flask
+        from server.pi_bridge import register_pi_bridge
+        laptop = Flask(__name__)
+        register_pi_bridge(laptop, self.save_dir / "pi-patch.json", "http://pi.local:5000")
+        class Upstream:
+            status = 200
+            headers = _Message()
+            headers["Content-Type"] = "application/json"
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self, *_): return b'{"camera":{}}'
+        with patch("server.pi_bridge.urlopen", return_value=Upstream()) as opener:
+            client = laptop.test_client()
+            self.assertEqual(client.patch("/api/pi/cameras/abc", json={"color": "#112233"}).status_code, 200)
+            sent = opener.call_args.args[0]
+            self.assertEqual(sent.get_method(), "PATCH")
+            self.assertEqual(json.loads(sent.data), {"color": "#112233"})
+            self.assertEqual(client.patch("/api/pi/cameras/abc", json={"url": "http://evil"}).status_code, 400)
+
+    @patch("server.raspberry_pi_server.urlopen")
+    def test_dashboard_request_waits_for_poller_instead_of_busy(self, mocked_urlopen) -> None:
+        import threading
+        registry = CameraRegistry(self.save_dir / "queued-registry.json")
+        camera = registry.add("Feeder", "http://feeder.local")
+        app = create_pi_app(self.save_dir / "queued", camera_registry=registry)
+        mocked_urlopen.return_value = FakeUpstream(b'{"runtime_state":"idle"}')
+        lock = registry.operation_lock(camera["id"])
+        lock.acquire()  # the background poller is mid-frame
+        threading.Timer(0.3, lock.release).start()
+        response = app.test_client().get(f"/api/cameras/{camera['id']}/status")
+        self.assertEqual(response.status_code, 200)
+
+    @patch("server.raspberry_pi_server.urlopen")
+    def test_dashboard_request_is_busy_at_once_while_streaming(self, mocked_urlopen) -> None:
+        import time as time_module
+        registry = CameraRegistry(self.save_dir / "streaming-registry.json")
+        camera = registry.add("Feeder", "http://feeder.local")
+        app = create_pi_app(self.save_dir / "streaming", camera_registry=registry)
+        lock = registry.operation_lock(camera["id"])
+        lock.acquire()
+        registry.set_streaming(camera["id"], True)
+        try:
+            started = time_module.monotonic()
+            response = app.test_client().get(f"/api/cameras/{camera['id']}/status")
+            elapsed = time_module.monotonic() - started
+        finally:
+            registry.set_streaming(camera["id"], False)
+            lock.release()
+        self.assertEqual(response.status_code, 409)
+        self.assertLess(elapsed, 1.0)
+        mocked_urlopen.assert_not_called()
+
     @patch("server.raspberry_pi_server.classify", return_value={"is_bird": False, "confidence": 0.1})
     def test_upload_is_attributed_and_capture_listing_filters_by_camera(self, _mocked_classify) -> None:
         registry = CameraRegistry(self.save_dir / "attributed-registry.json")

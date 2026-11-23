@@ -68,7 +68,10 @@ def register_camera_tools(app, registry, store, camera_proxy, on_capture):
         if error is not None:
             return error
         operation = registry.operation_lock(camera["id"])
-        if operation is None or not operation.acquire(blocking=False):
+        # The Pi hub queues dashboard requests behind its poller (see
+        # acquire_camera); other servers keep the immediate "busy" answer.
+        acquire = app.config.get("ACQUIRE_CAMERA") or (lambda _camera, lock: lock.acquire(blocking=False))
+        if operation is None or not acquire(camera, operation):
             return jsonify(error="Camera is busy. Retry after the current capture."), 409
         upstream = None
         try:

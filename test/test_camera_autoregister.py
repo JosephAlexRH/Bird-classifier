@@ -87,12 +87,28 @@ class RegistryHeartbeatTests(unittest.TestCase):
         self.assertFalse(bound["needs_name"])
         self.assertEqual(len(self.registry.snapshot()), 1)
 
-    def test_address_held_by_another_known_camera_is_left_alone(self) -> None:
-        self.registry.observe_heartbeat("esp32cam-old", "192.168.1.50")
+    def test_new_camera_on_a_reused_address_replaces_the_stale_entry(self) -> None:
+        old, _ = self.registry.observe_heartbeat("esp32cam-old", "192.168.1.50")
         camera, change = self.registry.observe_heartbeat("esp32cam-new", "192.168.1.50")
-        self.assertIsNone(camera)
-        self.assertEqual(change, "conflict")
-        self.assertEqual(len(self.registry.snapshot()), 1)
+        self.assertEqual(change, "replaced")
+        self.assertEqual(camera["hardware_camera_id"], "esp32cam-new")
+        self.assertEqual(camera["url"], "http://192.168.1.50")
+        parked = self.registry.get(old["id"])
+        self.assertTrue(parked["url"].endswith(".invalid"))
+        # The old camera's own heartbeat from a new lease is an ordinary move.
+        moved, change = self.registry.observe_heartbeat("esp32cam-old", "192.168.1.51")
+        self.assertEqual((change, moved["url"]), ("moved", "http://192.168.1.51"))
+        # Both survive a reload (URLs stay unique).
+        self.assertEqual(len(CameraRegistry(self.file).snapshot()), 2)
+
+    def test_camera_colour_is_validated_and_persisted(self) -> None:
+        camera, _ = self.registry.observe_heartbeat("esp32cam-1", "192.168.1.50")
+        self.assertIsNone(camera["color"])
+        self.assertEqual(self.registry.update(camera["id"], color="#1A2B3C")["color"], "#1a2b3c")
+        self.assertEqual(CameraRegistry(self.file).get(camera["id"])["color"], "#1a2b3c")
+        with self.assertRaises(ValueError):
+            self.registry.update(camera["id"], color="red")
+        self.assertIsNone(self.registry.update(camera["id"], color=None)["color"])
 
     def test_naming_a_camera_clears_the_prompt(self) -> None:
         camera, _ = self.registry.observe_heartbeat("esp32cam-1", "192.168.1.50")
@@ -117,9 +133,11 @@ class RegistryHeartbeatTests(unittest.TestCase):
         self.assertEqual(sync_registry_from_heartbeat(self.registry, heartbeat(), None, log=lines.append)[1], "added")
         self.assertEqual(sync_registry_from_heartbeat(self.registry, heartbeat(), None, log=lines.append)[1], "unchanged")
         other = heartbeat(camera_id="esp32cam-other")
-        for _ in range(3):
-            self.assertEqual(sync_registry_from_heartbeat(self.registry, other, None, log=lines.append)[1], "conflict")
-        self.assertEqual(len(lines), 2)  # one "added", one conflict notice
+        self.assertEqual(sync_registry_from_heartbeat(self.registry, other, None, log=lines.append)[1], "replaced")
+        for _ in range(2):
+            self.assertEqual(sync_registry_from_heartbeat(self.registry, other, None, log=lines.append)[1], "unchanged")
+        self.assertEqual(len(lines), 2)  # one "added", one "replaced" notice
+        self.assertIn("parked", lines[1])
 
 
 class ServerHeartbeatTests(unittest.TestCase):

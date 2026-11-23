@@ -56,12 +56,17 @@ struct Config {
   float motionMaxClippedFraction;
   int motionMinValidBlocks;
   float motionMaxChangedFraction;
+  // Seconds without any frame request before the sensor is powered down (0 = never).
+  int idlePowerDownS;
+  // StatusLedMode (status_led.h): 0 off, 1 boot (first 5 min), 2 on.
+  int statusLedMode;
   // Hub name looked up on the network (see hub_locator.h); serverIp is the fallback.
   // Keep this the last member: cfg is initialized positionally in app_config.cpp.
   char serverHost[64];
 };
 
 constexpr int kMaxBurstCount = 10;
+constexpr int kMaxIdlePowerDownS = 86400;
 constexpr int kMaxBurstIntervalMs = 5000;
 constexpr int kMaxConsecutiveTriggersLimit = 100;
 constexpr int kMaxMotionBlocks = 64;

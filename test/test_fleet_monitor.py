@@ -109,6 +109,26 @@ class FleetMonitorTests(unittest.TestCase):
         decoder = CrashDecoder(elf, str(addr2line), runner=lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
         self.assertEqual(decoder.decode(CRASH)["status"], "firmware_mismatch")
 
+    def test_decoder_picks_the_build_whose_sha_matches(self) -> None:
+        import hashlib
+        from unittest import mock
+        from server import fleet_monitor
+
+        build_dir = self.directory / "build"
+        for env, payload in (("esp32cam", b"classic build"), ("freenove_s3", b"s3 build")):
+            (build_dir / env).mkdir(parents=True)
+            (build_dir / env / "firmware.elf").write_bytes(payload)
+        addr2line = self.directory / "addr2line"
+        addr2line.write_text("")
+        calls = []
+        runner = lambda args, **k: calls.append(args) or subprocess.CompletedProcess(args, 0, "0x4200 in f at x.cpp:1\n", "")
+        crash = dict(CRASH, firmware_elf_sha256=hashlib.sha256(b"s3 build").hexdigest()[:16], pc="0x4200")
+        with mock.patch.object(fleet_monitor, "FIRMWARE_BUILD_DIR", build_dir):
+            decoded = CrashDecoder(addr2line=str(addr2line), runner=runner).decode(crash)
+        self.assertEqual(decoded["status"], "decoded")
+        self.assertEqual(decoded["build"], "freenove_s3")
+        self.assertIn(str(build_dir / "freenove_s3" / "firmware.elf"), calls[0])
+
 
 if __name__ == "__main__":
     unittest.main()

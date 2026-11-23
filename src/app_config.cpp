@@ -10,6 +10,9 @@
 #include <freertos/semphr.h>
 #include <mbedtls/sha256.h>
 
+#include "board_pins.h"
+#include "status_led.h"
+
 #if __has_include("secrets.h")
 #include "secrets.h"
 #define HAS_COMPILED_WIFI_SECRETS 1
@@ -236,6 +239,8 @@ Config cfg = {
     0.25f, // maximum clipped-pixel fraction in either version of a block
     12,    // minimum valid blocks required for a decision
     0.45f, // broad-change upper bound (lighting/scene change rather than motion)
+    30,    // idle seconds before the sensor powers down; 0 keeps it awake
+    static_cast<int>(StatusLedMode::Boot),  // status light for 5 min after power-up
     "birdhub.local",  // hub name found by mDNS; server_ip above is the fallback
 };
 
@@ -329,7 +334,11 @@ bool parseConfigFramesize(const char *name, int &framesize) {
 }
 
 void mountStorage() {
-  // One-bit mode avoids conflicts with the AI Thinker ESP32-CAM pins.
+  // One-bit mode avoids conflicts with the AI Thinker ESP32-CAM pins. The S3
+  // routes SDMMC through the GPIO matrix, so its pins are set explicitly.
+#if CONFIG_IDF_TARGET_ESP32S3
+  if (kSdNeedsPins) SD_MMC.setPins(kSdClkPin, kSdCmdPin, kSdD0Pin);
+#endif
   if (SD_MMC.begin("/sdcard", true) && SD_MMC.cardType() != CARD_NONE) {
     sdReady = true;
     configStorage = &SD_MMC;
@@ -493,6 +502,17 @@ void loadConfig() {
   if (document.containsKey("burst_count")) {
     cfg.burstCount = constrain(document["burst_count"].as<int>(), 1, kMaxBurstCount);
   }
+  if (document.containsKey("idle_power_down_s")) {
+    cfg.idlePowerDownS = constrain(document["idle_power_down_s"].as<int>(), 0, kMaxIdlePowerDownS);
+  }
+  if (document.containsKey("status_led")) {
+    StatusLedMode mode;
+    if (parseStatusLedMode(document["status_led"] | "", mode)) {
+      cfg.statusLedMode = static_cast<int>(mode);
+    } else {
+      Serial.println("Unknown status_led value; expected off, boot or on");
+    }
+  }
   if (document.containsKey("burst_interval_ms")) {
     cfg.burstIntervalMs = constrain(document["burst_interval_ms"].as<int>(), 0, kMaxBurstIntervalMs);
   }
@@ -586,6 +606,10 @@ void loadConfig() {
   Serial.printf("  wait_for_classif.:  %s\n", cfg.waitForClassification ? "true" : "false");
   Serial.printf("  burst_count:        %d\n", cfg.burstCount);
   Serial.printf("  burst_interval_ms:  %d\n", cfg.burstIntervalMs);
+  Serial.printf("  idle_power_down_s:  %d%s\n", cfg.idlePowerDownS,
+                cfg.idlePowerDownS == 0 ? " (never)" : "");
+  Serial.printf("  status_led:         %s\n",
+                statusLedModeName(static_cast<StatusLedMode>(cfg.statusLedMode)));
   Serial.printf("  keep_reference:     %s\n", cfg.keepReferenceAfterTrigger ? "true" : "false");
   Serial.printf("  max_consec_trig.:   %d\n", cfg.maxConsecutiveTriggers);
   Serial.printf("  buffer_to_sd:       %s\n", cfg.bufferUploadsToSd ? "true" : "false");
@@ -628,6 +652,8 @@ void saveConfig() {
   document["wait_for_classification"] = cfg.waitForClassification;
   document["burst_count"] = cfg.burstCount;
   document["burst_interval_ms"] = cfg.burstIntervalMs;
+  document["idle_power_down_s"] = cfg.idlePowerDownS;
+  document["status_led"] = statusLedModeName(static_cast<StatusLedMode>(cfg.statusLedMode));
   document["keep_reference_after_trigger"] = cfg.keepReferenceAfterTrigger;
   document["max_consecutive_triggers"] = cfg.maxConsecutiveTriggers;
   document["buffer_uploads_to_sd"] = cfg.bufferUploadsToSd;

@@ -12,16 +12,16 @@ fallback for deployments that need it.
 
 ## Supported hardware
 
-- AI Thinker ESP32-CAM, as configured by the `esp32cam` environment in
-  [`platformio.ini`](../platformio.ini)
-- OV2640 or OV5640 camera sensor
-- ESP32-CAM-MB programmer, or a correctly wired USB-to-UART adapter
-- Stable 5 V supply
-- FAT32 microSD card for configuration, optional bird retention, and optional
-  failed-upload buffering
+| Board | PlatformIO env | Notes |
+|---|---|---|
+| AI Thinker ESP32-CAM | `esp32cam` | Original fleet board; flashed through an ESP32-CAM-MB or USB-to-UART adapter |
+| Freenove ESP32-S3 WROOM CAM (N8R8) | `freenove_s3` | 8 MB flash, 8 MB octal PSRAM; flash through the USB-C port wired to the CH343 UART bridge. See the [S3 bring-up and field guide](esp32-s3-bringup.md) |
 
-The current PlatformIO project does not define an ESP32-S3 board environment.
-Adding one requires a board-specific pin map and build configuration.
+Both boards take an OV2640 or OV5640 sensor and need a stable 5 V supply and a
+FAT32 microSD card for configuration, optional bird retention, and optional
+failed-upload buffering. Pin maps for each board are in
+[`include/board_pins.h`](../include/board_pins.h); `pio run` with no `-e`
+builds both.
 
 ## Setup
 
@@ -133,6 +133,8 @@ running clock.
 | `wait_for_classification` | bool | `true`: wait for the receiver's classification after each upload (needed for SD bird saves). `false`: send `X-ESP32-Classification: deferred`, let the receiver queue inference, and re-arm motion immediately; nothing is saved to SD |
 | `burst_count` | int | JPEGs captured and uploaded per motion trigger (1-10) |
 | `burst_interval_ms` | int | Pause between burst JPEGs in milliseconds (0-5000) |
+| `status_led` | string | When the board's status light is lit: `boot` (default, first 5 minutes after power-up), `on` (always, including a flicker per capture) or `off`. Freenove ESP32-S3 only; see [Status light](#status-light) |
+| `idle_power_down_s` | int | Seconds with no frame requests before the sensor is powered down (default 30; 0 = never, 0-86400). The first frame after a power-down takes about 2-3 s while the sensor restarts and exposure settles. On the Freenove ESP32-S3 the sensor has no power-down line, so this only stops its clock and DMA |
 | `keep_reference_after_trigger` | bool | `true`: keep the pre-trigger background after a burst, so a subject that stays in view keeps triggering. `false`: relearn the background after every trigger |
 | `max_consecutive_triggers` | int | Back-to-back triggers (1-100) after which the background is relearned anyway, so a permanent scene change cannot trigger forever |
 | `buffer_uploads_to_sd` | bool | Write motion JPEGs that cannot be delivered to `/pending` on the SD card and upload them later, one every 2 s, once the receiver answers again |
@@ -306,6 +308,44 @@ evaluation/training cohorts: do not backfill missing legacy camera models or
 pool sensor metrics without explicitly accounting for the camera-induced data
 shift.
 
+## Status light
+
+The Freenove ESP32-S3 board's RGB LED (GPIO 48) shows the camera's state. The
+AI Thinker ESP32-CAM has no RGB LED, so `status_led` has no effect there. The
+light runs at about 10 % brightness.
+
+At boot it flashes once or more, in this order:
+
+| Flash | Meaning |
+|---|---|
+| White, once | Booted (power-on or reset) |
+| Orange, twice | The previous restart was a crash, watchdog reset or brownout; check the dashboard's Fleet tab for the crash record |
+| Purple, once | No usable SD card, so the configuration came from SPIFFS |
+
+After that it shows the highest-priority current state:
+
+| Pattern | Meaning |
+|---|---|
+| Red, fast blink | Camera failed to initialize; the board reboots within 60 s (see the serial log's `camera bus:` lines) |
+| Cyan, solid | Streaming |
+| White, brief flicker | A frame was just captured (only when `status_led` is `on`) |
+| Blue, slow blink | Joining Wi-Fi, or waiting for the first heartbeat reply |
+| Yellow, slow blink | On Wi-Fi but the hub is not answering heartbeats (wrong network, hub down, or out of range). A single slow hub reply can show this until the next heartbeat 15 s later |
+| Green, slow fade | All good; the camera sensor is asleep after `idle_power_down_s` |
+| Green, short blink every 3 s | All good: Wi-Fi up, hub answering, camera ready |
+
+`status_led` chooses when it is lit:
+
+- `boot` (default): lit for the first 5 minutes after power-up, then dark. Use
+  this in the field: you can check a camera on site after plugging it in, and it
+  stays dark afterwards so it doesn't startle birds, reflect into images or
+  draw attention.
+- `on`: always lit, including the capture flicker. For bench work.
+- `off`: never lit (the LED is switched off at boot).
+
+The setting can be changed from the dashboard's camera settings card and takes
+effect immediately; the 5-minute window always counts from power-up.
+
 ## Security note
 
 This firmware has no authentication and is meant for a trusted home LAN only. Do not expose port 80 on this device to the public internet — anyone on the same network can pull camera frames or change its configuration.
@@ -334,6 +374,9 @@ pio run -e esp32cam             # build
 pio run -e esp32cam -t upload   # build and flash firmware
 pio run -e esp32cam -t uploadfs # upload data/config.json to SPIFFS
 pio device monitor              # serial monitor at 115200 baud
+
+pio run -e freenove_s3 -t upload --upload-port COMx   # Freenove ESP32-S3
+pio device monitor -e freenove_s3 --port COMx
 ```
 
 Return to the [project overview](../README.md).

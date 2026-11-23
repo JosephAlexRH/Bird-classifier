@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import ipaddress
 import json
+import re
 import os
 import threading
 import time
@@ -74,6 +75,28 @@ def normalize_camera_url(value: str | None) -> str | None:
     return urlunsplit((parsed.scheme.lower(), netloc, "", "", ""))
 
 
+CAMERA_COLOR_PATTERN = re.compile(r"^#[0-9a-f]{6}$")
+STALE_HOST_SUFFIX = ".invalid"
+
+
+def normalize_camera_color(value: Any) -> str | None:
+    """A #rrggbb tag colour chosen in the dashboard, or None for the default."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not CAMERA_COLOR_PATTERN.match(value.strip().lower()):
+        raise ValueError("color must be a #rrggbb hex colour.")
+    return value.strip().lower()
+
+
+def stale_camera_url(camera_id: str) -> str:
+    """A unique placeholder for a camera whose last address now belongs to another camera.
+
+    ``.invalid`` is reserved and never resolves, so nothing is sent to it; the
+    camera's next heartbeat re-addresses it as a normal move.
+    """
+    return f"http://stale-{camera_id[:12]}{STALE_HOST_SUFFIX}"
+
+
 def normalize_camera_address(value: Any) -> str:
     """Normalize a camera IP, hostname, or complete base URL."""
     if not isinstance(value, str) or not value.strip():
@@ -138,8 +161,8 @@ def sync_registry_from_heartbeat(
 ) -> tuple[dict[str, Any] | None, str]:
     """Add or re-address a registry camera from its own heartbeat.
 
-    Returns (camera, change); change is one of "added", "moved", "bound",
-    "unchanged", "conflict" or "ignored".
+    Returns (camera, change); change is one of "added", "replaced", "moved",
+    "bound", "unchanged", "conflict" or "ignored".
     """
     log = log or (lambda message: print(message, flush=True))
     address = heartbeat_address(payload, remote_addr)
@@ -158,6 +181,11 @@ def sync_registry_from_heartbeat(
                 "but that address belongs to another registered camera that has not checked in. "
                 "Remove the old camera from the dashboard if it has been retired."
             )
+    elif change == "replaced" and camera is not None:
+        log(
+            f"Camera registry: added {camera['name']} [{camera['hardware_camera_id']}] at {camera['url']}; "
+            "the camera previously registered at that address is parked until its next heartbeat"
+        )
     elif change != "unchanged" and camera is not None:
         log(
             f"Camera registry: {change} {camera['name']} "
@@ -215,7 +243,7 @@ class CameraRegistry:
             key: copy.deepcopy(camera.get(key))
             for key in (
                 "id", "name", "url", "enabled", "default", "hardware_camera_id",
-                "sensor", "added_at", "needs_name",
+                "sensor", "added_at", "needs_name", "color",
             )
         }
 
@@ -261,6 +289,7 @@ class CameraRegistry:
                 "sensor": copy.deepcopy(item.get("sensor")) if isinstance(item.get("sensor"), dict) else None,
                 "added_at": item.get("added_at") if isinstance(item.get("added_at"), str) else None,
                 "needs_name": item.get("needs_name", False) is True,
+                "color": _loaded_color(item.get("color")),
                 **self._runtime_state(),
             }
         defaults = [camera for camera in loaded.values() if camera["default"]]
@@ -355,6 +384,7 @@ class CameraRegistry:
                 "sensor": None,
                 "added_at": utc_now(),
                 "needs_name": False,
+                "color": None,
                 **self._runtime_state(),
             }
             self._cameras[camera_id] = camera
@@ -371,6 +401,8 @@ class CameraRegistry:
             if "name" in changes:
                 camera["name"] = normalize_camera_name(changes["name"])
                 camera["needs_name"] = False
+            if "color" in changes:
+                camera["color"] = normalize_camera_color(changes["color"])
             if "enabled" in changes:
                 if not isinstance(changes["enabled"], bool):
                     raise ValueError("enabled must be true or false.")
@@ -406,7 +438,8 @@ class CameraRegistry:
         * known hardware ID, new address           -> "moved" (URL rewritten)
         * unknown ID, address of an unbound entry  -> "bound" (identity attached)
         * unknown ID, free address                 -> "added" (needs_name=True)
-        * unknown ID, address held by another ID   -> "conflict" (nothing changes)
+        * unknown ID, address held by another ID   -> "replaced" (new entry added;
+          the other entry's URL is parked on a stale placeholder until it checks in)
 
         When a camera moves onto an address another entry still claims, that
         entry's URL is stale by definition; the two URLs are swapped so URLs
@@ -436,9 +469,17 @@ class CameraRegistry:
                 known["url"] = url
                 self._persist_locked()
                 return self._copy_camera(known), "moved"
+            replaced = None
             if holder is not None:
                 if holder["hardware_camera_id"] is not None:
-                    return None, "conflict"
+                    # The heartbeat proves this address is the new camera's now,
+                    # so the other entry's URL is stale (its camera went offline
+                    # or got a new DHCP lease). Park it on a placeholder; its own
+                    # next heartbeat re-addresses it as an ordinary move.
+                    holder["url"] = stale_camera_url(holder["id"])
+                    replaced = holder
+                    holder = None
+            if holder is not None:
                 holder["hardware_camera_id"] = hardware_camera_id
                 if holder["sensor"] is None and sensor is not None:
                     holder["sensor"] = sensor
@@ -456,12 +497,15 @@ class CameraRegistry:
                 "sensor": sensor,
                 "added_at": utc_now(),
                 "needs_name": True,
+                "color": None,
                 **self._runtime_state(),
             }
             self._cameras[camera_id] = camera
             self._poll_locks[camera_id] = threading.Lock()
             self._operation_locks[camera_id] = threading.Lock()
             self._persist_locked()
+            if replaced is not None:
+                return self._copy_camera(camera), "replaced"
             return self._copy_camera(camera), "added"
 
     def bind_identity(
@@ -643,3 +687,10 @@ class CameraRegistry:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=self.timeout_seconds * 2 + 1)
+
+
+def _loaded_color(value: Any) -> str | None:
+    try:
+        return normalize_camera_color(value)
+    except ValueError:
+        return None

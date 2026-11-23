@@ -155,6 +155,27 @@ It currently expects the configured project user, `birdhub.service`, the
 collection-mode override, `/mnt/bird-backup`, and the USB UUID embedded in the
 script. Review and test the complete archival workflow before using it.
 
+## Camera benchmarking
+
+### `bench_camera.py`
+
+Measures capture latency (median/p95, time to first byte), captures per second,
+JPEG size, MJPEG stream frame rate, die temperature and minimum free heap for
+one or more cameras over their HTTP API, optionally at several frame sizes.
+`--soak-minutes` instead captures on a fixed cadence and logs every result to
+CSV, flagging failures and reboots (a changed `boot_id`). Stdlib only, so it
+runs on the laptop or the Pi.
+
+```powershell
+python .\scripts\bench_camera.py --camera http://S3_IP --camera http://OLD_CAM_IP `
+    --sizes VGA,SVGA,XGA,UXGA --frames 20 --stream-seconds 10
+python .\scripts\bench_camera.py --camera http://S3_IP --soak-minutes 120 --soak-interval 10
+```
+
+A size sweep changes the active sensor profile through `POST /config` (saved to
+the SD card) and restores the original profile afterwards, including on Ctrl-C.
+Results go to `bench_results/`.
+
 ## Related documentation
 
 - [Project overview](../README.md)

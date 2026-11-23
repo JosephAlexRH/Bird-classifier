@@ -66,7 +66,7 @@ def register_pi_bridge(app, config_path: Path, pi_url: str | None = None) -> Non
             query = {}
         data = None
         headers = {}
-        if method == "POST":
+        if method in ("POST", "PATCH"):
             data = json.dumps(request.get_json(silent=True)).encode()
             headers["Content-Type"] = "application/json"
         outgoing = Request(target + endpoint + ("?" + urlencode(query) if query else ""),
@@ -101,6 +101,25 @@ def register_pi_bridge(app, config_path: Path, pi_url: str | None = None) -> Non
         if not valid_id(camera_id) or operation not in allowed or request.method not in allowed[operation]:
             return jsonify(error="Unsupported camera operation."), 404
         return proxy(f"/api/cameras/{camera_id}/{operation}", method=request.method)
+
+    @app.delete("/api/pi/cameras/<camera_id>")
+    def pi_camera_remove(camera_id):
+        if not valid_id(camera_id):
+            return jsonify(error="Unsupported camera operation."), 404
+        return proxy(f"/api/cameras/{camera_id}", method="DELETE")
+
+    @app.patch("/api/pi/cameras/<camera_id>")
+    def pi_camera_update(camera_id):
+        payload = request.get_json(silent=True)
+        if not valid_id(camera_id) or not isinstance(payload, dict) or set(payload) - {"name", "color"}:
+            return jsonify(error="Only name and color can be changed here."), 400
+        return proxy(f"/api/cameras/{camera_id}", method="PATCH")
+
+    @app.delete("/api/pi/fleet/<camera_id>")
+    def pi_fleet_forget(camera_id):
+        if not valid_id(camera_id):
+            return jsonify(error="Unsupported camera operation."), 404
+        return proxy(f"/api/fleet/{camera_id}", method="DELETE")
 
     @app.get("/api/pi/cameras/<camera_id>/stream")
     def pi_camera_stream(camera_id):

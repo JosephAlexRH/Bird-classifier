@@ -31,6 +31,7 @@ but Pi-owned motion detection is the default configuration.
 
 - Multi-camera registration, health monitoring, and camera-specific controls
 - Support for OV2640 and OV5640 camera sensors
+- Colour status light on the ESP32-S3 board for on-site checks (Wi-Fi, hub link, camera faults)
 - Local motion selection, bird detection, species prediction, and visit grouping
 - Offline Raspberry Pi hotspot mode for field deployments
 - Browser-based live view, camera configuration, ROI editing, and data review
@@ -39,21 +40,23 @@ but Pi-owned motion detection is the default configuration.
 
 ## Hardware
 
-The checked-in PlatformIO environment targets the **AI Thinker ESP32-CAM**
-board. The firmware detects and configures either an OV2640 or OV5640 sensor.
+The firmware builds for two boards, each with its own PlatformIO environment:
+`esp32cam` (AI Thinker ESP32-CAM) and `freenove_s3` (Freenove ESP32-S3 WROOM
+CAM). Either board detects and configures an OV2640 or OV5640 sensor, and both
+can run side by side as one fleet.
 
 A typical deployment uses:
 
-- One or more AI Thinker ESP32-CAM boards
+- One or more AI Thinker ESP32-CAM or Freenove ESP32-S3 WROOM CAM boards
 - An OV2640 or OV5640 camera module
 - A Raspberry Pi hub, such as a Raspberry Pi Zero 2 W
 - A stable 5 V supply for each camera
 - A FAT32 microSD card for camera configuration and optional buffering
-- An ESP32-CAM-MB programmer or a suitable USB-to-UART adapter
+- For the ESP32-CAM, an ESP32-CAM-MB programmer or USB-to-UART adapter (the
+  Freenove S3 has USB-C on board)
 
-ESP32-S3 boards are not currently defined in `platformio.ini` and require a
-separate board environment and pin configuration before they should be treated
-as supported.
+See the [ESP32-S3 bring-up and field guide](docs/esp32-s3-bringup.md) for
+flashing, benchmarking and the pre-deployment checklist.
 
 ## Quick start
 
@@ -67,7 +70,8 @@ as supported.
 4. Build and upload the firmware:
 
    ```powershell
-   pio run -e esp32cam -t upload
+   pio run -e esp32cam -t upload      # AI Thinker ESP32-CAM
+   pio run -e freenove_s3 -t upload   # Freenove ESP32-S3 WROOM CAM
    pio device monitor
    ```
 
@@ -114,7 +118,7 @@ layout.
 
 | Path | Purpose |
 |---|---|
-| `src/`, `include/`, `data/` | ESP32-CAM firmware and example configuration |
+| `src/`, `include/`, `data/` | Camera firmware (ESP32-CAM and ESP32-S3) and example configuration |
 | `server/` | Laptop receiver, Raspberry Pi hub, dashboards, inference, and monitoring |
 | `deploy/` | Raspberry Pi service, hotspot, collection, backup, and update helpers |
 | `Models/` | Deployed model exports, contracts, labels, manifests, and training outputs |

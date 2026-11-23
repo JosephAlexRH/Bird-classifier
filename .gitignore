@@ -65,3 +65,5 @@ runs/
 
 # Backup source files
 *.bak_before_*
+# scripts/bench_camera.py output
+bench_results/

@@ -28,3 +28,10 @@ void logEvent(const char *format, ...) __attribute__((format(printf, 1, 2)));
 String deviceHealthJson();
 
 [[noreturn]] void rebootDevice(const char *reason);
+
+// Hub link as seen by the heartbeat task: Unknown until the first attempt.
+enum class HubLinkState { Unknown, Reachable, Unreachable };
+HubLinkState getHubLinkState();
+
+// True when this boot followed a crash, watchdog reset or brownout.
+bool didLastResetFail();

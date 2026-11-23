@@ -10,6 +10,7 @@ import shutil
 import os
 import queue
 import threading
+from urllib.parse import urlsplit
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,7 +33,7 @@ try:
         write_inference_record,
     )
     from .camera_registry import (
-        CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address,
+        CameraRegistry, DEFAULT_REGISTRY_FILE, STALE_HOST_SUFFIX, normalize_camera_address,
         sync_registry_from_heartbeat,
     )
     from .camera_dashboard_templates import PI_TABBED_DASHBOARD_HTML
@@ -59,7 +60,7 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
         write_inference_record,
     )
     from camera_registry import (
-        CameraRegistry, DEFAULT_REGISTRY_FILE, normalize_camera_address,
+        CameraRegistry, DEFAULT_REGISTRY_FILE, STALE_HOST_SUFFIX, normalize_camera_address,
         sync_registry_from_heartbeat,
     )
     from camera_dashboard_templates import PI_TABBED_DASHBOARD_HTML
@@ -90,6 +91,16 @@ MAX_JPEG_BYTES = 10 * 1024 * 1024
 # Sent by the ESP32 when wait_for_classification is false in its config.
 CLASSIFICATION_HEADER = "X-ESP32-Classification"
 PROXY_TIMEOUT_SECONDS = 8
+# A dashboard request (capture, status, config...) waits this long for the
+# camera's background worker to finish its current frame instead of answering
+# "busy" and making the browser retry. A framing stream holds the camera until
+# it is closed, so requests during a stream still get an immediate 409.
+CAMERA_WAIT_SECONDS = 6
+
+
+def is_parked(camera: dict[str, Any]) -> bool:
+    """Its address was taken over by another camera; waiting for its own heartbeat."""
+    return (urlsplit(camera.get("url") or "").hostname or "").endswith(STALE_HOST_SUFFIX)
 CAPTURE_ROI_SOURCE = "capture_sidecar.camera.requested.motion.roi"
 DEFAULT_MOTION_POLL_SECONDS = 0.25
 DEFAULT_MOTION_TIMEOUT_SECONDS = 2.0
@@ -421,7 +432,7 @@ def create_app(
         # Cameras announce themselves: new ones are added, moved ones re-addressed,
         # and the per-camera motion workers follow the registry.
         _, change = sync_registry_from_heartbeat(registry, payload, remote_addr, log=registry_log)
-        if change in {"added", "moved", "bound"}:
+        if change in {"added", "replaced", "moved", "bound"}:
             sync_motion_services()
 
     register_fleet_routes(
@@ -697,11 +708,12 @@ def create_app(
         cameras = {camera["id"]: camera for camera in registry.snapshot()}
         for camera_id in list(motion_services):
             camera = cameras.get(camera_id)
-            if camera is None or not camera["enabled"] or not hub_settings.camera_running(camera_id):
+            if (camera is None or not camera["enabled"] or is_parked(camera)
+                    or not hub_settings.camera_running(camera_id)):
                 stop_camera_motion(camera_id)
         if motion_management_enabled:
             for camera in cameras.values():
-                if camera["enabled"] and hub_settings.camera_running(camera["id"]):
+                if camera["enabled"] and not is_parked(camera) and hub_settings.camera_running(camera["id"]):
                     start_camera_motion(camera)
         selected = registry.resolve()
         app.config["MOTION_SERVICE"] = (
@@ -732,6 +744,14 @@ def create_app(
             if not inference_path(destination).exists():
                 pending.put(destination)
 
+    def acquire_camera(camera: dict[str, Any], operation_lock: threading.Lock) -> bool:
+        """Take the camera for a dashboard request, queuing behind the poller."""
+        if camera.get("streaming"):
+            return operation_lock.acquire(blocking=False)
+        return operation_lock.acquire(timeout=CAMERA_WAIT_SECONDS)
+
+    app.config["ACQUIRE_CAMERA"] = acquire_camera
+
     def camera_proxy(
         endpoint: str,
         method: str = "GET",
@@ -753,7 +773,7 @@ def create_app(
         )
         operation_lock = registry.operation_lock(camera["id"])
         assert operation_lock is not None
-        if not operation_lock.acquire(blocking=False):
+        if not acquire_camera(camera, operation_lock):
             return jsonify(error="Camera is busy. Try again after the current request finishes."), 409
         try:
             with urlopen(outgoing, timeout=PROXY_TIMEOUT_SECONDS) as upstream:
@@ -1496,6 +1516,8 @@ def create_app(
             return {
                 "id": camera_id,
                 "name": camera.get("name") or camera_id,
+                "color": camera.get("color"),
+                "parked": is_parked(camera) if camera else False,
                 "registered": bool(camera),
                 "url": camera.get("url"),
                 "sensor": (camera.get("sensor") or {}).get("model") or (camera.get("status") or {}).get("camera_model"),

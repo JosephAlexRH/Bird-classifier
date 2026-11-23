@@ -5,11 +5,13 @@
 #include <driver/periph_ctrl.h>
 
 #include "app_config.h"
+#include "board_pins.h"
 #include "camera_service.h"
 #include "camera_runtime.h"
 #include "device_health.h"
 #include "device_telemetry.h"
 #include "motion_detector.h"
+#include "status_led.h"
 #include "upload_buffer.h"
 #include "web_server.h"
 
@@ -137,10 +139,23 @@ void setup() {
   // previous boot and can keep writing frames into RAM the new boot has
   // already handed to the Wi-Fi driver. Power the sensor down and reset both
   // peripherals as early as possible.
-  pinMode(32, OUTPUT);  // camera PWDN (kPowerDownPin); HIGH = powered down
-  digitalWrite(32, HIGH);
+  //
+  // On the ESP32-S3 the camera is fed by the LCD_CAM peripheral, not I2S0, and
+  // GPIO 32 belongs to the octal flash/PSRAM bus, so it must never be driven.
+#if BIRDCAM_CAM_HAS_PWDN
+  pinMode(kCamPwdnPin, OUTPUT);  // HIGH = sensor powered down
+  digitalWrite(kCamPwdnPin, HIGH);
+#endif
+#if CONFIG_IDF_TARGET_ESP32S3
+  periph_module_reset(PERIPH_LCD_CAM_MODULE);
+  periph_module_reset(PERIPH_GDMA_MODULE);
+#else
   periph_module_reset(PERIPH_I2S0_MODULE);
+#endif
   periph_module_reset(PERIPH_LEDC_MODULE);
+#if BIRDCAM_HAS_RGB_LED
+  neopixelWrite(kRgbLedPin, 0, 0, 0);  // otherwise it keeps a random power-up colour
+#endif
 
   // 160 MHz is plenty for motion checks and uploads and runs cooler than 240.
   setCpuFrequencyMhz(160);
@@ -156,6 +171,7 @@ void setup() {
   // Persistent configuration is read once at boot. HTTP updates mutate cfg in
   // RAM and saveConfig() persists that snapshot without a background reload.
   loadConfig();
+  startStatusLed();  // needs cfg (status_led) and the reset reason
   initializeUploadBuffer();
   initializeCameraRuntime(cfg.motionEnabled);
   connectToWifi();
@@ -164,6 +180,7 @@ void setup() {
   if (!initializeCamera()) {
     // Stay reachable long enough to report the failure, then retry from scratch.
     logEvent("camera: initialization failed; rebooting in 60 s");
+    statusLedNoteCameraFailed();
     setCameraRuntimeError("Camera initialization failed");
     startWebServer();
     startDeviceHealthMonitor();

@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
 #include <esp_arduino_version.h>
 #include <esp_camera.h>
 #include <esp_timer.h>
@@ -13,30 +14,33 @@
 #include <new>
 
 #include "app_config.h"
+#include "board_pins.h"
 #include "device_health.h"
 #include "device_telemetry.h"
+#include "status_led.h"
 
 static_assert(ESP_ARDUINO_VERSION == ESP_ARDUINO_VERSION_VAL(2, 0, 17),
               "Camera metadata enum/provenance mapping requires Arduino-ESP32 2.0.17");
 
 namespace {
 
-constexpr int kPowerDownPin = 32;
-constexpr int kResetPin = -1;
-constexpr int kXclkPin = 0;
-constexpr int kSiodPin = 26;
-constexpr int kSiocPin = 27;
-constexpr int kY9Pin = 35;
-constexpr int kY8Pin = 34;
-constexpr int kY7Pin = 39;
-constexpr int kY6Pin = 36;
-constexpr int kY5Pin = 21;
-constexpr int kY4Pin = 19;
-constexpr int kY3Pin = 18;
-constexpr int kY2Pin = 5;
-constexpr int kVsyncPin = 25;
-constexpr int kHrefPin = 23;
-constexpr int kPclkPin = 22;
+// Pin numbers come from board_pins.h, selected by the PlatformIO environment.
+constexpr int kPowerDownPin = kCamPwdnPin;
+constexpr int kResetPin = kCamResetPin;
+constexpr int kXclkPin = kCamXclkPin;
+constexpr int kSiodPin = kCamSiodPin;
+constexpr int kSiocPin = kCamSiocPin;
+constexpr int kY9Pin = kCamY9Pin;
+constexpr int kY8Pin = kCamY8Pin;
+constexpr int kY7Pin = kCamY7Pin;
+constexpr int kY6Pin = kCamY6Pin;
+constexpr int kY5Pin = kCamY5Pin;
+constexpr int kY4Pin = kCamY4Pin;
+constexpr int kY3Pin = kCamY3Pin;
+constexpr int kY2Pin = kCamY2Pin;
+constexpr int kVsyncPin = kCamVsyncPin;
+constexpr int kHrefPin = kCamHrefPin;
+constexpr int kPclkPin = kCamPclkPin;
 constexpr uint8_t kMaxExposureConsistencyAttempts = 3;
 constexpr int kOv2640FrameBufferCount = 1;
 constexpr camera_grab_mode_t kOv2640GrabMode = CAMERA_GRAB_WHEN_EMPTY;
@@ -45,8 +49,8 @@ constexpr camera_grab_mode_t kOv2640GrabMode = CAMERA_GRAB_WHEN_EMPTY;
 // the mode the OV2640 has always used, and it runs the board noticeably cooler.
 constexpr int kOv5640FrameBufferCount = 1;
 constexpr camera_grab_mode_t kOv5640GrabMode = CAMERA_GRAB_WHEN_EMPTY;
-// Real idle: power the sensor down after this long with nothing using it.
-constexpr unsigned long kCameraIdlePowerDownMs = 30000;
+// Real idle: the sensor powers down after cfg.idlePowerDownS seconds with
+// nothing using it (idle_power_down_s in config.json; 0 = never).
 // After power-up, let auto exposure / gain / white balance settle before use.
 constexpr unsigned long kCameraWakeSettleMs = 1500;
 constexpr int kProbeXclkHz = 20000000;
@@ -491,6 +495,64 @@ const char *cameraSensorModelName(uint16_t pid, uint8_t version) {
   return "unknown";
 }
 
+// Diagnostic for a failed camera probe: scan the SCCB bus and print the raw
+// ID registers of whatever answers, so a misidentified sensor or a flaky
+// ribbon shows up in the serial log. Runs only after esp_camera_init() has
+// failed and released the bus; the device reboots shortly afterwards.
+static bool sccbRead(uint8_t address, uint16_t reg, bool wide, uint8_t &value) {
+  Wire.beginTransmission(address);
+  if (wide) Wire.write(static_cast<uint8_t>(reg >> 8));
+  Wire.write(static_cast<uint8_t>(reg & 0xff));
+  if (Wire.endTransmission(true) != 0) return false;  // SCCB: no repeated start
+  if (Wire.requestFrom(address, static_cast<uint8_t>(1)) != 1) return false;
+  value = Wire.read();
+  return true;
+}
+
+static void sccbWrite(uint8_t address, uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(address);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission(true);
+}
+
+static void logCameraBusScan() {
+  constexpr uint8_t kScanLedcChannel = 7;  // not the camera's channel 0
+  // Sensors only answer on SCCB while XCLK is running.
+  ledcSetup(kScanLedcChannel, 20000000, 1);
+  ledcAttachPin(kXclkPin, kScanLedcChannel);
+  ledcWrite(kScanLedcChannel, 1);
+  delay(50);
+  if (!Wire.begin(kSiodPin, kSiocPin, 100000)) {
+    Serial.println("camera bus scan: could not start I2C");
+    ledcDetachPin(kXclkPin);
+    return;
+  }
+  int found = 0;
+  for (uint8_t address = 0x08; address < 0x78; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission(true) != 0) continue;
+    ++found;
+    Serial.printf("camera bus: device at 0x%02x", address);
+    uint8_t hi = 0, lo = 0;
+    if (address == 0x30) {  // OV2640: sensor bank, PID 0x0A / VER 0x0B (expect 26 42)
+      sccbWrite(address, 0xff, 0x01);
+      if (sccbRead(address, 0x0a, false, hi) && sccbRead(address, 0x0b, false, lo))
+        Serial.printf("  OV2640 PID/VER=%02x %02x", hi, lo);
+    }
+    // OV3660/OV5640 16-bit ID at 0x300A/0x300B (expect 36 60 or 56 40)
+    if (sccbRead(address, 0x300a, true, hi) && sccbRead(address, 0x300b, true, lo))
+      Serial.printf("  reg16 300A/300B=%02x %02x", hi, lo);
+    // GalaxyCore (GC2145/GC032A) 8-bit ID at 0xF0/0xF1
+    if (sccbRead(address, 0xf0, false, hi) && sccbRead(address, 0xf1, false, lo))
+      Serial.printf("  reg8 F0/F1=%02x %02x", hi, lo);
+    Serial.println();
+  }
+  if (found == 0) Serial.println("camera bus: nothing answered (ribbon seating, camera power, or pins)");
+  Wire.end();
+  ledcDetachPin(kXclkPin);
+}
+
 bool initializeCamera() {
   CameraMutexGuard cameraLock;
   if (!cameraLock.locked()) return false;
@@ -499,6 +561,7 @@ bool initializeCamera() {
   esp_err_t error = esp_camera_init(&cameraConfig);
   if (error != ESP_OK) {
     Serial.printf("Camera init failed: 0x%x\n", error);
+    logCameraBusScan();
     return false;
   }
 
@@ -732,6 +795,7 @@ bool captureJpeg(CapturedJpeg &capture, bool drainQueuedFrame) {
   capture.frameBuffer = frameBuffer;
   // Register reads occur now, while this exact retained JPEG is still held.
   capture.metadata = sampleCameraMetadata(frameBuffer);
+  statusLedNoteCapture();
   return true;
 }
 
@@ -1167,9 +1231,11 @@ bool suspendCamera() {
   if (cameraMutex == nullptr || xSemaphoreTakeRecursive(cameraMutex, 0) != pdTRUE) {
     return false;  // a capture or settings change is in progress; try again later
   }
-  esp_camera_deinit();  // stops the I2S DMA and the XCLK, frees the frame buffers
+  esp_camera_deinit();  // stops the camera DMA and the XCLK, frees the frame buffers
+#if BIRDCAM_CAM_HAS_PWDN
   pinMode(kPowerDownPin, OUTPUT);
   digitalWrite(kPowerDownPin, HIGH);  // sensor power-down
+#endif  // Freenove S3: no PWDN line; without XCLK the sensor sits in standby
   cameraPowered = false;
   unlockCamera();
   logEvent("camera: powered down (idle)");
@@ -1178,6 +1244,7 @@ bool suspendCamera() {
 
 void maintainCameraPower(bool idleAllowed) {
   if (!cameraPowered || !idleAllowed) return;
-  if (millis() - lastCameraUseMs < kCameraIdlePowerDownMs) return;
+  if (cfg.idlePowerDownS <= 0) return;  // configured to stay awake
+  if (millis() - lastCameraUseMs < static_cast<unsigned long>(cfg.idlePowerDownS) * 1000UL) return;
   suspendCamera();
 }

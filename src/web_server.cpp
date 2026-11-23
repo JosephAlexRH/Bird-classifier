@@ -6,12 +6,14 @@
 #include <esp_camera.h>
 
 #include "app_config.h"
+#include "board_pins.h"
 #include "camera_runtime.h"
 #include "camera_service.h"
 #include "device_health.h"
 #include "device_telemetry.h"
 #include "image_storage.h"
 #include "motion_detector.h"
+#include "status_led.h"
 #include "upload_buffer.h"
 
 namespace {
@@ -249,6 +251,9 @@ String configJson() {
   document["wait_for_classification"] = cfg.waitForClassification;
   document["burst_count"] = cfg.burstCount;
   document["burst_interval_ms"] = cfg.burstIntervalMs;
+  document["idle_power_down_s"] = cfg.idlePowerDownS;
+  document["status_led"] = statusLedModeName(static_cast<StatusLedMode>(cfg.statusLedMode));
+  document["status_led_present"] = BIRDCAM_HAS_RGB_LED == 1;
   document["keep_reference_after_trigger"] = cfg.keepReferenceAfterTrigger;
   document["max_consecutive_triggers"] = cfg.maxConsecutiveTriggers;
   document["buffer_uploads_to_sd"] = cfg.bufferUploadsToSd;
@@ -484,6 +489,21 @@ bool validConfig(const JsonDocument &document, String &error) {
       return false;
     }
   }
+  if (document.containsKey("status_led")) {
+    StatusLedMode mode;
+    if (!document["status_led"].is<const char *>() ||
+        !parseStatusLedMode(document["status_led"].as<const char *>(), mode)) {
+      error = "status_led must be \"off\", \"boot\" or \"on\"";
+      return false;
+    }
+  }
+  if (document.containsKey("idle_power_down_s")) {
+    const int value = document["idle_power_down_s"];
+    if (value < 0 || value > kMaxIdlePowerDownS) {
+      error = "idle_power_down_s must be between 0 (never) and 86400";
+      return false;
+    }
+  }
   if (document.containsKey("burst_interval_ms")) {
     const int value = document["burst_interval_ms"];
     if (value < 0 || value > kMaxBurstIntervalMs) {
@@ -661,6 +681,13 @@ void applyConfig(const JsonDocument &document) {
   }
   if (document.containsKey("burst_count")) cfg.burstCount = document["burst_count"];
   if (document.containsKey("burst_interval_ms")) cfg.burstIntervalMs = document["burst_interval_ms"];
+  if (document.containsKey("idle_power_down_s")) cfg.idlePowerDownS = document["idle_power_down_s"];
+  if (document.containsKey("status_led")) {
+    StatusLedMode mode;
+    if (parseStatusLedMode(document["status_led"].as<const char *>(), mode)) {
+      cfg.statusLedMode = static_cast<int>(mode);
+    }
+  }
   if (document.containsKey("keep_reference_after_trigger")) {
     cfg.keepReferenceAfterTrigger = document["keep_reference_after_trigger"];
   }
