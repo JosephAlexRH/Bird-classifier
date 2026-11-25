@@ -574,24 +574,60 @@ up at a site that has none. The installer also disables the older hand-written
 `bird-pi.service` if it is enabled.
 
 **Wi-Fi hotspot (no router at the site).** The Pi can be its own Wi-Fi network
-that the cameras join directly:
+that the cameras join directly. Set it up once, at home:
 
 ```bash
-sudo bash deploy/pi_hotspot.sh on        # field mode; stays on across reboots
+sudo bash deploy/pi_hotspot.sh on        # create the BirdHub hotspot (and switch to it now)
+sudo bash deploy/pi_hotspot.sh off       # back to home Wi-Fi; the hotspot stays as the fallback
+sudo bash deploy/birdhub_mode.sh install # field-mode jumper (below)
 sudo bash deploy/pi_hotspot.sh status    # network name, password, connected devices
-sudo bash deploy/pi_hotspot.sh off       # back to your normal Wi-Fi
 ```
 
-The first `on` creates a network called `BirdHub` with a random password and
-prints both (choose your own with `--ssid` and `--password`). The hub is then
-always at `10.42.0.1`. Put the network name and password in each camera's
-`config.json` as `wifi_ssid` / `wifi_password`, and set `server_ip` to
-`10.42.0.1` as the fallback for `server_host`. The Pi has a single Wi-Fi radio,
-so it is either the hotspot or on your home Wi-Fi, not both: switching modes
-drops a Wi-Fi SSH session (use Ethernet, or rejoin through the hotspot). With an
-Ethernet cable plugged in, the hotspot also shares that internet connection.
-To view the dashboard or give the hub the time, join `BirdHub` from your phone
-and open `http://10.42.0.1:5000`. Needs Raspberry Pi OS Bookworm or newer.
+The first `on` creates a network called `BirdHub` (NetworkManager profile
+`birdhub-ap`) with a random password and prints both (choose your own with
+`--ssid` and `--password`). The hub is then always at `192.168.4.1`. Put the
+network name and password in each camera's `config.json` as `wifi_ssid` /
+`wifi_password`, and set `server_ip` to `192.168.4.1` as the fallback for
+`server_host`. Needs Raspberry Pi OS Bookworm or newer.
+
+The hotspot is plain **WPA2 (AES/CCMP) on 2.4 GHz channel 6, with protected
+management frames off**. The ESP32 needs exactly that: it ignores a network
+advertised as WPA1 (serial log `reason 201 NO_AP_FOUND`, even right next to the
+Pi) and stalls on WPA2/WPA3 mixed mode (`reason 2 AUTH_EXPIRE`). `on` re-applies
+these settings to an existing profile, so re-running it repairs one made by hand.
+
+**Field mode: the jumper.** Which network the Pi uses is decided at each boot by
+a jumper on the last pair of GPIO header pins, **39 (GND) and 40 (GPIO21)**, at
+the end opposite the PiRTC:
+
+| Jumper | At boot |
+|---|---|
+| On | Field mode: the BirdHub hotspot starts, even if home Wi-Fi is in range |
+| Off | Home mode: home Wi-Fi; the hotspot starts only if home Wi-Fi is out of range |
+
+Deploying is then: jumper on, USB drive in, power on. No SSH, and nothing to
+undo at home. The jumper is read once at boot, so to switch modes shut down,
+move it, and power on. `sudo bash deploy/birdhub_mode.sh status` shows what the
+jumper reads now and what the last boot chose (`journalctl -t birdhub-mode`).
+`pi_hotspot.sh on` overrides the jumper (hotspot at every boot) until `off`.
+
+The Pi has a single Wi-Fi radio, so it is either the hotspot or on your home
+Wi-Fi, not both: switching modes drops a Wi-Fi SSH session (rejoin through the
+hotspot). Restart the hotspot with one command, `sudo nmcli con up birdhub-ap`;
+a separate `nmcli con down` first cuts the SSH session before the `up` runs and
+leaves the Pi with no network. With an Ethernet cable plugged in, the hotspot
+also shares that internet connection. To view the dashboard or give the hub the
+time, join `BirdHub` from your phone and open `http://192.168.4.1:5000`. Phones
+and laptops may hop back to a network with internet: on Windows, turn off
+*Connect automatically* for the home network while working on the hub, and on a
+phone turn off mobile data if the dashboard won't load.
+
+**Power-on order.** Power the hub first and the cameras about two minutes later
+(or press RST on each camera once the dashboard loads). The hub needs that long
+to boot, mount its USB drive and load its models; a camera that boots first
+blinks yellow until its next successful heartbeat. Shut the hub down with
+`sudo shutdown -h now` and wait for the green light to stop before unplugging:
+pulling the power marks the USB drive dirty, which slows its next mount.
 
 **Time without internet or a clock module.** A Pi has no battery clock, and the
 cameras normally take their time from internet servers. In the field:
@@ -611,8 +647,10 @@ cameras normally take their time from internet servers. In the field:
   The dashboard shows `HUB CLOCK UNVERIFIED` until then, and every run-log line
   records the clock state (`ntp`, `system`, `reference`, `offset`, `unverified`).
 
-With a clock module fitted later, none of this changes; the phone visit simply
-finds nothing to correct.
+With a clock module (such as a PiRTC) fitted, the hub keeps the right time across
+power cuts, so a phone visit normally finds nothing to correct. Without internet
+the hub still cannot *verify* that time, so the dashboard keeps showing the clock
+as unverified until a phone or laptop opens it; one visit per power-up is enough.
 
 **Run log.** Everything the fleet page shows only briefly is kept permanently in
 `<save-dir>/runlog/run-YYYY-MM-DD.jsonl`, one JSON object per line: every
@@ -622,6 +660,30 @@ hub status line every 5 minutes (free disk, CPU temperature, and the Pi's
 under-voltage flag, which is the one to watch on a battery). Each line also
 carries a monotonic time and the hub power-up it belongs to, so durations stay
 right even where the wall clock was wrong. Expect very roughly 10 MB per camera per day.
+
+**USB capture drive.** `~/bird_images` links to the USB drive, so captures,
+the run log and the camera registry all live on it. The hub service is bound to
+the drive's mount (`birdhub.service.d/usb-storage.conf`): **if the drive is not
+plugged in and mounted at boot, the hub does not start** (`Dependency failed`
+in `journalctl -u birdhub`), which keeps it from filling the SD card. The fstab
+entry waits up to 30 s for the drive (`x-systemd.device-timeout=30s`); a dirty
+drive can take longer than the old 5 s. Before starting, the service checks the
+drive's UUID with `scripts/backup_pi_usb.py --check-only`.
+
+- Don't run `sudo mount /mnt/bird-backup` when the drive is already mounted: it
+  mounts it twice on top of itself. Check with `findmnt /mnt/bird-backup` (one
+  line) and `sudo umount /mnt/bird-backup` once to undo a second mount.
+- After an unclean unplug, repair it:
+  `sudo systemctl stop birdhub && sudo umount /mnt/bird-backup && sudo fsck.vfat -a /dev/sda1 && sudo mount /mnt/bird-backup && sudo systemctl start birdhub`.
+- **FAT32 allows only about 12,000 long file names in one folder**, and every
+  capture is a `.jpg` plus a `.json`, so `bird_images` fills at roughly 6,000
+  captures however much space is free. Captures then fail with
+  `[Errno 28] No space left on device` while `df` shows the drive nearly empty.
+  To recover, stop the hub, rename the folder (`mv bird_images bird_images_archive_YYYYMMDD`,
+  instant on the same drive), create an empty `bird_images` and start the hub.
+  Before a multi-day run, reformat the drive as exFAT (no practical per-folder
+  limit, still readable on Windows); the fstab line and
+  `deploy/adopt_usb_storage.sh` expect `vfat` and need updating to match.
 
 Summarise a run afterwards:
 
@@ -701,8 +763,15 @@ wheel from `requirements.txt`; no hand-built runtime or libatomic preload.
 4. `cd ~/birdserver && sudo bash deploy/setup_new_pi.sh` creates `~/.venv`,
    times both models, mounts the USB drive by UUID at boot (`nofail`), links
    `~/bird_images` to it and installs `birdhub.service`.
-5. `sudo bash deploy/enable_pi_collection.sh <deployment-id>`; add
-   `sudo bash deploy/pi_hotspot.sh on` for field sites.
+5. `sudo bash deploy/enable_pi_collection.sh <deployment-id>`. For field sites,
+   create the hotspot and install the field-mode jumper:
+   `sudo bash deploy/pi_hotspot.sh on`, `sudo bash deploy/pi_hotspot.sh off`,
+   then `sudo bash deploy/birdhub_mode.sh install`.
+6. If a PiRTC is fitted, enable it once: add `dtoverlay=i2c-rtc,pcf8523` to
+   `/boot/firmware/config.txt`, remove `fake-hwclock`, reboot, then
+   `sudo hwclock -w` while on internet time.
+7. Keep logs across reboots so a failed field boot can be read afterwards:
+   `sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald`.
 
 Camera identities, ROIs and dashboard settings live on the USB drive
 (`cameras.json`, `fleet.json`, `hub_settings.json`) and come across with it.
@@ -755,14 +824,14 @@ and reloading/restarting systemd restores the previous service arguments.
 The code backup path is printed during transfer.
 
 No laptop server is needed in the field: join the Pi's hotspot and open
-`http://10.42.0.1:5000`. The same hub page runs locally on the Pi
+`http://192.168.4.1:5000`. The same hub page runs locally on the Pi
 without internet or external web assets. Live & capture includes previews,
 manual/calibration capture, ROI editing and MJPEG framing. Streaming holds the
 camera's operation lock and pauses its acquisition; close the stream to resume.
 Sensor settings and hub-wide processing switches are in the Settings tab.
-The updater also copies `deploy/pi_hotspot.sh`, which can enable the existing
-NetworkManager hotspot setup. Cameras must join that hotspot too; keep
-`server_host: birdhub.local` and use `server_ip: 10.42.0.1` as fallback.
+The updater also copies `deploy/pi_hotspot.sh`, which creates or repairs the
+`birdhub-ap` NetworkManager hotspot. Cameras must join that hotspot too; keep
+`server_host: birdhub.local` and use `server_ip: 192.168.4.1` as fallback.
 Opening the dashboard offers the laptop/phone time through the hub clock API;
 when the OS clock cannot be set, the existing clock-offset logging applies.
 
@@ -857,6 +926,29 @@ http://SERVER_IP:5000/latest.jpg
 The `/health` response also reports camera poll counts, background readiness,
 persistence and inference state, model readiness, the most recent crop
 selection, and the latest polling error.
+
+**Dashboard stuck on "Connecting…", or no cameras and no free space shown.**
+The page fills those in from `/health`; check it from the Pi itself:
+
+```bash
+systemctl status birdhub.service --no-pager | head -12
+curl -s -m 5 -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5000/health
+```
+
+- `inactive (dead)` with `Dependency failed`: the USB drive was not mounted at
+  boot (see *USB capture drive*).
+- `failed` at `ExecStartPre`: the drive UUID check failed; `findmnt /mnt/bird-backup`
+  should show exactly one line for UUID `FC1B-D5B3`.
+- `active (running)` but `curl` prints `000`: the server is stuck. Before
+  restarting, record where every thread is waiting:
+  `sudo ~/.venv/bin/py-spy dump --pid $(systemctl show -p MainPID --value birdhub.service) > ~/hang.txt`
+  (`py-spy` installs from a wheel copied over from a laptop when the Pi has no internet).
+- `200`: the hub is fine; the device you are browsing from is not reaching it
+  (wrong network, or a phone sending traffic over mobile data).
+
+A camera whose captures fail with `[Errno 28] No space left on device` while the
+drive has free space has hit the FAT32 per-folder limit; the error shows in
+`/api/cameras` under `motion_service.last_capture_error`.
 
 ## Related documentation
 
