@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Turn the Raspberry Pi into its own Wi-Fi network for sites with no router.
-# The cameras join the Pi directly; the hub is always at 10.42.0.1.
+# The cameras join the Pi directly; the hub is always at 192.168.4.1.
 #
-#   sudo bash deploy/pi_hotspot.sh on                      # field mode (stays on across reboots)
+#   sudo bash deploy/pi_hotspot.sh on                      # create the hotspot and force it on at every boot
 #   sudo bash deploy/pi_hotspot.sh on --ssid BirdHub --password "choose-a-password"
-#   sudo bash deploy/pi_hotspot.sh off                     # back to your normal Wi-Fi
+#   sudo bash deploy/pi_hotspot.sh off                     # back to home Wi-Fi; hotspot stays the fallback
 #   sudo bash deploy/pi_hotspot.sh status                  # mode, network name, password, who is connected
+#
+# Normal field use is the GPIO jumper instead (deploy/birdhub_mode.sh): jumper on
+# pins 39-40 = hotspot at boot, jumper off = home Wi-Fi. "on" here overrides the
+# jumper until "off" is run. Without either, the hotspot still starts on its own
+# whenever the home Wi-Fi is out of range (autoconnect priority -10).
 #
 # The Pi has one Wi-Fi radio, so it is either a hotspot or on your home Wi-Fi,
 # never both. If you are connected to the Pi over Wi-Fi (SSH), switching modes
@@ -14,8 +19,9 @@
 # Needs Raspberry Pi OS "Bookworm" or newer (NetworkManager).
 set -euo pipefail
 
-PROFILE=birdhub-hotspot
-HUB_ADDRESS=10.42.0.1
+PROFILE=birdhub-ap
+HUB_ADDRESS=192.168.4.1
+FALLBACK_PRIORITY=-10
 SSID=""
 PASSWORD=""
 ASSUME_YES=0
@@ -94,6 +100,12 @@ case "${ACTION}" in
   on)
     if profile_exists; then
       [[ -n "${SSID}" ]] && nmcli connection modify "${PROFILE}" 802-11-wireless.ssid "${SSID}"
+      # Re-assert the security the ESP32 needs on profiles made by hand or by an
+      # older version of this script: WPA2-only (it ignores WPA1 networks and
+      # reports 201 NO_AP_FOUND) and PMF off (with PMF/WPA3 it fails with 2 AUTH_EXPIRE).
+      nmcli connection modify "${PROFILE}" 802-11-wireless-security.key-mgmt wpa-psk \
+        802-11-wireless-security.proto rsn 802-11-wireless-security.pairwise ccmp \
+        802-11-wireless-security.group ccmp 802-11-wireless-security.pmf 1
       if [[ -n "${PASSWORD}" ]]; then
         [[ ${#PASSWORD} -ge 8 ]] || { echo "The password must be at least 8 characters." >&2; exit 1; }
         nmcli connection modify "${PROFILE}" 802-11-wireless-security.psk "${PASSWORD}"
@@ -114,6 +126,7 @@ case "${ACTION}" in
         802-11-wireless-security.key-mgmt wpa-psk \
         802-11-wireless-security.proto rsn \
         802-11-wireless-security.pairwise ccmp \
+        802-11-wireless-security.group ccmp \
         802-11-wireless-security.pmf 1 \
         802-11-wireless-security.psk "${PASSWORD}" \
         ipv4.method shared \
@@ -124,7 +137,8 @@ case "${ACTION}" in
       echo "NOTE: no Wi-Fi country is set, which can stop the hotspot from starting."
       echo "      Set it once with: sudo raspi-config nonint do_wifi_country US"
     fi
-    # Higher priority than your home Wi-Fi so the hotspot wins at every boot.
+    # Higher priority than your home Wi-Fi so the hotspot wins at every boot,
+    # whatever the jumper says. "off" puts it back to the fallback priority.
     nmcli connection modify "${PROFILE}" connection.autoconnect yes connection.autoconnect-priority 100
     warn_about_remote_session
     nmcli connection up "${PROFILE}" >/dev/null
@@ -136,7 +150,8 @@ Point each camera at this network (config.json on its SD card, or the config edi
   "wifi_ssid":     the network name above
   "wifi_password": the password above
   "server_ip":     "${HUB_ADDRESS}"      (fallback; "server_host": "birdhub.local" finds it by name)
-The hotspot stays on across reboots until you run: sudo bash $0 off
+The hotspot is now forced on at every boot (overriding the field-mode jumper)
+until you run: sudo bash $0 off
 NOTE
     ;;
   off)
@@ -145,7 +160,10 @@ NOTE
       exit 0
     fi
     warn_about_remote_session
-    nmcli connection modify "${PROFILE}" connection.autoconnect no
+    # Keep the hotspot as the away-from-home fallback (and for the field-mode
+    # jumper) rather than disabling it; home Wi-Fi wins whenever it is in range.
+    nmcli connection modify "${PROFILE}" connection.autoconnect yes \
+      connection.autoconnect-priority "${FALLBACK_PRIORITY}"
     nmcli connection down "${PROFILE}" >/dev/null 2>&1 || true
     nmcli device wifi rescan ifname "${WIFI_DEVICE}" >/dev/null 2>&1 || true
     sleep 3

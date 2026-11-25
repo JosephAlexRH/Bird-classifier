@@ -71,6 +71,8 @@ cat <<DONE
 
 New hub ready. Next:
   sudo bash deploy/enable_pi_collection.sh <deployment-id>
-  sudo bash deploy/pi_hotspot.sh on        # field mode, if there is no router
+  sudo bash deploy/pi_hotspot.sh on        # create the BirdHub hotspot (192.168.4.1)
+  sudo bash deploy/pi_hotspot.sh off       #   ...then hand boot-time choice back to:
+  sudo bash deploy/birdhub_mode.sh install # field-mode jumper on GPIO pins 39-40
 Swap check (512 MB RAM): swapon --show
 DONE

@@ -354,7 +354,23 @@ This firmware has no authentication and is meant for a trusted home LAN only. Do
 
 - **Wi-Fi does not connect** — double-check `wifi_ssid` and `wifi_password` in
   the SD card's `/config.json`; the board only supports 2.4 GHz Wi-Fi. If those
-  fields are absent, check the optional `include/secrets.h` fallback.
+  fields are absent, check the optional `include/secrets.h` fallback. The serial
+  log prints the name it uses in brackets with its length
+  (`Connecting to [BirdHub] (7 chars)`); stray spaces, tabs and line breaks
+  around `wifi_ssid`, `server_ip` and `server_host` are trimmed on load (only
+  tabs and line breaks around `wifi_password`, where a space can be real). If it
+  is still not connected after 20 s, the firmware scans once and lists every
+  network it can see with channel, signal and security (`=>` marks the
+  configured one, `~~` a name that differs only in capitalisation), then resumes
+  connecting. The disconnect reason narrows it down:
+  - `201 NO_AP_FOUND` and the network absent from the scan: hub off, out of range
+    or antenna shielded.
+  - `201 NO_AP_FOUND` but the scan lists it as `WPA`: the network offers only WPA1,
+    which the ESP32 ignores. Set the access point to WPA2 (AES/CCMP); on the Pi,
+    `sudo bash deploy/pi_hotspot.sh on` applies the right settings.
+  - `2 AUTH_EXPIRE` with the scan showing `WPA2/WPA3`: turn off protected management
+    frames (WPA2 only) on the access point.
+  - `15` or `204`: wrong password.
 - **Camera init failed** — usually a power issue; use a dedicated 5V supply rather than a laptop USB port.
 - **`config.json not found`** — confirm the card is FAT32-formatted and the file sits at the SD card root, not in a subfolder.
 - **No images under `/birds`** — check `/status` for the last classification and SD result, then check the Pi's `/health` response for model readiness, queue depth, and the latest inference. Remember that `wait_for_classification: false` deliberately returns before a verdict, so the ESP32 cannot make its own `/birds` copy in deferred mode.
@@ -363,6 +379,12 @@ This firmware has no authentication and is meant for a trusted home LAN only. Do
   as the laptop server's `--camera-url`. The ESP32's `server_ip` is the reverse
   direction and must be the laptop's LAN address. Temporarily set
   `motion_enabled` to `false` to isolate preview traffic from motion uploads.
+- **Status light blinks yellow after a field power-up** — the camera booted
+  before the hub was answering. Power the hub first and the camera about two
+  minutes later, or press RST once the dashboard loads; the hub log
+  (`journalctl -u birdhub`) should show its heartbeats every ~15 s.
+- **`/sdcard/pending does not exist` at boot** — harmless when `buffer_uploads_to_sd`
+  is `false`; create an empty `pending` folder at the card root to silence it.
 - **ESP32 stops answering when the receiver is offline** — failed motion uploads
   use bounded timeouts and a 15-second retry cooldown. Check that `server_ip`
   still matches the receiver's current DHCP address.

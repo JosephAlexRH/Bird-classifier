@@ -33,7 +33,7 @@ but Pi-owned motion detection is the default configuration.
 - Support for OV2640 and OV5640 camera sensors
 - Colour status light on the ESP32-S3 board for on-site checks (Wi-Fi, hub link, camera faults)
 - Local motion selection, bird detection, species prediction, and visit grouping
-- Offline Raspberry Pi hotspot mode for field deployments
+- Offline Raspberry Pi hotspot for field deployments, chosen at boot by a jumper on the hub
 - Browser-based live view, camera configuration, ROI editing, and data review
 - Immutable JPEG acquisition sidecars plus separate motion, inference, and review records
 - Dataset collection, bounding-box review, export, backup, and deployment tools
@@ -49,7 +49,8 @@ A typical deployment uses:
 
 - One or more AI Thinker ESP32-CAM or Freenove ESP32-S3 WROOM CAM boards
 - An OV2640 or OV5640 camera module
-- A Raspberry Pi hub, such as a Raspberry Pi Zero 2 W
+- A Raspberry Pi hub, such as a Raspberry Pi Zero 2 W, with a USB drive for
+  captures and optionally a PiRTC clock module
 - A stable 5 V supply for each camera
 - A FAT32 microSD card for camera configuration and optional buffering
 - For the ESP32-CAM, an ESP32-CAM-MB programmer or USB-to-UART adapter (the
@@ -92,7 +93,7 @@ preview frames, edit settings, draw a motion ROI, and save test captures.
 
 ### 3. Run the Raspberry Pi hub
 
-Copy or clone the repository onto the Pi, install an appropriate TFLite runtime  ,
+Copy or clone the repository onto the Pi, install an appropriate TFLite runtime,
 and run the supplied service installer:
 
 ```bash
@@ -102,6 +103,15 @@ sudo bash deploy/install_pi_hub.sh
 The hub dashboard listens on port `5000`. Cameras advertise themselves by
 heartbeat and normally find the hub as `birdhub.local`; a configured
 `server_ip` remains the fallback.
+
+For a site with no router, the Pi runs its own `BirdHub` Wi-Fi network (hub at
+`192.168.4.1`). A jumper on GPIO pins 39-40 selects field mode at boot, so
+deploying is: jumper on, USB drive in, power the hub, then the cameras:
+
+```bash
+sudo bash deploy/pi_hotspot.sh on && sudo bash deploy/pi_hotspot.sh off
+sudo bash deploy/birdhub_mode.sh install
+```
 
 See the [server and deployment guide](server/README.md) for model files,
 multi-camera operation, collection mode, hotspot setup, monitoring, and data

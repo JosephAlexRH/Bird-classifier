@@ -14,11 +14,11 @@ if ($LASTEXITCODE -ne 0) { throw 'Pi backup failed; update stopped.' }
 $Files = @('bird_inference.py', 'pi_motion.py', 'raspberry_pi_server.py', 'camera_registry.py',
            'collection.py', 'collection_dashboard.py', 'console_dashboard.py', 'camera_tools.py',
            'hub_dashboard.py', 'hub_settings.py', 'fleet_monitor.py', 'motion_crop.py', 'scene_background.py',
-           'visits.py', 'static_boxes.py', 'fleet_stats.py', 'hub_specs.py')
+           'visits.py', 'static_boxes.py', 'fleet_stats.py', 'hub_specs.py', 'hub_clock.py')
 $Sources = $Files | ForEach-Object { Join-Path $ProjectDir "server/$_" }
 & scp @Sources "${Target}:birdserver/server/"
 if ($LASTEXITCODE -ne 0) { throw 'Server transfer failed; collection service has not been restarted.' }
-& scp (Join-Path $PSScriptRoot 'enable_pi_collection.sh') (Join-Path $PSScriptRoot 'pi_hotspot.sh') "${Target}:birdserver/deploy/"
+& scp (Join-Path $PSScriptRoot 'enable_pi_collection.sh') (Join-Path $PSScriptRoot 'pi_hotspot.sh') (Join-Path $PSScriptRoot 'birdhub_mode.sh') "${Target}:birdserver/deploy/"
 if ($LASTEXITCODE -ne 0) { throw 'Installer transfer failed; service has not been restarted.' }
 Write-Host 'Enabling collection through SSH. Enter your Pi sudo password if requested.'
 & ssh -t $Target "cd ~/birdserver && sudo bash deploy/enable_pi_collection.sh $DeploymentId"
