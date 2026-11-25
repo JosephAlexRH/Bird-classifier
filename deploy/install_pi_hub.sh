@@ -32,7 +32,8 @@ if [[ $# -gt 0 ]]; then
 fi
 
 # --- Python environment -----------------------------------------------------
-VENV_DIR="${REPO_DIR}/.venv"
+# BIRDHUB_VENV lets setup_new_pi.sh share ~/.venv with the collection scripts.
+VENV_DIR="${BIRDHUB_VENV:-${REPO_DIR}/.venv}"
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
   echo "Creating Python environment in ${VENV_DIR} ..."
   # System packages stay visible so an apt-installed TFLite runtime keeps working.

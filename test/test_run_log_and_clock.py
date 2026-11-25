@@ -119,6 +119,29 @@ class HubClockTests(unittest.TestCase):
         self.assertEqual(self.journal[-1][0], "clock_restored")
 
 
+    def test_journal_that_reads_the_clock_does_not_deadlock(self) -> None:
+        # Production wires RunLog.context to hub_clock.state(), so every journal
+        # write re-enters the clock. offer_reference must not hold its lock then.
+        import threading
+        holder: dict = {}
+
+        def journal(kind, **fields):
+            self.journal.append((kind, {**fields, "clock": holder["clock"].state()["source"]}))
+
+        holder["clock"] = HubClock(
+            self.file, clock=self.time, ntp_synced=lambda: False, set_system_time=self.time.step,
+            boot_id=lambda: "boot-1", journal=journal,
+        )
+        done = threading.Event()
+        worker = threading.Thread(
+            target=lambda: (holder["clock"].offer_reference((self.time.now + 500) * 1000), done.set()),
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(done.wait(5), "offer_reference deadlocked when the journal read the clock")
+        self.assertEqual(self.journal[-1][0], "clock_reference")
+        self.assertEqual(holder["clock"].state()["source"], "reference")
+
 class RunLogTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

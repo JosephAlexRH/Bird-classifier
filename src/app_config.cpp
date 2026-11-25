@@ -90,6 +90,26 @@ void writeSensorProfile(JsonObject object, const CameraSensorProfile &profile) {
   object["xclk_hz"] = profile.xclkHz;
 }
 
+// Copies a config string with stray whitespace removed from both ends.
+// Values typed or pasted on Windows can pick up a trailing space, tab, CR or LF,
+// which makes "BirdHub " a different network from "BirdHub". Returns true if
+// anything was stripped so the caller can log it. trimSpaces=false keeps
+// spaces (valid inside Wi-Fi passwords) and strips only CR/LF/tab.
+bool copyTrimmed(char *dst, const char *src, size_t dstSize, bool trimSpaces = true) {
+  auto strip = [trimSpaces](char c) {
+    return c == '\r' || c == '\n' || c == '\t' || (trimSpaces && c == ' ');
+  };
+  const char *start = src;
+  while (*start != '\0' && strip(*start)) ++start;
+  const char *end = start + strlen(start);
+  while (end > start && strip(*(end - 1))) --end;
+  const size_t length = static_cast<size_t>(end - start);
+  const size_t copied = length < dstSize - 1 ? length : dstSize - 1;
+  memmove(dst, start, copied);  // memmove: dst may be the default value passed in as src
+  dst[copied] = '\0';
+  return start != src || end != src + strlen(src);
+}
+
 void applyCompiledWifiFallback() {
   cfg.wifiSsid[0] = '\0';
   cfg.wifiPassword[0] = '\0';
@@ -422,8 +442,15 @@ void loadConfig() {
     cfg.motionOwner = MotionOwner::Pi;
   }
 
-  const char *ssid = document["wifi_ssid"] | "";
-  const char *password = document["wifi_password"] | "";
+  // Trim before validating so a stray trailing space/CR can't silently change
+  // the network name (shows up on the ESP32 as reason 201 NO_AP_FOUND).
+  char ssid[64];
+  char password[96];
+  const bool ssidTrimmed = copyTrimmed(ssid, document["wifi_ssid"] | "", sizeof(ssid));
+  const bool passwordTrimmed =
+      copyTrimmed(password, document["wifi_password"] | "", sizeof(password), false);
+  if (ssidTrimmed) Serial.println("Note: removed stray whitespace around wifi_ssid in config.json");
+  if (passwordTrimmed) Serial.println("Note: removed stray CR/LF/tab around wifi_password in config.json");
   if (ssid[0] != '\0' && strlen(ssid) <= 32 && strlen(password) <= 64) {
     strlcpy(cfg.wifiSsid, ssid, sizeof(cfg.wifiSsid));
     strlcpy(cfg.wifiPassword, password, sizeof(cfg.wifiPassword));
@@ -479,13 +506,13 @@ void loadConfig() {
     }
   }
   if (document.containsKey("server_ip")) {
-    strlcpy(cfg.serverIp, document["server_ip"] | cfg.serverIp, sizeof(cfg.serverIp));
+    copyTrimmed(cfg.serverIp, document["server_ip"] | cfg.serverIp, sizeof(cfg.serverIp));
   }
   if (document.containsKey("server_port")) {
     cfg.serverPort = document["server_port"];
   }
   if (document.containsKey("server_host")) {
-    strlcpy(cfg.serverHost, document["server_host"] | cfg.serverHost, sizeof(cfg.serverHost));
+    copyTrimmed(cfg.serverHost, document["server_host"] | cfg.serverHost, sizeof(cfg.serverHost));
   }
   if (document.containsKey("save_birds_to_sd")) {
     cfg.saveBirdsToSd = document["save_birds_to_sd"];

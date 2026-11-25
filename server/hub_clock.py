@@ -196,6 +196,7 @@ class HubClock:
             return {"applied": False, "offset_s": round(offset, 3), "state": state,
                     "reason": "the hub already has a real clock"}
 
+        log_entry: dict[str, Any] | None = None
         with self._lock:
             previous = self._reference
             needs_step = abs(offset) > STEP_THRESHOLD_SECONDS
@@ -204,8 +205,8 @@ class HubClock:
                 stepped = bool(self._set_system_time(client))
             if needs_step or previous is None:
                 # Only worth a line when it tells us something new.
-                self._write(
-                    "clock_reference", source=source, hub_unix_before=hub, reference_unix=client,
+                log_entry = dict(
+                    source=source, hub_unix_before=hub, reference_unix=client,
                     offset_s=round(offset, 3), stepped=stepped,
                     note=("hub clock corrected" if stepped else
                           "hub clock agrees with the reference" if not needs_step else
@@ -218,4 +219,9 @@ class HubClock:
                 "trusted": stepped or not needs_step,
             }
             self._save()
+        # Journal outside the lock: the run log's context calls state(), which
+        # takes this same (non-reentrant) lock. Writing while holding it
+        # deadlocked the hub the first time a dashboard offered its clock.
+        if log_entry is not None:
+            self._write("clock_reference", **log_entry)
         return {"applied": True, "stepped": stepped, "offset_s": round(offset, 3), "state": self.state()}

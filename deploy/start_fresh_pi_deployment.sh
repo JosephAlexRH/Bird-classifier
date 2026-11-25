@@ -27,14 +27,23 @@ done
 OVERRIDE=/etc/systemd/system/birdhub.service.d/collection.conf
 [[ -f "${OVERRIDE}" ]]
 cp "${OVERRIDE}" "${OVERRIDE}.before-fresh-$(date -u +%Y%m%dT%H%M%SZ)"
+# The Pi Zero W (ARMv6) needs libatomic preloaded for its hand-built tflite-runtime;
+# 64-bit boards such as the Pi Zero 2 W use ai-edge-litert and need nothing.
+PRELOAD_LINE=""
+if [[ "$(uname -m)" == armv6l && -f /usr/lib/arm-linux-gnueabihf/libatomic.so.1 ]]; then
+  PRELOAD_LINE="Environment=LD_PRELOAD=/usr/lib/arm-linux-gnueabihf/libatomic.so.1"
+fi
+# Leave one core for camera acquisition and the dashboard (override with BIRDHUB_THREADS).
+CORES="$(nproc)"
+NUM_THREADS="${BIRDHUB_THREADS:-$(( CORES > 1 ? CORES - 1 : 1 ))}"
 cat >"${OVERRIDE}" <<EOF
 [Service]
 User=${RUN_USER}
 WorkingDirectory=${RUN_HOME}/birdserver
 Environment=PYTHONUNBUFFERED=1
-Environment=LD_PRELOAD=/usr/lib/arm-linux-gnueabihf/libatomic.so.1
+${PRELOAD_LINE}
 ExecStart=
-ExecStart=${RUN_HOME}/.venv/bin/python server/raspberry_pi_server.py --host 0.0.0.0 --port 5000 --save-dir ${RUN_HOME}/bird_images --collection-mode --deployment-id ${DEPLOYMENT_ID} --num-threads 1 --motion-poll-seconds 2 --motion-timeout-seconds 10
+ExecStart=${RUN_HOME}/.venv/bin/python server/raspberry_pi_server.py --host 0.0.0.0 --port 5000 --save-dir ${RUN_HOME}/bird_images --collection-mode --deployment-id ${DEPLOYMENT_ID} --num-threads ${NUM_THREADS} --motion-poll-seconds 2 --motion-timeout-seconds 10
 EOF
 systemctl daemon-reload
 systemctl start birdhub.service

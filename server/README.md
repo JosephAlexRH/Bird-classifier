@@ -688,6 +688,27 @@ clients:
 These endpoints, like the rest of the receiver, have no authentication. Keep
 them on a trusted LAN and do not forward port 5000 from the public internet.
 
+## Moving the hub to a new Pi (Pi Zero 2 W)
+
+The Pi Zero 2 W runs 64-bit Raspberry Pi OS, so it uses the `ai-edge-litert`
+wheel from `requirements.txt`; no hand-built runtime or libatomic preload.
+
+1. Flash **Raspberry Pi OS Lite (64-bit)**. In Imager set hostname `birdhub`,
+   user `jrussell`, Wi-Fi (country US) and SSH.
+2. Archive and stop the old hub: `.\deploy\archive_pi_deployment.ps1`, then
+   `sudo systemctl stop birdhub` and power it off. Move the USB drive across.
+3. On the new Pi: `git clone https://github.com/JosephAlexRH/Bird-classifier ~/birdserver`
+4. `cd ~/birdserver && sudo bash deploy/setup_new_pi.sh` creates `~/.venv`,
+   times both models, mounts the USB drive by UUID at boot (`nofail`), links
+   `~/bird_images` to it and installs `birdhub.service`.
+5. `sudo bash deploy/enable_pi_collection.sh <deployment-id>`; add
+   `sudo bash deploy/pi_hotspot.sh on` for field sites.
+
+Camera identities, ROIs and dashboard settings live on the USB drive
+(`cameras.json`, `fleet.json`, `hub_settings.json`) and come across with it.
+Cameras find the new board as `birdhub.local`; from Windows use
+`-PiAddress birdhub.local` (or its IP) with the PowerShell scripts.
+
 ## Detector-only field collection and Pi review
 
 Use `--collection-mode` on the Pi for dataset collection. This skips loading and
@@ -703,11 +724,14 @@ Capture pauses below 256 MiB of free disk space; it does not delete originals.
 ```bash
 source ~/.venv/bin/activate
 cd ~/birdserver
-LD_PRELOAD=/usr/lib/arm-linux-gnueabihf/libatomic.so.1 \
 python server/raspberry_pi_server.py --collection-mode \
-  --deployment-id garden-feeder-20261116 --num-threads 1 \
+  --deployment-id garden-feeder-20261116 --num-threads 3 \
   --motion-poll-seconds 2 --motion-timeout-seconds 10
 ```
+
+On the old Pi Zero W (ARMv6, hand-built `tflite-runtime`), prefix the command
+with `LD_PRELOAD=/usr/lib/arm-linux-gnueabihf/libatomic.so.1` and use
+`--num-threads 1`. The deploy scripts pick both automatically from the board.
 
 The existing camera registry and heartbeats supply camera addresses; omit a
 fixed `--camera-url` when cameras already register with the Pi. Keep

@@ -26,14 +26,65 @@ namespace {
   volatile bool cameraReady = false;
   TaskHandle_t motionTaskHandle = nullptr;
 
+  const char *authModeName(wifi_auth_mode_t mode) {
+    switch (mode) {
+      case WIFI_AUTH_OPEN: return "open";
+      case WIFI_AUTH_WEP: return "WEP";
+      case WIFI_AUTH_WPA_PSK: return "WPA";
+      case WIFI_AUTH_WPA2_PSK: return "WPA2";
+      case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+      case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-Ent";
+      case WIFI_AUTH_WPA3_PSK: return "WPA3";
+      case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+      default: return "other";
+    }
+  }
+
+  // One-off scan after a failed connect, so the serial log shows whether the
+  // configured network is visible at all (reason 201 = not seen) and how strong
+  // it is. Logged lines go to Serial; the summary also goes to the event log.
+  void logVisibleNetworks() {
+    // A scan isn't allowed while the driver is mid-connect, and auto-reconnect
+    // restarts the attempt on every 201, so pause it for the duration.
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false);
+    delay(200);
+    const int count = WiFi.scanNetworks(false, true);
+    WiFi.setAutoReconnect(true);
+    if (count < 0) {
+      logEvent("wifi scan failed (%d)", count);
+      return;
+    }
+    Serial.printf("Wi-Fi scan: %d network(s) visible, looking for [%s]\n", count, cfg.wifiSsid);
+    int match = -1;
+    for (int i = 0; i < count; ++i) {
+      const String name = WiFi.SSID(i);
+      const bool exact = name == cfg.wifiSsid;
+      const bool nearMiss = !exact && name.equalsIgnoreCase(cfg.wifiSsid);
+      if (exact) match = i;
+      Serial.printf("  %s[%s] ch%d %d dBm %s\n", exact ? "=> " : nearMiss ? "~~ " : "   ",
+                    name.c_str(), WiFi.channel(i), WiFi.RSSI(i),
+                    authModeName(WiFi.encryptionType(i)));
+    }
+    if (match >= 0) {
+      logEvent("wifi scan: [%s] visible on ch%d at %d dBm (%s)", cfg.wifiSsid,
+               WiFi.channel(match), WiFi.RSSI(match), authModeName(WiFi.encryptionType(match)));
+    } else {
+      logEvent("wifi scan: [%s] NOT visible among %d networks (hub off, out of range, or antenna)",
+               cfg.wifiSsid, count);
+    }
+    WiFi.scanDelete();
+  }
+
   void connectToWifi() {
     if (cfg.wifiSsid[0] == '\0') {
       Serial.println("Wi-Fi not configured; set wifi_ssid in config.json or provide include/secrets.h");
       return;
     }
     WiFi.mode(WIFI_STA);
-    Serial.print("Connecting to ");
-    Serial.println(cfg.wifiSsid);
+    // Brackets and length expose invisible characters in the configured name.
+    Serial.printf("Connecting to [%s] (%u chars)\n", cfg.wifiSsid,
+                  static_cast<unsigned>(strlen(cfg.wifiSsid)));
     WiFi.setAutoReconnect(true);
     WiFi.persistent(false);
     WiFi.begin(cfg.wifiSsid, cfg.wifiPassword);
@@ -52,6 +103,9 @@ namespace {
       Serial.println();
       logEvent("wifi: not connected after 20 s (status %d); continuing, driver keeps retrying",
                static_cast<int>(WiFi.status()));
+      logVisibleNetworks();
+      WiFi.begin(cfg.wifiSsid, cfg.wifiPassword);  // the scan stopped the attempt; resume it
+      WiFi.setTxPower(WIFI_POWER_15dBm);
       return;
     }
 

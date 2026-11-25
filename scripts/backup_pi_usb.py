@@ -26,11 +26,14 @@ def digest(path):
 
 def check_mount(mount, uuid):
     # --mountpoint requires this exact path, not its parent/root filesystem.
-    actual = subprocess.check_output(
+    output = subprocess.check_output(
         ['findmnt', '--noheadings', '--raw', '--mountpoint', str(mount),
-         '--output', 'UUID'], text=True).strip()
-    if actual.casefold() != uuid.casefold():
-        raise RuntimeError(f'Expected USB UUID {uuid}; found {actual!r}')
+         '--output', 'UUID'], text=True)
+    # A repeated `mount` stacks the same drive twice, giving one line per
+    # mount; that is still the right drive, so compare the distinct UUIDs.
+    found = {line.strip().casefold() for line in output.splitlines() if line.strip()}
+    if found != {uuid.casefold()}:
+        raise RuntimeError(f'Expected USB UUID {uuid}; found {sorted(found)!r}')
 
 
 def copy_stable(source, target, history):
