@@ -25,6 +25,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+try:
+    from .capture_storage import capture_files, in_capture_folder, locate_capture_file
+except ImportError:  # Direct execution from the server folder
+    from capture_storage import capture_files, in_capture_folder, locate_capture_file
+
 VISIT_SCHEMA_VERSION = 1
 DEFAULT_GAP_SECONDS = 120.0
 # A visit needs at least this many species-scored frames before it is auto-labelled; a single frame
@@ -280,14 +285,14 @@ def rebuild(directory: Path, gap_seconds: float = DEFAULT_GAP_SECONDS, automatio
             ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Rebuild every visit from the capture sidecars (and any .inference.json) in ``directory``."""
     directory = Path(directory)
-    refs = [ref for path in sorted(directory.glob("capture_*.json"))
+    refs = [ref for path in sorted(capture_files(directory, "capture_*.json"), key=lambda p: p.name)
             if not path.name.endswith((".inference.json", ".motion.json"))
             for ref in [read_capture_ref(path)] if ref is not None]
     mapping = assign_visits(refs, gap_seconds)
     tracker = VisitTracker(None, gap_seconds=gap_seconds, automation=automation)
     visits = []
     for ref in sorted(refs, key=lambda c: (c.camera, c.time, c.capture_id)):
-        inference_path = directory / f"{ref.capture_id}.inference.json"
+        inference_path = locate_capture_file(directory, f"{ref.capture_id}.inference.json")
         inference = None
         if inference_path.is_file():
             try:

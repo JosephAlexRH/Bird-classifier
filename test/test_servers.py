@@ -14,6 +14,8 @@ from unittest.mock import patch
 from urllib.error import URLError
 
 from server.capture_storage import (
+    capture_files,
+    locate_capture_file,
     CAPTURE_SCHEMA_VERSION,
     METADATA_HEADER,
     CalibrationType,
@@ -139,7 +141,7 @@ class CaptureStorageTests(unittest.TestCase):
                     self.assertEqual(record["calibration_type"], calibration_type.value)
                     self.assertIs(type(record["calibration_type"]), str)
                     sidecar = json.loads(
-                        (store.root / record["sidecar"]).read_text(encoding="utf-8")
+                        (locate_capture_file(store.root, record["sidecar"])).read_text(encoding="utf-8")
                     )
                     self.assertEqual(sidecar["calibration_type"], calibration_type.value)
                     self.assertEqual(sidecar["schema_version"], 3)
@@ -182,7 +184,7 @@ class CaptureStorageTests(unittest.TestCase):
             roi = {"x": 0.125, "y": 0.25, "width": 0.5, "height": 0.625}
             metadata["camera"]["requested"]["motion"] = {"roi": roi}
             record = store.save_capture(JPEG, source="test", camera_metadata=metadata)
-            saved = json.loads((store.root / record["sidecar"]).read_text(encoding="utf-8"))
+            saved = json.loads((locate_capture_file(store.root, record["sidecar"])).read_text(encoding="utf-8"))
             self.assertEqual(saved["firmware_metadata_schema_version"], 5)
             self.assertEqual(saved["camera"]["requested"]["motion"]["roi"], roi)
 
@@ -209,7 +211,7 @@ class CaptureStorageTests(unittest.TestCase):
             }
 
             record = store.save_capture(JPEG, source="test", camera_metadata=metadata)
-            saved = json.loads((store.root / record["sidecar"]).read_text(encoding="utf-8"))
+            saved = json.loads((locate_capture_file(store.root, record["sidecar"])).read_text(encoding="utf-8"))
 
             self.assertEqual(record["camera_model"], "OV2640")
             self.assertEqual(saved["camera"]["sensor"]["pid"], 0x26)
@@ -272,7 +274,7 @@ class CaptureStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = CaptureStore(Path(temporary))
             capture = store.save_capture(JPEG, source="test")
-            image_path = store.root / capture["filename"]
+            image_path = locate_capture_file(store.root, capture["filename"])
             record = {"schema_version": 1, "capture_id": capture["capture_id"]}
             destination = store.save_derived_record(image_path, "motion", record)
             self.assertEqual(destination.name, f"{capture['capture_id']}.motion.json")
@@ -303,8 +305,8 @@ class LaptopServerTests(unittest.TestCase):
         self.assertEqual(record["source"], "motion")
         self.assertIn("not supplied", record["metadata_error"])
         self.assertEqual(record["sha256"], hashlib.sha256(JPEG).hexdigest())
-        self.assertEqual((self.save_dir / record["filename"]).read_bytes(), JPEG)
-        sidecar = json.loads((self.save_dir / record["sidecar"]).read_text(encoding="utf-8"))
+        self.assertEqual((locate_capture_file(self.save_dir, record["filename"])).read_bytes(), JPEG)
+        sidecar = json.loads((locate_capture_file(self.save_dir, record["sidecar"])).read_text(encoding="utf-8"))
         manifest = json.loads((self.save_dir / "manifest.jsonl").read_text(encoding="utf-8"))
         self.assertEqual(sidecar["capture_id"], record["capture_id"])
         self.assertEqual(manifest["capture_id"], record["capture_id"])
@@ -367,7 +369,7 @@ class LaptopServerTests(unittest.TestCase):
     def test_upload_rejects_empty_and_incomplete_images(self) -> None:
         self.assertEqual(self.client.post("/upload", data=b"").status_code, 400)
         self.assertEqual(self.client.post("/upload", data=b"not jpeg").status_code, 415)
-        self.assertFalse(list(self.save_dir.glob("*.jpg")))
+        self.assertFalse(capture_files(self.save_dir, "*.jpg"))
 
     @patch("server.laptop_test_server.urlopen")
     def test_manual_calibration_capture_saves_user_fields(self, mocked_urlopen) -> None:
@@ -755,7 +757,7 @@ class RaspberryPiServerTests(unittest.TestCase):
         record = response.get_json()
         self.assertTrue(record["classification"]["is_bird"])
         self.assertEqual(record["classification"]["label"], "sparrow")
-        mocked_classify.assert_called_once_with(self.save_dir / record["filename"])
+        mocked_classify.assert_called_once_with(locate_capture_file(self.save_dir, record["filename"]))
         health = self.client.get("/health").get_json()
         self.assertEqual(health["latest_image"], record["filename"])
         self.assertEqual(health["classification"]["confidence"], 0.92)
@@ -776,9 +778,9 @@ class RaspberryPiServerTests(unittest.TestCase):
         self.assertEqual(record["status"], "queued")
         self.assertIsNone(record["classification"])
         self.assertTrue(record["classification_deferred"])
-        self.assertTrue((self.save_dir / record["filename"]).exists())
+        self.assertTrue((locate_capture_file(self.save_dir, record["filename"])).exists())
         self.app.config["CLASSIFICATION_QUEUE"].join()
-        mocked_classify.assert_called_once_with(self.save_dir / record["filename"])
+        mocked_classify.assert_called_once_with(locate_capture_file(self.save_dir, record["filename"]))
         health = self.client.get("/health").get_json()
         self.assertEqual(health["classification"]["label"], "sparrow")
         self.assertEqual(health["classification_queue_depth"], 0)
@@ -917,12 +919,12 @@ class RaspberryPiServerTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [(
-                self.save_dir / "models" / f"{capture_id}.jpg",
+                locate_capture_file(self.save_dir / "models", f"{capture_id}.jpg"),
                 roi,
                 CAPTURE_ROI_SOURCE,
             )],
         )
-        inference_path = self.save_dir / "models" / f"{capture_id}.inference.json"
+        inference_path = locate_capture_file(self.save_dir / "models", f"{capture_id}.inference.json")
         self.assertTrue(inference_path.is_file())
         inference = json.loads(inference_path.read_text(encoding="utf-8"))
         self.assertEqual(inference["guess"], "sparrow")
@@ -962,10 +964,10 @@ class RaspberryPiServerTests(unittest.TestCase):
         record = response.get_json()
         self.assertIsNone(record["classification"])
         self.assertIn("roi is required", record["classification_error"])
-        self.assertTrue((root / record["filename"]).is_file())
-        self.assertTrue((root / record["sidecar"]).is_file())
+        self.assertTrue((locate_capture_file(root, record["filename"])).is_file())
+        self.assertTrue((locate_capture_file(root, record["sidecar"])).is_file())
         inference = json.loads(
-            (root / f"{record['capture_id']}.inference.json").read_text(encoding="utf-8")
+            locate_capture_file(root, f"{record['capture_id']}.inference.json").read_text(encoding="utf-8")
         )
         self.assertEqual(inference["status"], "error")
         self.assertIn("roi is required", inference["error"])
@@ -1015,7 +1017,7 @@ class RaspberryPiServerTests(unittest.TestCase):
         capture_id = response.get_json()["capture_id"]
         self.assertEqual(calls[0][1]["crop_source"], "capture_motion_record.selection.final_bounds_px")
         self.assertEqual(set(calls[0][1]["selected_crop"]), {"left", "top", "right", "bottom"})
-        motion_path = root / f"{capture_id}.motion.json"
+        motion_path = locate_capture_file(root, f"{capture_id}.motion.json")
         self.assertTrue(motion_path.is_file())
         motion = json.loads(motion_path.read_text(encoding="utf-8"))
         self.assertEqual(motion["selection"]["source"], "static_roi_fallback")
@@ -1052,7 +1054,7 @@ class RaspberryPiServerTests(unittest.TestCase):
             "owner": "pi", "roi": {"x": 0, "y": 0, "width": 1, "height": 1},
         }
         record = store.save_capture(output.getvalue(), source="pi_motion_poll", camera_metadata=metadata)
-        image_path = root / record["filename"]
+        image_path = locate_capture_file(root, record["filename"])
         bounds = {"left": 40, "top": 30, "right": 200, "bottom": 190, "width": 160, "height": 160}
         motion = {
             "schema_version": 1,
@@ -1106,7 +1108,7 @@ class RaspberryPiServerTests(unittest.TestCase):
         root = self.save_dir / "motion-api"
         store = CaptureStore(root)
         record = store.save_capture(JPEG, source="pi_motion_poll")
-        image_path = root / record["filename"]
+        image_path = locate_capture_file(root, record["filename"])
         motion = {"schema_version": 1, "capture": {"capture_id": record["capture_id"]}}
         store.save_derived_record(image_path, "motion", motion)
         app = create_pi_app(root)
@@ -1292,6 +1294,61 @@ class RaspberryPiServerTests(unittest.TestCase):
         finally:
             latest_image.close()
         app.config["CLEANUP"]()
+
+
+class DateFolderStorageTests(unittest.TestCase):
+    """Captures are filed in YYYY/MM/DD folders; legacy flat captures stay readable."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.save_dir = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_new_capture_and_derived_records_go_in_their_utc_day_folder(self) -> None:
+        store = CaptureStore(self.save_dir)
+        record = store.save_capture(JPEG, source="test")
+        stamp = record["capture_id"].split("_")[1]
+        day = self.save_dir / stamp[0:4] / stamp[4:6] / stamp[6:8]
+        self.assertEqual(record["filename"], f"{record['capture_id']}.jpg")
+        self.assertEqual((day / record["filename"]).read_bytes(), JPEG)
+        self.assertTrue((day / record["sidecar"]).is_file())
+        self.assertFalse((self.save_dir / record["filename"]).exists())
+        self.assertEqual(store.path_for(record["filename"]), day / record["filename"])
+        motion = store.save_derived_record(day / record["filename"], "motion", {"ok": True})
+        self.assertEqual(motion.parent, day)
+        self.assertTrue((self.save_dir / "manifest.jsonl").is_file())
+
+    def test_legacy_flat_capture_is_still_found_listed_and_served(self) -> None:
+        legacy_id = "capture_20261101T120000_000000Z_00000000"
+        (self.save_dir / f"{legacy_id}.jpg").write_bytes(JPEG)
+        (self.save_dir / f"{legacy_id}.json").write_text(
+            json.dumps({"capture_id": legacy_id, "filename": f"{legacy_id}.jpg"}), encoding="utf-8")
+        self.assertEqual(locate_capture_file(self.save_dir, f"{legacy_id}.jpg"), self.save_dir / f"{legacy_id}.jpg")
+        app = create_pi_app(self.save_dir)
+        app.testing = True
+        try:
+            client = app.test_client()
+            new = client.post("/upload", data=JPEG, content_type="image/jpeg").get_json()
+            listed = [item["capture_id"] for item in client.get("/api/captures").get_json()["captures"]]
+            self.assertEqual(listed, [legacy_id, new["capture_id"]])
+            for capture_id in listed:
+                response = client.get(f"/api/captures/{capture_id}/image")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data, JPEG)
+                response.close()
+        finally:
+            app.config["CLEANUP"]()
+
+    def test_capture_files_ignores_hub_folders_that_are_not_dates(self) -> None:
+        (self.save_dir / "crops").mkdir()
+        (self.save_dir / "crops" / "capture_x_bird_00.jpg").write_bytes(JPEG)
+        (self.save_dir / "2026" / "11" / "28").mkdir(parents=True)
+        (self.save_dir / "2026" / "11" / "28" / "capture_20261128T000000_000000Z_a.jpg").write_bytes(JPEG)
+        (self.save_dir / "capture_20261001T000000_000000Z_b.jpg").write_bytes(JPEG)
+        names = sorted(path.name for path in capture_files(self.save_dir))
+        self.assertEqual(names, ["capture_20261001T000000_000000Z_b.jpg", "capture_20261128T000000_000000Z_a.jpg"])
 
 
 if __name__ == "__main__":

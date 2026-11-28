@@ -26,6 +26,7 @@ try:
         METADATA_HEADER,
         CalibrationType,
         CaptureStore,
+        capture_files,
         calibration_type_values,
         is_jpeg,
         parse_calibration_type,
@@ -45,6 +46,7 @@ except ImportError:  # Direct execution: python server/laptop_test_server.py
         METADATA_HEADER,
         CalibrationType,
         CaptureStore,
+        capture_files,
         calibration_type_values,
         is_jpeg,
         parse_calibration_type,
@@ -616,7 +618,7 @@ def create_app(
         "streaming": False,
     }
 
-    existing = sorted(store.root.glob("*.jpg"), key=lambda path: path.stat().st_mtime)
+    existing = sorted(capture_files(store.root, "*.jpg"), key=lambda path: path.stat().st_mtime)
     latest: dict[str, Any] = {"path": existing[-1] if existing else None, "record": None}
 
     def record_camera_state(reachable: bool, error: str | None = None) -> None:
@@ -876,7 +878,7 @@ def create_app(
 
     def update_latest(record: dict[str, Any]) -> None:
         with state_lock:
-            latest["path"] = store.root / record["filename"]
+            latest["path"] = store.path_for(record["filename"])
             latest["record"] = record
 
     @app.get("/legacy")
@@ -909,7 +911,7 @@ def create_app(
         update_latest(record)
         print(
             f"Received {len(image)} bytes from {record.get('camera_model') or 'unknown'}: "
-            f"{store.root / record['filename']}",
+            f"{store.path_for(record['filename'])}",
             flush=True,
         )
         return jsonify(status="ok", **record)
@@ -995,7 +997,7 @@ def create_app(
     def latest_camera_capture(camera_id: str) -> tuple[Path, dict[str, Any]] | None:
         if registry.get(camera_id) is None:
             return None
-        paths = sorted(store.root.glob("*.jpg"), key=lambda item: item.stat().st_mtime, reverse=True)
+        paths = sorted(capture_files(store.root, "*.jpg"), key=lambda item: item.stat().st_mtime, reverse=True)
         for path in paths:
             try:
                 sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))

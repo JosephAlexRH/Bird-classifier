@@ -14,7 +14,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Pi backup failed; update stopped.' }
 $Files = @('bird_inference.py', 'pi_motion.py', 'raspberry_pi_server.py', 'camera_registry.py',
            'collection.py', 'collection_dashboard.py', 'console_dashboard.py', 'camera_tools.py',
            'hub_dashboard.py', 'hub_settings.py', 'fleet_monitor.py', 'motion_crop.py', 'scene_background.py',
-           'visits.py', 'static_boxes.py', 'fleet_stats.py', 'hub_specs.py', 'hub_clock.py')
+           'visits.py', 'static_boxes.py', 'fleet_stats.py', 'hub_specs.py', 'hub_clock.py',
+           'capture_storage.py', 'laptop_test_server.py')
 $Sources = $Files | ForEach-Object { Join-Path $ProjectDir "server/$_" }
 & scp @Sources "${Target}:birdserver/server/"
 if ($LASTEXITCODE -ne 0) { throw 'Server transfer failed; collection service has not been restarted.' }

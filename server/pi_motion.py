@@ -305,7 +305,7 @@ class MotionService:
                 inference = {'status': 'skipped', 'reason': 'background_calibration',
                              'is_bird': None, 'background_calibration': self.background.state(),
                              'completed_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
-                destination = self.store.root / record['filename']
+                destination = self.store.path_for(record['filename'])
                 write_inference_record(destination, inference)
                 if self.on_persist:
                     self.on_persist(destination, record, inference)
@@ -410,7 +410,7 @@ class MotionService:
                         'capture_policy': motion['capture_policy'],
                     },
                 )
-                destination = self.store.root / capture["filename"]
+                destination = self.store.path_for(capture["filename"])
                 motion["capture"] = {
                     "capture_id": capture["capture_id"],
                     "filename": capture["filename"],
@@ -421,7 +421,7 @@ class MotionService:
                     "boot_id": boot_id,
                     "event_id": event_id,
                 }
-                sidecar_path = self.store.root / capture["sidecar"]
+                sidecar_path = self.store.path_for(capture["sidecar"])
                 sidecar_sha256 = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
                 sensor = ((capture.get("camera") or {}).get("sensor") or {})
                 camera_provenance = {
@@ -526,7 +526,7 @@ class MotionService:
             "camera_registry_id": self.camera_registry_id, "camera_name": self.camera_name,
             "event_id": f"event_{uuid.uuid4().hex}", "deployment_id": self.deployment_id,
             "collection_run_id": self.collection_run_id, "hub_pipeline": self.pipeline_snapshot()})
-        path = self.store.root / record["filename"]
+        path = self.store.path_for(record["filename"])
         pending = {"status": "pending", "capture_id": record["capture_id"],
                    "image": {"filename": path.name, "sha256": record["sha256"]}}
         # An absent result already means pending in the API; this explicit record
@@ -549,7 +549,7 @@ class MotionService:
 
     def _skip_captured(self, captured: tuple, reason: str) -> None:
         record = captured[2]
-        path = self.store.root / record["filename"]
+        path = self.store.path_for(record["filename"])
         write_inference_record(path, {"status": "skipped", "reason": reason,
             "capture_id": record["capture_id"], "image": {"filename": path.name, "sha256": record["sha256"]},
             "is_bird": None, "collection": {"status": "unprocessed", "crops": [], "review_status": "unreviewed"}})
@@ -583,7 +583,7 @@ class MotionService:
                     self.last_analysis_error = None
             except Exception as error:
                 record = captured[2]
-                write_inference_record(self.store.root / record["filename"], {
+                write_inference_record(self.store.path_for(record["filename"]), {
                     "status": "error", "capture_id": record["capture_id"], "error": str(error)})
                 with self._state_lock:
                     self.last_analysis_error = str(error)

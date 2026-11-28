@@ -30,6 +30,11 @@ try:
 except ImportError:  # Direct execution from the server folder
     from console_dashboard import CONSOLE_DASHBOARD_HTML
 
+try:
+    from .capture_storage import capture_files, in_capture_folder, locate_capture_file
+except ImportError:  # Direct execution from the server folder
+    from capture_storage import capture_files, in_capture_folder, locate_capture_file
+
 HEARTBEAT_INTERVAL_SECONDS = 15
 ONLINE_WITHIN_SECONDS = 40
 LATE_WITHIN_SECONDS = 120
@@ -433,7 +438,7 @@ CAPTURE_SCAN_LIMIT = 600  # newest images inspected when listing one camera's ca
 def recent_captures(capture_dir: Path, camera_id: str, limit: int) -> list[dict[str, Any]]:
     """Newest saved captures whose sidecar names this hardware camera id."""
     try:
-        images = sorted(capture_dir.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+        images = sorted(capture_files(capture_dir, "*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
         return []
     found: list[dict[str, Any]] = []
@@ -568,8 +573,8 @@ def register_fleet_routes(
     def fleet_capture_image(filename: str) -> tuple[Response, int] | Response:
         if capture_dir is None or "/" in filename or "\\" in filename or not filename.endswith(".jpg"):
             return jsonify(error="Not found."), 404
-        path = Path(capture_dir) / filename
-        if path.parent.resolve() != Path(capture_dir).resolve() or not path.is_file():
+        path = locate_capture_file(Path(capture_dir), filename)
+        if not in_capture_folder(Path(capture_dir), path) or not path.is_file():
             return jsonify(error="Not found."), 404
         return send_file(path, mimetype="image/jpeg", max_age=3600)
 

@@ -59,6 +59,8 @@ class ThumbnailCanvasItem:
     name_id: int
 
 
+DATE_DIR_GLOB = "[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9]"  # hub date folders: YYYY/MM/DD
+
 def visible_thumbnail_range(
     record_count: int,
     visible_top: float,
@@ -102,7 +104,7 @@ def discover_records(directory: Path) -> list[ImageRecord]:
     images = sorted(
         (
             path
-            for path in directory.iterdir()
+            for path in [*directory.iterdir(), *directory.glob(f"{DATE_DIR_GLOB}/*")]
             if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
         ),
         key=lambda path: path.name.casefold(),
@@ -110,7 +112,7 @@ def discover_records(directory: Path) -> list[ImageRecord]:
     json_paths = sorted(
         (
             path
-            for path in directory.iterdir()
+            for path in [*directory.iterdir(), *directory.glob(f"{DATE_DIR_GLOB}/*")]
             if path.is_file()
             and path.suffix.lower() == ".json"
             and path.name.casefold() != "manifest.json"

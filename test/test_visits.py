@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from server.capture_storage import CaptureStore
+from server.capture_storage import CaptureStore, locate_capture_file
 from server.pi_motion import MotionService
 from server.visits import (
     CaptureRef,
@@ -215,14 +215,14 @@ class MotionServiceVisitTests(unittest.TestCase):
                                     fetcher=lambda *_a, **_k: (image, meta),
                                     monotonic=iter([0, 0.1]).__next__, visit_tracker=tracker)
             first, second = service.process_once(), service.process_once()
-            records = [json.loads((root / f"{r['capture']['capture_id']}.inference.json").read_text())
+            records = [json.loads(locate_capture_file(root, f"{r['capture']['capture_id']}.inference.json").read_text())
                        for r in (first, second)]
             self.assertEqual(records[0]["visit"]["visit_id"], records[1]["visit"]["visit_id"])
             self.assertTrue(records[0]["visit"]["visit_id"].startswith("esp32-aabbcc/capture_"))
             closed = tracker.close_all()
             self.assertEqual(closed[0]["captures"], 2)
             self.assertEqual(closed[0]["result"]["label"], "House Sparrow")
-            sidecar = json.loads((root / f"{first['capture']['capture_id']}.json").read_text())
+            sidecar = json.loads(locate_capture_file(root, f"{first['capture']['capture_id']}.json").read_text())
             self.assertNotIn("visit", sidecar)  # visits never touch acquisition records
 
 

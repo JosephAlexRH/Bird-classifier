@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 from server.bird_inference import SELECTED_CROP_GEOMETRY
-from server.capture_storage import CaptureStore
+from server.capture_storage import locate_capture_file, CaptureStore, capture_files
 from server.motion_crop import MotionConfig
 from server.pi_motion import MotionService
 
@@ -64,7 +64,7 @@ class PiMotionTests(unittest.TestCase):
             results = [service.process_once() for _ in range(3)]
             self.assertTrue(all(not result["persisted"] for result in results))
             self.assertTrue(service.background.ready)
-            self.assertEqual(list(root.glob("capture_*.jpg")), [])
+            self.assertEqual(capture_files(root, "capture_*.jpg"), [])
 
     def test_clear_blob_is_persisted_with_motion_and_inference_records(self):
         quiet = np.zeros((120, 160, 3), np.uint8)
@@ -87,16 +87,16 @@ class PiMotionTests(unittest.TestCase):
             result = service.process_once()
             self.assertTrue(result["persisted"])
             capture = result["capture"]
-            self.assertTrue((root / capture["filename"]).is_file())
-            self.assertTrue((root / f"{capture['capture_id']}.motion.json").is_file())
-            self.assertTrue((root / f"{capture['capture_id']}.inference.json").is_file())
-            motion = json.loads((root / f"{capture['capture_id']}.motion.json").read_text())
-            inference = json.loads((root / f"{capture['capture_id']}.inference.json").read_text())
+            self.assertTrue((locate_capture_file(root, capture["filename"])).is_file())
+            self.assertTrue(locate_capture_file(root, f"{capture['capture_id']}.motion.json").is_file())
+            self.assertTrue(locate_capture_file(root, f"{capture['capture_id']}.inference.json").is_file())
+            motion = json.loads(locate_capture_file(root, f"{capture['capture_id']}.motion.json").read_text())
+            inference = json.loads(locate_capture_file(root, f"{capture['capture_id']}.inference.json").read_text())
             self.assertEqual(capture["camera_model"], "OV5640")
             self.assertEqual(motion["camera_provenance"]["model"], "OV5640")
             self.assertEqual(motion["camera_provenance"]["sensor_pid"], 0x5640)
             self.assertEqual(inference["camera_provenance"]["model"], "OV5640")
-            self.assertEqual(persisted[0][0], root / capture["filename"])
+            self.assertEqual(persisted[0][0], locate_capture_file(root, capture["filename"]))
 
     def test_bird_static_fallback_is_persisted_but_not_admitted(self):
         frame = np.full((120, 160, 3), 50, np.uint8)
@@ -153,9 +153,9 @@ class PiMotionTests(unittest.TestCase):
             self.assertTrue(result["persisted"])
             self.assertEqual(result["inference"]["status"], "error")
             capture = result["capture"]
-            saved = json.loads((root / f"{capture['capture_id']}.inference.json").read_text())
+            saved = json.loads(locate_capture_file(root, f"{capture['capture_id']}.inference.json").read_text())
             self.assertIn("model unavailable", saved["error"])
-            motion = json.loads((root / f"{capture['capture_id']}.motion.json").read_text())
+            motion = json.loads(locate_capture_file(root, f"{capture['capture_id']}.motion.json").read_text())
             self.assertEqual(motion["static_roi"]["capture_sidecar"], capture["sidecar"])
             self.assertEqual(len(motion["static_roi"]["capture_sidecar_sha256"]), 64)
             self.assertEqual(len(motion["crop_id"]), 64)

@@ -14,6 +14,11 @@ from typing import Any
 
 from PIL import Image
 
+try:
+    from .capture_storage import capture_files, in_capture_folder, locate_capture_file
+except ImportError:  # Direct execution from the server folder
+    from capture_storage import capture_files, in_capture_folder, locate_capture_file
+
 # Keep the deployment detector-manifest columns in the same order as bbox_data.
 MANIFEST_FIELDS = tuple("annotation_id sample_id source_dataset source_image_id image_path relative_path width_px height_px review_state annotation_trust annotation_origin eligible_for_training detector_class_id detector_class_name species_id species_name scientific_name box_id xmin ymin xmax ymax confidence source_split model_split split_group projected_area_px2 bird_size is_Bird mixed_species bird_count context_percent context_xmin context_ymin context_xmax context_ymax".split())
 PROVENANCE_FIELDS = ("camera_id", "camera_registry_id", "deployment_id", "collection_run_id", "received_at", "image_sha256", "detector_sha256")
@@ -48,7 +53,7 @@ def manifest_csv(root: Path):
     writer = csv.DictWriter(output, fieldnames=MANIFEST_FIELDS + PROVENANCE_FIELDS)
     writer.writeheader()
     yield output.getvalue()
-    for image_path in sorted(root.glob("capture_*.jpg")):
+    for image_path in sorted(capture_files(root), key=lambda path: path.name):
         def read(suffix):
             try:
                 return json.loads(image_path.with_suffix(suffix).read_text(encoding="utf-8"))

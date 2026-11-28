@@ -37,7 +37,7 @@ try:
         sync_registry_from_heartbeat,
     )
     from .camera_dashboard_templates import PI_TABBED_DASHBOARD_HTML
-    from .capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
+    from .capture_storage import METADATA_HEADER, CaptureStore, capture_files, is_jpeg, parse_camera_metadata
     from .laptop_test_server import camera_url_argument, normalize_camera_url
     from .pi_motion import MotionService
     from .motion_crop import MotionConfig, rgb_to_gray, select_motion_crop
@@ -64,7 +64,7 @@ except ImportError:  # Direct execution: python server/raspberry_pi_server.py
         sync_registry_from_heartbeat,
     )
     from camera_dashboard_templates import PI_TABBED_DASHBOARD_HTML
-    from capture_storage import METADATA_HEADER, CaptureStore, is_jpeg, parse_camera_metadata
+    from capture_storage import METADATA_HEADER, CaptureStore, capture_files, is_jpeg, parse_camera_metadata
     from laptop_test_server import camera_url_argument, normalize_camera_url
     from pi_motion import MotionService
     from motion_crop import MotionConfig, rgb_to_gray, select_motion_crop
@@ -448,7 +448,7 @@ def create_app(
         camera_url = default_camera["url"]
     inference_lock = threading.Lock()
     state_lock = threading.Lock()
-    existing = sorted(store.root.glob("*.jpg"), key=lambda path: path.stat().st_mtime)
+    existing = sorted(capture_files(store.root, "*.jpg"), key=lambda path: path.stat().st_mtime)
     latest: dict[str, Any] = {
         "path": existing[-1] if existing else None,
         "received_at": None,
@@ -1037,7 +1037,7 @@ def create_app(
         return camera_proxy("capture", camera_id=camera_id)
 
     def manual_capture_saved(record):
-        destination = store.root / record["filename"]
+        destination = store.path_for(record["filename"])
         normal = record["calibration_type"] == "normal"
         analyze = normal and (inference_engine is None or hub_settings.value["detector_enabled"])
         status = "pending" if analyze else "skipped"
@@ -1099,7 +1099,7 @@ def create_app(
                 "camera_name": registered.get("name") if registered else None,
             },
         )
-        destination = store.root / record["filename"]
+        destination = store.path_for(record["filename"])
         count_frame(destination, record, None)
         deferred = request.headers.get(CLASSIFICATION_HEADER, "").strip().lower() == "deferred"
         if deferred:
@@ -1232,13 +1232,13 @@ def create_app(
     def capture_path(capture_id: str) -> Path | None:
         if not capture_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in capture_id):
             return None
-        path = store.root / f"{capture_id}.jpg"
+        path = store.path_for(f"{capture_id}.jpg")
         return path if path.is_file() else None
 
     def latest_camera_capture(camera_id: str) -> Path | None:
         if registry.get(camera_id) is None:
             return None
-        paths = sorted(store.root.glob("capture_*.jpg"), key=lambda item: item.name, reverse=True)
+        paths = sorted(capture_files(store.root), key=lambda item: item.name, reverse=True)
         for path in paths:
             try:
                 sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
@@ -1275,7 +1275,7 @@ def create_app(
             limit = max(1, min(200, int(request.args.get("limit", "50"))))
         except ValueError:
             return jsonify(error="limit must be an integer"), 400
-        paths = sorted(store.root.glob("capture_*.jpg"), key=lambda item: item.name)
+        paths = sorted(capture_files(store.root), key=lambda item: item.name)
         if camera_id or camera_registry_id:
             filtered: list[Path] = []
             for path in paths:
@@ -1405,7 +1405,7 @@ def create_app(
             review = json.loads(original.with_suffix(".review.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return jsonify(error="Review not found."), 404
-        path = store.root / "review_crops" / f"{capture_id}_bird_{index:02d}.png"
+        path = original.parent / "review_crops" / f"{capture_id}_bird_{index:02d}.png"
         if review.get("decision") != "boxed" or index >= len(review.get("boxes", [])) or not path.is_file():
             return jsonify(error="Reviewed crop not found."), 404
         return send_file(path, mimetype="image/png", max_age=0)
@@ -1418,7 +1418,7 @@ def create_app(
         inference = read_inference_record(original) or {}
         crops = (inference.get("collection") or {}).get("crops", [])
         crop = next((item for item in crops if item.get("detection_index") == index), None)
-        path = store.root / "crops" / f"{capture_id}_bird_{index:02d}.png"
+        path = original.parent / "crops" / f"{capture_id}_bird_{index:02d}.png"
         if crop is None or not path.is_file():
             return jsonify(error="Crop not found."), 404
         return send_file(path, mimetype="image/png", max_age=3600)

@@ -18,7 +18,7 @@ from server.camera_capture_job import (
     parse_args,
     run_interval,
 )
-from server.capture_storage import METADATA_HEADER, CaptureStore
+from server.capture_storage import locate_capture_file, METADATA_HEADER, CaptureStore
 
 
 JPEG = b"\xff\xd8environment-frame\xff\xd9"
@@ -88,10 +88,10 @@ class CameraCaptureJobTests(unittest.TestCase):
             record = capture_environment_frame(
                 "HTTP://CAMERA.Local/", store, timeout_seconds=4.0, opener=opener
             )
-            sidecar = json.loads((store.root / record["sidecar"]).read_text(encoding="utf-8"))
+            sidecar = json.loads((locate_capture_file(store.root, record["sidecar"])).read_text(encoding="utf-8"))
             manifest = [json.loads(line) for line in store.manifest_path.read_text().splitlines()]
 
-            self.assertEqual((store.root / record["filename"]).read_bytes(), JPEG)
+            self.assertEqual((locate_capture_file(store.root, record["filename"])).read_bytes(), JPEG)
             self.assertEqual(record["source"], "environment")
             self.assertEqual(record["camera_model"], "OV5640")
             self.assertEqual(record["collection"]["purpose"], COLLECTION_PURPOSE)
@@ -123,7 +123,7 @@ class CameraCaptureJobTests(unittest.TestCase):
                 store,
                 opener=lambda *_args, **_kwargs: FakeResponse(JPEG, metadata="not-json"),
             )
-            self.assertTrue((store.root / record["filename"]).is_file())
+            self.assertTrue((locate_capture_file(store.root, record["filename"])).is_file())
             self.assertIn("invalid JSON", record["metadata_error"])
 
     def test_fetch_rejects_wrong_content_type_incomplete_and_oversized_images(self) -> None:

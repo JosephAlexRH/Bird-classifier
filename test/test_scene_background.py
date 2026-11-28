@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from server.capture_storage import CaptureStore
+from server.capture_storage import capture_files
 from server.motion_crop import MotionConfig
 from server.pi_motion import MotionService
 from server.scene_background import SceneBackground
@@ -54,15 +55,15 @@ class SceneBackgroundTests(unittest.TestCase):
             self.poll()
         self.assertTrue(self.service.background.ready)
         self.assertEqual(len(self.engine.calls), 1)
-        self.assertEqual(len(list(self.root.glob('capture_*.jpg'))), 6)
+        self.assertEqual(len(capture_files(self.root)), 6)
         self.assertEqual(len(self.service.background.evidence), 5)
-        for record in self.root.glob('*.inference.json'):
+        for record in capture_files(self.root, '*.inference.json'):
             value = json.loads(record.read_text())
             if value.get('status') == 'complete':
                 continue
             self.assertEqual(value['reason'], 'background_calibration')
             self.assertIsNone(value['is_bird'])
-        self.assertEqual(list(self.root.glob('*.review.json')), [])
+        self.assertEqual(capture_files(self.root, '*.review.json'), [])
 
     def test_quiet_scene_skips_detector_and_saving_after_calibration(self):
         self.calibrate()
@@ -121,7 +122,7 @@ class SceneBackgroundTests(unittest.TestCase):
         self.assertTrue(result['persisted'])
         self.assertTrue(result['motion']['capture_policy']['periodic_background_sample'])
         self.assertEqual(result['capture']['capture_policy']['training_label'], 'unreviewed')
-        self.assertEqual(list(self.root.glob('*.review.json')), [])
+        self.assertEqual(capture_files(self.root, '*.review.json'), [])
 
     def test_other_camera_cannot_restore_reference_and_reset_is_explicit(self):
         self.calibrate()
@@ -129,7 +130,7 @@ class SceneBackgroundTests(unittest.TestCase):
         self.assertFalse(self.service.background.ready)
         self.assertEqual(self.service.background.reason, 'user_reset')
         self.assertFalse(self.service.background.cache_path.exists())
-        self.assertGreater(len(list(self.root.glob('capture_*.jpg'))), 0)
+        self.assertGreater(len(capture_files(self.root)), 0)
 
     def test_background_command_rejects_concurrent_analysis(self):
         self.poll()

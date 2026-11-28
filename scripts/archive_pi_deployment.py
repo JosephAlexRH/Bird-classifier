@@ -22,6 +22,8 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen
 
 
+DATE_DIR_GLOB = "[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9]"  # hub date folders: YYYY/MM/DD
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -118,12 +120,12 @@ def inventory_source(source, output, project=None):
                'python': sys.version, 'source_inventory_sha256': sha256(output / 'source_inventory.json'),
                'packages': sorted(({'name': d.metadata['Name'], 'version': d.version}
                                    for d in importlib.metadata.distributions()), key=lambda d: str(d['name'])),
-               'raw_capture_count': len(list(source.glob('capture_*.jpg'))),
+               'raw_capture_count': len([*source.glob('capture_*.jpg'), *source.glob(f'{DATE_DIR_GLOB}/capture_*.jpg')]),
                'snapshot_policy': 'cumulative_source_directory_no_source_deletion',
                'archive_tool_sha256': sha256(Path(__file__)),
                'assets': []}
     acquisition_count, deployments, cameras, received = 0, set(), set(), []
-    for path in source.glob('capture_*.json'):
+    for path in [*source.glob('capture_*.json'), *source.glob(f'{DATE_DIR_GLOB}/capture_*.json')]:
         if not re.fullmatch(r'capture_[A-Za-z0-9_]+', path.stem):
             continue
         try:

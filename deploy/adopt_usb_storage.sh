@@ -39,7 +39,7 @@ if awk -v m="${MOUNT}" '$1 !~ /^#/ && $2 == m {found=1} END {exit !found}' /etc/
   }
 else
   cp /etc/fstab "/etc/fstab.before-bird-usb-$(date +%Y%m%dT%H%M%S)"
-  printf '\nUUID=%s %s vfat uid=%s,gid=%s,umask=0077,nofail,x-systemd.device-timeout=30s 0 0\n' \
+  printf '\nUUID=%s %s vfat uid=%s,gid=%s,umask=0077,flush,nofail,x-systemd.device-timeout=30s 0 2\n' \
     "${UUID}" "${MOUNT}" "${RUN_UID}" "${RUN_GID}" >> /etc/fstab
   echo "Added ${MOUNT} to /etc/fstab"
 fi

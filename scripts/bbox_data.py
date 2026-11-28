@@ -82,6 +82,8 @@ _TRUE = frozenset({"1", "true", "t", "yes", "y", "on"})
 _FALSE = frozenset({"0", "false", "f", "no", "n", "off"})
 
 
+DATE_DIR_GLOB = "[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9]"  # hub date folders: YYYY/MM/DD
+
 def parse_optional_float(value: object) -> float | None:
     """Return a finite float, or ``None`` for blank/malformed/non-finite data."""
 
@@ -821,14 +823,15 @@ def load_image_directory(
 ) -> tuple[BBoxDataset, dict[str, GroundTruthRecord]]:
     """Discover images and build an unsaved detector-style dataset.
 
-    ``recursive=False`` limits discovery to files directly inside ``path``.  This
+    ``recursive=False`` limits discovery to files directly inside ``path`` (plus the
+    hub's ``YYYY/MM/DD`` capture folders).  This
     is useful for capture directories that also contain generated crops or other
     derived images in subdirectories. The hub's own derived folders (``crops``,
     ``review_crops``, ``backgrounds``) are skipped even when recursive.
     """
 
     root = Path(path).expanduser().resolve(strict=True)
-    candidates = root.rglob("*") if recursive else root.iterdir()
+    candidates = root.rglob("*") if recursive else [*root.iterdir(), *root.glob(f"{DATE_DIR_GLOB}/*")]
     images = sorted(
         (item for item in candidates if item.is_file() and item.suffix.casefold() in IMAGE_EXTENSIONS
          and not HUB_DERIVED_DIRECTORIES.intersection(

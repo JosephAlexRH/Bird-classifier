@@ -673,8 +673,13 @@ drive's UUID with `scripts/backup_pi_usb.py --check-only`.
 - Don't run `sudo mount /mnt/bird-backup` when the drive is already mounted: it
   mounts it twice on top of itself. Check with `findmnt /mnt/bird-backup` (one
   line) and `sudo umount /mnt/bird-backup` once to undo a second mount.
-- After an unclean unplug, repair it:
+- Pulling the power is expected in the field. The fstab line checks and repairs
+  the drive automatically at every boot (fsck pass `2`) and mounts it with
+  `flush`, so less data is in flight when power is cut. If FAT damage is found
+  while running, Linux remounts the drive read-only and captures fail with
+  `[Errno 30] Read-only file system`; a reboot repairs it, or by hand:
   `sudo systemctl stop birdhub && sudo umount /mnt/bird-backup && sudo fsck.vfat -a /dev/sda1 && sudo mount /mnt/bird-backup && sudo systemctl start birdhub`.
+  `journalctl -b -u "systemd-fsck@*"` shows what the boot check found.
 - **FAT32 allows only about 12,000 long file names in one folder**, and every
   capture is a `.jpg` plus a `.json`, so `bird_images` fills at roughly 6,000
   captures however much space is free. Captures then fail with

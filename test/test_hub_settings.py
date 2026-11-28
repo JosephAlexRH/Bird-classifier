@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image
 
 from server.bird_inference import BirdInferenceEngine
+from server.capture_storage import capture_files, locate_capture_file
 from server.camera_registry import CameraRegistry
 from server.hub_settings import HubSettings
 from server.pi_motion import MotionService
@@ -203,7 +204,7 @@ class HubControlTests(unittest.TestCase):
         self.assertTrue(result['persisted'])
         self.assertEqual(result['inference']['reason'],'analysis_disabled')
         self.assertIsNone(result['inference']['is_bird'])
-        self.assertEqual(len(list((self.root/'raw').glob('capture_*.jpg'))),1)
+        self.assertEqual(len(capture_files(self.root/'raw')),1)
 
     def test_uploaded_frames_obey_the_same_analysis_off_switch(self):
         self.client.post('/api/hub/settings',json={'detector_enabled':False,'species_enabled':False})
@@ -211,7 +212,7 @@ class HubControlTests(unittest.TestCase):
             response=self.client.post('/upload',data=jpeg(np.full((30,40,3),50,np.uint8)))
             self.assertEqual(response.status_code,200)
             infer.assert_not_called()
-        captured=self.root/'captures'/response.json['filename']
+        captured=locate_capture_file(self.root/'captures',response.json['filename'])
         record=json.loads(captured.with_suffix('.inference.json').read_text())
         self.assertEqual(record['reason'],'analysis_disabled')
         self.assertIsNone(record['is_bird'])

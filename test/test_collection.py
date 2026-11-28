@@ -16,7 +16,7 @@ from PIL import Image
 from flask import Flask
 
 from server.bird_inference import BirdInferenceEngine
-from server.capture_storage import CaptureStore
+from server.capture_storage import CaptureStore, capture_files, locate_capture_file
 from server.collection import export_bird_crops, manifest_csv, MANIFEST_FIELDS
 from server.pi_bridge import register_pi_bridge
 from server.pi_motion import MotionService
@@ -94,8 +94,8 @@ class CollectionTests(unittest.TestCase):
             self.assertTrue(entered.wait(2))
             service._collection_capture_once()
             service._collection_capture_once()
-            self.assertEqual(len(list(self.root.glob("capture_*.jpg"))),3)
-            records=[json.loads(p.read_text()) for p in self.root.glob("*.inference.json")]
+            self.assertEqual(len(capture_files(self.root, "capture_*.jpg")),3)
+            records=[json.loads(p.read_text()) for p in capture_files(self.root, "*.inference.json")]
             self.assertEqual(sum(r["status"]=="skipped" for r in records),1)
             self.assertEqual(service.inference_skipped,1)
             self.assertEqual(service._captured.qsize(),1)
@@ -112,8 +112,8 @@ class CollectionTests(unittest.TestCase):
         raw=jpeg(np.full((30,40,3),70,np.uint8))
         capture=CaptureStore(self.root).save_capture(raw,source="test",extra={"camera_id":"camera-1","deployment_id":"scene-a"})
         cid=capture["capture_id"]
-        original=(self.root/capture["filename"]).read_bytes()
-        acquisition=(self.root/capture["sidecar"]).read_bytes()
+        original=locate_capture_file(self.root, capture["filename"]).read_bytes()
+        acquisition=locate_capture_file(self.root, capture["sidecar"]).read_bytes()
         try:
             self.assertEqual(client.post(f"/api/captures/{cid}/review",json={"decision":"boxed","boxes":[]}).status_code,400)
             invalid={"left":0,"top":0,"right":100,"bottom":20}
@@ -138,9 +138,9 @@ class CollectionTests(unittest.TestCase):
             self.assertEqual(rows[0]["xmin"],"")
             self.assertEqual(rows[0]["species_name"],"")
             self.assertEqual(rows[0]["split_group"],"camera-1:scene-a")
-            self.assertEqual((self.root/capture["filename"]).read_bytes(),original)
-            self.assertEqual((self.root/capture["sidecar"]).read_bytes(),acquisition)
-            self.assertEqual(len(json.loads((self.root/f"{cid}.review.json").read_text())["history"]),2)
+            self.assertEqual(locate_capture_file(self.root, capture["filename"]).read_bytes(),original)
+            self.assertEqual(locate_capture_file(self.root, capture["sidecar"]).read_bytes(),acquisition)
+            self.assertEqual(len(json.loads(locate_capture_file(self.root, f"{cid}.review.json").read_text())["history"]),2)
             self.assertEqual(client.get(f"/api/captures/{cid}/review-crops/0/image").status_code,404)
             self.assertEqual(client.get('/api/captures?order=desc').json['captures'][0]['review']['decision'],'no_bird')
         finally:
@@ -182,7 +182,7 @@ class CollectionTests(unittest.TestCase):
             second=client.get('/api/captures?order=desc&limit=1&before='+page['next_before']).json
             self.assertEqual(second['captures'][0]['capture_id'],records[-2]['capture_id'])
             response=client.get('/api/captures/'+records[0]['capture_id']+'/metadata')
-            self.assertEqual(response.data,(self.root/records[0]['sidecar']).read_bytes())
+            self.assertEqual(response.data,locate_capture_file(self.root, records[0]['sidecar']).read_bytes())
             response.close()
         finally:
             app.config['CLEANUP']()
@@ -198,7 +198,7 @@ class CollectionTests(unittest.TestCase):
             fetcher=lambda *_a,**_k:(jpeg(np.full((30,40,3),50,np.uint8)),metadata()))
         result=service.process_once()
         self.assertTrue(result['persisted'])
-        self.assertEqual(len(list(self.root.glob('capture_*.jpg'))),1)
+        self.assertEqual(len(capture_files(self.root, "capture_*.jpg")),1)
         self.assertFalse(result['background_admitted'])
         self.assertEqual(result['inference']['collection']['crops'],[])
         row=list(csv.DictReader(io.StringIO(''.join(manifest_csv(self.root)))))[0]
@@ -267,7 +267,7 @@ class CollectionTests(unittest.TestCase):
             capture=response.json
             self.assertEqual(capture['calibration_type'],'gray_card')
             self.assertEqual(capture['note'],'Field calibration')
-            inference=json.loads((self.root/(capture['capture_id']+'.inference.json')).read_text())
+            inference=json.loads(locate_capture_file(self.root, capture['capture_id']+'.inference.json').read_text())
             self.assertEqual(inference['reason'],'calibration_frame')
             self.assertEqual(app.config['CLASSIFICATION_QUEUE'].unfinished_tasks,0)
             with patch('server.raspberry_pi_server.urlopen',return_value=Upstream(b'{}','application/json')):
